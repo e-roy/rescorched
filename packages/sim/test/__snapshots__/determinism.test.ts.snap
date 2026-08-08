@@ -3,31 +3,31 @@
 exports[`golden: ballistics > a fixed shot follows a stable path 1`] = `
 {
   "impactKind": "terrain",
-  "impactX": 1025.685,
-  "impactY": 282.297,
-  "steps": 133,
+  "impactX": 968.117,
+  "impactY": 427.492,
+  "steps": 159,
 }
 `;
 
-exports[`golden: full match replay > produces a stable final state hash 1`] = `"906fbd88"`;
+exports[`golden: full match replay > produces a stable final state hash 1`] = `"febae0af"`;
 
 exports[`golden: full match replay > records stable per-tank outcomes 1`] = `
 [
   {
     "alive": true,
-    "health": 47,
+    "health": 3,
     "id": "p1",
     "score": 0,
     "x": 381,
-    "y": 681,
+    "y": 580,
   },
   {
     "alive": true,
     "health": 100,
     "id": "p2",
-    "score": 16,
+    "score": 22,
     "x": 582,
-    "y": 625,
+    "y": 454,
   },
   {
     "alive": true,
@@ -35,7 +35,7 @@ exports[`golden: full match replay > records stable per-tank outcomes 1`] = `
     "id": "p3",
     "score": 0,
     "x": 1080,
-    "y": 602,
+    "y": 586,
   },
 ]
 `;
@@ -59,26 +59,26 @@ exports[`golden: rng > sfc32 output is stable 1`] = `
 
 exports[`golden: terrain > a fixed profile of columns is stable 1`] = `
 [
-  397,
-  606,
-  519,
-  453,
-  302,
-  349,
-  308,
-  223,
-  202,
-  280,
+  318,
+  522,
+  345,
+  264,
+  364,
+  366,
+  623,
+  561,
   510,
+  379,
+  273,
 ]
 `;
 
-exports[`golden: terrain > style "canyon" hashes stably 1`] = `"49587c91"`;
+exports[`golden: terrain > style "canyon" hashes stably 1`] = `"2b42b866"`;
 
-exports[`golden: terrain > style "mountains" hashes stably 1`] = `"fd60a3e5"`;
+exports[`golden: terrain > style "mountains" hashes stably 1`] = `"2d991e5d"`;
 
-exports[`golden: terrain > style "plateaus" hashes stably 1`] = `"d9c7200d"`;
+exports[`golden: terrain > style "plateaus" hashes stably 1`] = `"380ba13d"`;
 
-exports[`golden: terrain > style "rolling" hashes stably 1`] = `"977ccf01"`;
+exports[`golden: terrain > style "rolling" hashes stably 1`] = `"8abfaa4f"`;
 
-exports[`golden: terrain > style "valley" hashes stably 1`] = `"66bf2dfa"`;
+exports[`golden: terrain > style "valley" hashes stably 1`] = `"db5a3c80"`;

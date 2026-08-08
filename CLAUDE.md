@@ -7,7 +7,7 @@ by accident.
 
 ## The one idea everything else follows from
 
-The simulation is pure and deterministic, and it is the *same code* on the server
+The simulation is pure and deterministic, and it is the _same code_ on the server
 and in the browser.
 
 ```
@@ -25,17 +25,17 @@ players to disagree about who died.
 
 ## Layout
 
-| Path | What lives there | Never put here |
-|---|---|---|
-| `packages/sim` | terrain, physics, weapons, detonation, turn machine, economy, seeded RNG | anything platform-specific |
-| `packages/protocol` | Zod schema for every WebSocket message, both directions | game rules |
-| `packages/config` | shared tsconfig | code |
-| `apps/server` | Worker routes + the `GameRoom` Durable Object | game rules (they belong in sim) |
-| `apps/client` | Phaser rendering, DOM menus, input, socket | game rules (they belong in sim) |
-| `e2e` | Playwright against a real `wrangler dev` | unit tests |
-| `scripts` | dependency-free maintenance scripts | build steps |
+| Path                | What lives there                                                         | Never put here                  |
+| ------------------- | ------------------------------------------------------------------------ | ------------------------------- |
+| `packages/sim`      | terrain, physics, weapons, detonation, turn machine, economy, seeded RNG | anything platform-specific      |
+| `packages/protocol` | Zod schema for every WebSocket message, both directions                  | game rules                      |
+| `packages/config`   | shared tsconfig                                                          | code                            |
+| `apps/server`       | Worker routes + the `GameRoom` Durable Object                            | game rules (they belong in sim) |
+| `apps/client`       | Phaser rendering, DOM menus, input, socket                               | game rules (they belong in sim) |
+| `e2e`               | Playwright against a real `wrangler dev`                                 | unit tests                      |
+| `scripts`           | dependency-free maintenance scripts                                      | build steps                     |
 
-Inside `packages/sim`, files are split by *reason to change*:
+Inside `packages/sim`, files are split by _reason to change_:
 
 - `rng.ts` — the only source of randomness in the whole game.
 - `math.ts` — deterministic replacements for engine-defined `Math` functions.
@@ -93,7 +93,7 @@ them. `e2e/reference/README.md` describes what the 1991 original looks like, and
 ## Golden snapshots
 
 `packages/sim/test/determinism.test.ts` snapshots the final state hash of a
-recorded match. It exists to catch *accidental* nondeterminism. When you change
+recorded match. It exists to catch _accidental_ nondeterminism. When you change
 the rules on purpose it will go red — regenerate with
 
 ```bash

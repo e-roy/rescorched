@@ -4,6 +4,11 @@
  * Semi-implicit Euler at a fixed timestep, with the terrain sampled along every
  * step so a fast projectile can never tunnel through a thin ridge. That
  * no-tunnelling guarantee is a property test in the suite, not a hope.
+ *
+ * Three things here are load-bearing and each has its reasoning written down
+ * next to the constant that encodes it: how hard wind pushes (`windAuthority`),
+ * why a step can never outrun the collision sweep (`maxSpeed`), and how a long
+ * flight stays a small array (`maxPathPoints`).
  */
 
 import { clamp, detCosDeg, detSinDeg, hypot2 } from './math.ts';
@@ -13,19 +18,119 @@ import { isSolid, type Terrain } from './terrain.ts';
 export const PHYSICS = {
   /** Pixels per second squared. */
   gravity: 260,
-  /** Wind acceleration per unit of wind, pixels per second squared. */
-  windScale: 26,
   /** Fixed integration step, seconds. */
   dt: 1 / 60,
-  /** Sub-samples per step used for the swept collision check. */
-  maxSubSteps: 64,
-  /** Hard cap so a shot fired straight up into low gravity still terminates. */
-  maxSteps: 3600,
   /** Muzzle speed at power 100, pixels per second. */
   powerScale: 5.2,
+
+  /**
+   * Largest |wind| the game ever produces.
+   *
+   * This must equal `DEFAULT_WORLD.maxWind` in `game.ts`, which is where wind is
+   * actually rolled. It cannot import it — `game.ts` imports this file — so the
+   * mirror is asserted in `test/physics.test.ts` instead. It matters twice over:
+   * it is the clamp applied to every caller's wind, so a larger world maxWind
+   * would be silently truncated here and the HUD would lie about what the shell
+   * feels; and it is the denominator of `windScale`, so the "full wind costs an
+   * eighth of range" contract below is stated relative to it.
+   */
+  maxWind: 10,
+  /**
+   * Wind authority — the one knob that decides how much wind matters.
+   *
+   * Wind stays a constant horizontal acceleration, exactly as in the original:
+   * the arc remains a parabola, so "more power goes further, 45 degrees goes
+   * furthest" still holds and the gun stays learnable. What was wrong was the
+   * magnitude. At the old `windScale: 26`, full wind pushed sideways at
+   * 260 px/s^2 — precisely as hard as gravity pulls down — and the results were
+   * farce: a power-5 shot fired straight up rose 1 pixel and landed 22 pixels
+   * downwind; a power-60 lob drifted 559 px across a 382 px range. Correct
+   * integration of a badly chosen constant.
+   *
+   * Expressing the constant as a fraction of gravity makes the feel provable.
+   * Firing at angle t with speed v, flight time is T = 2*v*sin(t)/g and range is
+   * R = v^2*sin(2t)/g, so a constant sideways acceleration a gives
+   *
+   *     drift D = a*T^2/2   =>   D / R = (a / g) * tan(t)
+   *
+   * — independent of power. With a_max = g / windAuthority, full wind costs a
+   * flat shot at 45 degrees an eighth of its range whatever the power setting,
+   * and punishes high lobs harder (tan(75 deg) is 3.7x tan(45 deg)), which is
+   * exactly the tactical texture the original had. `test/physics.test.ts` pins
+   * the resulting distance.
+   */
+  windAuthority: 8,
+  /** Wind acceleration per unit of wind: gravity / (maxWind * windAuthority). */
+  windScale: 3.25,
+
+  /** Sub-samples per step used for the swept collision check. */
+  maxSubSteps: 64,
+  /**
+   * Hard speed ceiling, pixels per second.
+   *
+   * Nothing the game fires comes near it — the fastest muzzle is 520 px/s and a
+   * shell falling the full height of the world reaches about 770. The ceiling
+   * exists to turn "the sweep samples at most one pixel apart" from a property
+   * of the current tuning into a property of the code: at 3600 px/s a step
+   * covers 60 px, so `ceil(distance)` can never reach `maxSubSteps` and the
+   * clamp there can never silently coarsen the sampling. Without it, a caller
+   * passing a large `velocity` override could tunnel.
+   */
+  maxSpeed: 3600,
+  /** Hard cap so a shot fired straight up into low gravity still terminates. */
+  maxSteps: 3600,
+  /**
+   * Most path points returned to the client, excluding the impact point.
+   *
+   * A normal shot emits one point per step — a two-second arc is 120 points,
+   * which the client animates smoothly. Pathological flights are the problem: a
+   * low-gravity mortar lobbed off the top of the screen runs 3056 steps, and
+   * every point of it crosses the wire as JSON in a broadcast (3057 points,
+   * 70 KB). Past this budget the path halves its own resolution and keeps
+   * going: the same shot comes back as 383 points and 8.9 KB.
+   *
+   * The retained points are exact integration samples — nothing is interpolated
+   * or averaged. Emission is `step % stride === 0`, so after any number of
+   * halvings path point `i` is precisely the position after step `i * stride`:
+   * evenly spaced in time, in order, never a point out of rhythm. The drawn arc
+   * is the same curve, just sampled more coarsely the longer the flight lasts.
+   * (The appended impact point is the one exception — it lands wherever the
+   * shell actually hit.)
+   *
+   * `test/physics.test.ts` pins the resulting point count and JSON size as
+   * absolute numbers, not as a restatement of this constant.
+   */
+  maxPathPoints: 512,
+  /**
+   * How far clear of a hit circle the shell must get before it arms against it,
+   * as a multiple of that circle's own radius.
+   *
+   * Zero clearance is not enough. A flat, low-power shot leaves its own tank's
+   * circle through the side, then falls back across the rim a pixel later and
+   * detonates on the shooter: at factor 1 (rim-touching arms the shell) 226 of
+   * the 2172 angle/power combinations below power 12 did exactly that, some of
+   * them "flights" of twelve steps. The shell must reach real separation before
+   * "outside the circle" means "gone".
+   *
+   * A multiple of the radius rather than a pixel count, for two reasons: it
+   * scales with whatever is being shot at (a shield bubble is not a tank), and
+   * it does not silently depend on `DEFAULT_WORLD.tankRadius` living in another
+   * file. 1.5 is half a radius of clear air past the rim — 4.5 px for the
+   * standard 9 px tank, a quarter of the hull's width.
+   *
+   * The value is pinned from BOTH sides in `test/physics.test.ts`, because there
+   * is no knee in the data to appeal to: raising it walks the shortest lob that
+   * can land on your own head steadily upward (one power notch per pixel), and
+   * pushed far enough it would quietly delete that behaviour altogether. The
+   * test asserts the exact lowest self-detonating power, so any movement in
+   * either direction fails.
+   */
+  armFactor: 1.5,
   /** How far off-screen (left/right/top) a projectile may drift before it is lost. */
   offscreenMargin: 400,
 } as const;
+
+const MAX_SPEED_SQUARED = PHYSICS.maxSpeed * PHYSICS.maxSpeed;
 
 export interface ProjectileSpawn {
   x: number;
@@ -47,12 +152,20 @@ export interface Impact {
 }
 
 export interface Trajectory {
-  /** Sampled flight path, one point per integration step, including the start. */
+  /**
+   * Sampled flight path. One point per integration step for any normal shot;
+   * for a very long flight, every `stride`-th step, evenly spaced (see
+   * `PHYSICS.maxPathPoints`). Points are exact integration samples, never
+   * interpolated. The final point is always the impact point.
+   */
   points: Float64Array;
   /** Number of (x, y) pairs in `points`. */
   length: number;
   impact: Impact;
-  /** Steps taken — used by the client to time the flight animation. */
+  /**
+   * Integration steps taken. Equals `length - 1` unless the path was thinned,
+   * so it stays a true measure of how long the shell was in the air.
+   */
   steps: number;
 }
 
@@ -99,9 +212,13 @@ export function launchVelocity(angleDeg: number, power: number): { vx: number; v
  * inputs this returns an identical trajectory on every engine.
  */
 export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): Trajectory {
-  const { terrain, wind } = options;
+  const { terrain } = options;
   const gravity = PHYSICS.gravity * (options.gravityScale ?? 1);
-  const windAccel = options.windImmune ? 0 : wind * PHYSICS.windScale;
+  // Clamp the wind the same way the turn machine does, so no caller — or
+  // hand-crafted message that got past the schema — can hand the shell a
+  // hurricane the tuning above was never balanced for.
+  const wind = clamp(options.wind, -PHYSICS.maxWind, PHYSICS.maxWind);
+  const windAccel = options.windImmune === true ? 0 : wind * PHYSICS.windScale;
   const dt = PHYSICS.dt;
 
   const initial = options.velocity ?? launchVelocity(spawn.angleDeg, spawn.power);
@@ -110,12 +227,34 @@ export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): 
   let vx = initial.vx;
   let vy = initial.vy;
 
-  // Grow-on-demand path buffer. Two floats per point.
-  let capacity = 256;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    !Number.isFinite(vx) ||
+    !Number.isFinite(vy) ||
+    !Number.isFinite(gravity) ||
+    !Number.isFinite(windAccel)
+  ) {
+    // A NaN anywhere in the initial conditions would otherwise run the full step
+    // budget doing NaN arithmetic and hand back a trajectory nothing can draw.
+    // Fail closed instead: a shell that never existed, at a finite position.
+    const safeX = Number.isFinite(spawn.x) ? spawn.x : 0;
+    const safeY = Number.isFinite(spawn.y) ? spawn.y : 0;
+    return {
+      points: Float64Array.of(safeX, safeY),
+      length: 1,
+      impact: { kind: 'expired', x: safeX, y: safeY },
+      steps: 0,
+    };
+  }
+
+  // Grow-on-demand path buffer. Two floats per point. Bounded above by the
+  // decimation below, so this doubles at most a handful of times.
+  let capacity = 128;
   let points = new Float64Array(capacity * 2);
   let length = 0;
 
-  const push = (px: number, py: number): void => {
+  const emit = (px: number, py: number): void => {
     if (length >= capacity) {
       capacity *= 2;
       const grown = new Float64Array(capacity * 2);
@@ -127,9 +266,25 @@ export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): 
     length += 1;
   };
 
-  push(x, y);
+  // Emit every `stride`-th step, keyed off the absolute step number rather than
+  // a countdown since the last emit. That is what makes the retained samples
+  // stay exactly `stride` apart across a halving: the survivors of a halving are
+  // the even-indexed points, i.e. steps 0, 2*stride, 4*stride, …, which are
+  // precisely the multiples of the new stride.
+  let stride = 1;
+  /** Throw away every other point and emit half as often from here on. */
+  const halveResolution = (): void => {
+    let write = 0;
+    for (let read = 0; read < length; read += 2) {
+      points[write * 2] = points[read * 2] as number;
+      points[write * 2 + 1] = points[read * 2 + 1] as number;
+      write += 1;
+    }
+    length = write;
+    stride *= 2;
+  };
 
-  let impact: Impact = { kind: 'expired', x, y };
+  emit(x, y);
 
   // A target flagged `ignore` starts disarmed and arms itself the moment the
   // shell is clear of its circle. Step counting cannot do this correctly: a
@@ -138,24 +293,42 @@ export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): 
   const targets = options.targets;
   const armed = targets === undefined ? undefined : targets.map((target) => target.ignore !== true);
 
+  let impact: Impact | null = null;
+  let steps = 0;
+
   for (let step = 0; step < PHYSICS.maxSteps; step += 1) {
+    steps = step + 1;
+
     // Semi-implicit Euler: update velocity first, then position.
     vx += windAccel * dt;
     vy += gravity * dt;
+
+    const speedSquared = vx * vx + vy * vy;
+    if (speedSquared > MAX_SPEED_SQUARED) {
+      const scale = PHYSICS.maxSpeed / Math.sqrt(speedSquared);
+      vx *= scale;
+      vy *= scale;
+    }
 
     const nextX = x + vx * dt;
     const nextY = y + vy * dt;
 
     const hit = sweep(x, y, nextX, nextY, terrain, targets, armed);
     if (hit !== null) {
-      push(hit.x, hit.y);
       impact = hit;
       break;
     }
 
     x = nextX;
     y = nextY;
-    push(x, y);
+
+    if (steps % stride === 0) {
+      if (length >= PHYSICS.maxPathPoints) halveResolution();
+      // Re-test: halving doubled the stride, and this step may no longer be a
+      // multiple of it. Skipping the emit is correct — the next multiple is
+      // still exactly one new stride after the last surviving point.
+      if (steps % stride === 0) emit(x, y);
+    }
 
     // Off the sides or below the world: gone. Above the world is legal —
     // lobbing a shot off the top of the screen is a real Scorched Earth move.
@@ -169,14 +342,25 @@ export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): 
     }
   }
 
-  return { points, length, impact, steps: length - 1 };
+  // Ran the whole step budget without hitting anything: report where it got to,
+  // not where it started.
+  impact ??= { kind: 'expired', x, y };
+
+  // The impact point is always the last point of the path, whatever the
+  // decimation did — the client draws the trail straight to the explosion.
+  if (points[(length - 1) * 2] !== impact.x || points[(length - 1) * 2 + 1] !== impact.y) {
+    emit(impact.x, impact.y);
+  }
+
+  return { points, length, impact, steps };
 }
 
 /**
  * Swept collision along one integration step.
  *
  * Samples at no more than one pixel apart, which is what makes tunnelling
- * impossible regardless of projectile speed.
+ * impossible regardless of projectile speed. `PHYSICS.maxSpeed` bounds a step at
+ * 60 px, so the `maxSubSteps` clamp below is a backstop that never fires.
  */
 function sweep(
   fromX: number,
@@ -202,16 +386,18 @@ function sweep(
         const target = targets[index] as HitCircle;
         const ddx = px - target.x;
         const ddy = py - target.y;
-        const inside = ddx * ddx + ddy * ddy <= target.radius * target.radius;
+        const distanceSquared = ddx * ddx + ddy * ddy;
 
         if (armed[index] !== true) {
-          // Disarmed against this target (it is the shooter). Arm as soon as
-          // the shell is genuinely clear of the circle.
-          if (!inside) armed[index] = true;
+          // Disarmed against this target (it is the shooter). Arm only once the
+          // shell is clear of the circle by a real margin — see
+          // `PHYSICS.armFactor`.
+          const clearance = target.radius * PHYSICS.armFactor;
+          if (distanceSquared > clearance * clearance) armed[index] = true;
           continue;
         }
 
-        if (inside) {
+        if (distanceSquared <= target.radius * target.radius) {
           return { kind: 'tank', x: px, y: py, tankIndex: index };
         }
       }

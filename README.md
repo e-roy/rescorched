@@ -1,6 +1,6 @@
 # Scorched Earth (web)
 
-An open-source multiplayer remake of [Scorched Earth](https://en.wikipedia.org/wiki/Scorched_Earth_(video_game)),
+An open-source multiplayer remake of [Scorched Earth](<https://en.wikipedia.org/wiki/Scorched_Earth_(video_game)>),
 the 1991 DOS artillery game — destructible terrain, ballistics with wind, a deep
 arsenal, a between-rounds armoury, and turn-based multiplayer that survives a
 dropped connection.
@@ -62,14 +62,14 @@ pnpm deploy       # wrangler deploy
 
 Tests run at every layer, and all of them run offline:
 
-| Layer | Tool | What it covers |
-|---|---|---|
-| Sim | Vitest | trajectories, terrain destruction, damage, turn machine, economy |
-| Invariants | fast-check | same seed → same outcome, shots never tunnel, health never negative, the sim never throws on valid input |
-| Determinism | Vitest snapshots | a recorded match replays to the same state hash |
-| Server | `@cloudflare/vitest-pool-workers` | the real Durable Object inside real workerd, including hibernation wake-up and hostile input |
-| Protocol | Vitest + Zod | every message round-trips; malformed and hostile frames are rejected |
-| End to end | Playwright | two browsers, one room, a complete turn, an identical crater, a mid-game reconnect, and a rejected illegal move |
+| Layer       | Tool                              | What it covers                                                                                                  |
+| ----------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Sim         | Vitest                            | trajectories, terrain destruction, damage, turn machine, economy                                                |
+| Invariants  | fast-check                        | same seed → same outcome, shots never tunnel, health never negative, the sim never throws on valid input        |
+| Determinism | Vitest snapshots                  | a recorded match replays to the same state hash                                                                 |
+| Server      | `@cloudflare/vitest-pool-workers` | the real Durable Object inside real workerd, including hibernation wake-up and hostile input                    |
+| Protocol    | Vitest + Zod                      | every message round-trips; malformed and hostile frames are rejected                                            |
+| End to end  | Playwright                        | two browsers, one room, a complete turn, an identical crater, a mid-game reconnect, and a rejected illegal move |
 
 ## Supply chain
 
