@@ -13,8 +13,14 @@ blob-report/
 e2e/.artifacts/
 
 # Screenshots captured by agents for visual review are build output, not source.
-# Reference images of the original game ARE committed (e2e/reference/).
 e2e/screenshots/
+
+# Reference images of the original game are fetched on demand, never committed:
+# they are non-free screenshots of a copyrighted game (fair use on Wikipedia),
+# and redistributing them from an open-source repo is a licensing problem.
+# Run `node scripts/fetch-reference.mjs` to get them. See e2e/reference/README.md.
+e2e/reference/*
+!e2e/reference/README.md
 
 .DS_Store
 Thumbs.db

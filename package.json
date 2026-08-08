@@ -20,6 +20,7 @@
     "check": "pnpm verify:supply-chain && pnpm lint && pnpm typecheck && pnpm test",
     "test:e2e": "pnpm --filter @scorched/e2e test",
     "screenshot": "pnpm --filter @scorched/e2e screenshot",
+    "reference": "node scripts/fetch-reference.mjs",
     "deploy": "pnpm build && pnpm --filter @scorched/server deploy"
   },
   "devDependencies": {
