@@ -51,7 +51,9 @@ async function main() {
     // Bot-protection pages come back as HTML with a 200. Check the magic bytes
     // rather than trusting the status code.
     if (!(bytes[0] === 0x89 && bytes[1] === 0x50)) {
-      throw new Error(`"${item.as}" did not come back as a PNG — got ${bytes.length} bytes of something else`);
+      throw new Error(
+        `"${item.as}" did not come back as a PNG — got ${bytes.length} bytes of something else`,
+      );
     }
 
     await writeFile(path.join(OUT_DIR, item.as), bytes);

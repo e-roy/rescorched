@@ -14,6 +14,7 @@ export * from './math.ts';
 export * from './terrain.ts';
 export * from './physics.ts';
 export * from './weapons.ts';
+export * from './detonation.ts';
 export * from './game.ts';
 export * from './economy.ts';
 export * from './serialize.ts';

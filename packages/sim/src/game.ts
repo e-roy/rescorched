@@ -1,16 +1,17 @@
 /**
- * Turn state machine, damage resolution and round flow.
+ * Turn state machine and round flow.
  *
  * Every function here is pure with respect to the outside world: it takes a
  * state, returns a new state plus the list of events that got it there. The
  * Durable Object stores the state and broadcasts the events; clients replay the
  * events to animate. Nothing here touches a clock, a socket or the DOM.
+ *
+ * What a weapon *does* on impact lives in `detonation.ts`. This file only knows
+ * that something detonated and that it produced events.
  */
 
-import { clamp, hypot2 } from './math.ts';
+import { clamp } from './math.ts';
 import {
-  applyCrater,
-  applyMound,
   cloneTerrain,
   generateTerrain,
   hashTerrain,
@@ -19,14 +20,9 @@ import {
   type TerrainStyle,
 } from './terrain.ts';
 import { simulateFlight, trajectoryToArray, type HitCircle, type Trajectory } from './physics.ts';
+import { applyDamage, detonate, type DetonationEvent } from './detonation.ts';
 import { makeRng, restoreRng, type RngState } from './rng.ts';
-import {
-  BABY_MISSILE,
-  damageAtDistance,
-  requireWeapon,
-  type WeaponDef,
-  type WeaponId,
-} from './weapons.ts';
+import { BABY_MISSILE, requireWeapon, type WeaponDef, type WeaponId } from './weapons.ts';
 
 export const DEFAULT_WORLD = {
   width: 1280,
@@ -236,7 +232,7 @@ export function settleTanks(state: GameState): GameEvent[] {
     if (fallDistance > 24) {
       const damage = Math.min(60, Math.floor((fallDistance - 24) / 4));
       if (damage > 0) {
-        applyDamage(state, index, damage, null, events);
+        applyFallDamage(state, index, damage, events);
       }
     }
   }
@@ -309,7 +305,17 @@ export function fire(state: GameState, playerId: string, input: FireInput): Reso
   });
 
   if (trajectory.impact.kind !== 'wall' && trajectory.impact.kind !== 'expired') {
-    detonate(next, weapon, trajectory.impact.x, trajectory.impact.y, next.activeTank, events, rng);
+    events.push(
+      ...(detonate(
+        next,
+        weapon,
+        trajectory.impact.x,
+        trajectory.impact.y,
+        next.activeTank,
+        rng,
+        DETONATION_RULES,
+      ) as GameEvent[]),
+    );
   }
 
   events.push(...settleTanks(next));
@@ -354,126 +360,30 @@ function flyShot(
   );
 }
 
-/** Apply a weapon's effect at an impact point. */
-function detonate(
-  state: GameState,
-  weapon: WeaponDef,
-  x: number,
-  y: number,
-  shooterIndex: number,
-  events: GameEvent[],
-  rng: ReturnType<typeof makeRng>,
-): void {
-  switch (weapon.detonation) {
-    case 'dirt': {
-      applyMound(state.terrain, x, y, weapon.radius);
-      events.push({ type: 'dirt', x, y, radius: weapon.radius });
-      return;
-    }
-    case 'roller': {
-      // Walk downhill from the impact point, exploding as it goes.
-      const distance = weapon.rollDistance ?? 100;
-      const direction = surfaceAt(state.terrain, x + 8) < surfaceAt(state.terrain, x - 8) ? -1 : 1;
-      let cursorX = x;
-      const stepSize = Math.max(8, Math.floor(weapon.radius / 2));
-      let travelled = 0;
-      while (travelled <= distance) {
-        const groundY = surfaceAt(state.terrain, cursorX);
-        blast(state, weapon, cursorX, groundY, shooterIndex, events);
-        cursorX = clamp(cursorX + direction * stepSize, 0, state.terrain.width - 1);
-        travelled += stepSize;
-      }
-      return;
-    }
-    case 'cluster': {
-      blast(state, weapon, x, y, shooterIndex, events);
-      const count = weapon.clusterCount ?? 4;
-      const spread = weapon.clusterSpread ?? 0.4;
-      for (let i = 0; i < count; i += 1) {
-        const offsetX = rng.range(-1, 1) * weapon.radius * (2 + spread * 6);
-        const childX = clamp(x + offsetX, 0, state.terrain.width - 1);
-        const childY = surfaceAt(state.terrain, childX);
-        blast(state, weapon, childX, childY, shooterIndex, events);
-      }
-      return;
-    }
-    case 'napalm': {
-      // Burns downhill in a widening pool.
-      blast(state, weapon, x, y, shooterIndex, events);
-      const direction = surfaceAt(state.terrain, x + 8) < surfaceAt(state.terrain, x - 8) ? -1 : 1;
-      let cursorX = x;
-      for (let i = 0; i < 6; i += 1) {
-        cursorX = clamp(cursorX + direction * weapon.radius * 0.6, 0, state.terrain.width - 1);
-        blast(state, weapon, cursorX, surfaceAt(state.terrain, cursorX), shooterIndex, events, 0.5);
-      }
-      return;
-    }
-    case 'explode':
-    default: {
-      blast(state, weapon, x, y, shooterIndex, events);
-    }
-  }
-}
-
-/** One explosion: carve the terrain, hurt everyone in range. */
-function blast(
-  state: GameState,
-  weapon: WeaponDef,
-  x: number,
-  y: number,
-  shooterIndex: number,
-  events: GameEvent[],
-  damageScale = 1,
-): void {
-  applyCrater(state.terrain, x, y, weapon.radius);
-  events.push({ type: 'explosion', x, y, radius: weapon.radius, weapon: weapon.id });
-
-  for (let index = 0; index < state.tanks.length; index += 1) {
-    const tank = state.tanks[index] as Tank;
-    if (!tank.alive) continue;
-    const distance = hypot2(tank.x - x, tank.y - DEFAULT_WORLD.tankRadius / 2 - y);
-    const damage = damageAtDistance(weapon, distance) * damageScale;
-    if (damage <= 0) continue;
-    applyDamage(state, index, Math.round(damage), shooterIndex, events);
-  }
-}
+/**
+ * Blast rules shared by every detonation: what a point of damage is worth in
+ * cash, and what a kill pays. These live here rather than in detonation.ts
+ * because they are economy decisions, not physics.
+ */
+const DETONATION_RULES = {
+  damageBounty: DEFAULT_WORLD.damageBounty,
+  killBounty: DEFAULT_WORLD.killBounty,
+} as const;
 
 /**
- * Hurt a tank. Health is clamped at zero — the property suite asserts it can
- * never go negative, for any weapon, at any range, ever.
+ * Apply fall damage to a tank that dropped when the ground went out from
+ * under it. Routes through the same applyDamage() as weapon blasts so the
+ * "health never goes negative" invariant has exactly one implementation.
  */
-function applyDamage(
+function applyFallDamage(
   state: GameState,
   tankIndex: number,
   amount: number,
-  byTankIndex: number | null,
   events: GameEvent[],
 ): void {
-  const tank = state.tanks[tankIndex] as Tank;
-  if (!tank.alive || amount <= 0) return;
-
-  const applied = Math.min(tank.health, amount);
-  tank.health = Math.max(0, tank.health - amount);
-  events.push({ type: 'damage', tankIndex, amount: applied, healthAfter: tank.health });
-
-  if (byTankIndex !== null && byTankIndex !== tankIndex) {
-    const shooter = state.tanks[byTankIndex];
-    if (shooter !== undefined) {
-      shooter.money += applied * DEFAULT_WORLD.damageBounty;
-      shooter.score += applied;
-    }
-  }
-
-  if (tank.health <= 0) {
-    tank.alive = false;
-    events.push({ type: 'death', tankIndex, byTankIndex });
-    if (byTankIndex !== null && byTankIndex !== tankIndex) {
-      const shooter = state.tanks[byTankIndex];
-      if (shooter !== undefined) {
-        shooter.money += DEFAULT_WORLD.killBounty;
-      }
-    }
-  }
+  const detonationEvents: DetonationEvent[] = [];
+  applyDamage(state, tankIndex, amount, null, DETONATION_RULES, detonationEvents);
+  events.push(...(detonationEvents as GameEvent[]));
 }
 
 /** Hand the turn to the next living tank, or end the round. */
