@@ -1,0 +1,49 @@
+packages:
+  - 'packages/*'
+  - 'apps/*'
+  - 'e2e'
+
+# ---------------------------------------------------------------------------
+# Supply-chain security — NON-NEGOTIABLE (see TECH_STACK.md).
+#
+# No agent may weaken, bypass, or remove these settings. In particular:
+#   * never set `minimumReleaseAge: 0` (or lower it),
+#   * never use `dangerouslyAllowAllBuilds`,
+#   * never install with lifecycle scripts globally enabled.
+# If a needed package version is still inside the quarantine window, pick an
+# older version or wait the window out. That is the whole point.
+# ---------------------------------------------------------------------------
+
+# 7 days, in minutes. Newly published versions are quarantined for a week
+# before pnpm will install them. Compromised releases are almost always
+# yanked within days, so this is the single highest-value defence.
+minimumReleaseAge: 10080
+
+# Transitive deps must resolve from the registry — no git URLs or tarball
+# URLs smuggled in through a sub-dependency.
+blockExoticSubdeps: true
+
+# Refuse packages whose trust level dropped compared to the prior release.
+trustPolicy: no-downgrade
+
+# Lifecycle scripts are blocked by default (pnpm 10+). Only the explicitly
+# reviewed few below may run install scripts. Reviewed one by one:
+#
+#   esbuild  — links the prebuilt platform binary it ships with. Needed by both
+#              wrangler and vite; without it neither can bundle.
+#   workerd  — the actual Cloudflare Workers runtime binary. `wrangler dev`
+#              cannot start without it, so there is no local dev and no
+#              vitest-pool-workers test run without this script.
+#
+# Everything else stays blocked. Playwright downloads Chromium through an
+# explicit `playwright install` command, not an install script, so it needs no
+# entry here. Adding a name below requires the same scrutiny as adding a
+# dependency, and scripts/verify-supply-chain.mjs will reject anything that is
+# not also on its reviewed allowlist.
+onlyBuiltDependencies:
+  - esbuild
+  - workerd
+
+allowBuilds:
+  esbuild: true
+  workerd: true

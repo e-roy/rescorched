@@ -1,0 +1,10 @@
+{
+  "extends": "@scorched/config/tsconfig.lib.json",
+  "compilerOptions": {
+    "rootDir": "."
+  },
+  // `vitest.config.ts` is deliberately excluded: it imports Vite's types, and
+  // this project compiles with `types: []` so that nothing in the sim can
+  // reach for a Node or DOM global by accident.
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

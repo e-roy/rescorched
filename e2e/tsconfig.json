@@ -1,0 +1,10 @@
+{
+  "extends": "@scorched/config/tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"]
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "screenshots", "test-results", "playwright-report"]
+}

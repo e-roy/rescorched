@@ -1,0 +1,16 @@
+node_modules
+dist
+.wrangler
+coverage
+pnpm-lock.yaml
+e2e/screenshots
+e2e/reference
+test-results
+playwright-report
+worker-configuration.d.ts
+**/*.snap
+
+# The project brief and its source of truth. Formatting is the author's, not
+# Prettier's — reflowing these would churn the document every agent touches it.
+TECH_STACK.md
+GAME_PROMPT.md

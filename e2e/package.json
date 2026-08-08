@@ -1,0 +1,23 @@
+{
+  "name": "@scorched/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright end-to-end tests against a real `wrangler dev`",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report",
+    "screenshot": "playwright test screenshot.spec.ts --reporter=list",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "install-browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0",
+    "@scorched/config": "workspace:*",
+    "@scorched/protocol": "workspace:*",
+    "@scorched/sim": "workspace:*",
+    "@types/node": "26.1.2",
+    "typescript": "5.9.3"
+  }
+}

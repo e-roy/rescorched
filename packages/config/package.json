@@ -1,0 +1,16 @@
+{
+  "name": "@scorched/config",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared TypeScript / ESLint configuration for the workspace",
+  "exports": {
+    "./tsconfig.base.json": "./tsconfig.base.json",
+    "./tsconfig.lib.json": "./tsconfig.lib.json",
+    "./eslint": "./eslint.js"
+  },
+  "scripts": {
+    "typecheck": "echo \"@scorched/config: nothing to typecheck\"",
+    "test": "echo \"@scorched/config: no tests\""
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@scorched/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker + Durable Object game rooms",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@scorched/protocol": "workspace:*",
+    "@scorched/sim": "workspace:*",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.20.1",
+    "@cloudflare/workers-types": "5.20260729.1",
+    "@scorched/config": "workspace:*",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.118.0"
+  }
+}

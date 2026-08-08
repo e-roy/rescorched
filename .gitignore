@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.wrangler/
+.turbo/
+coverage/
+*.tsbuildinfo
+worker-configuration.d.ts
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+e2e/.artifacts/
+
+# Screenshots captured by agents for visual review are build output, not source.
+# Reference images of the original game ARE committed (e2e/reference/).
+e2e/screenshots/
+
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.local

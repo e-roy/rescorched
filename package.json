@@ -1,0 +1,35 @@
+{
+  "name": "scorched-earth-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Open-source multiplayer web remake of Scorched Earth (1991)",
+  "license": "MIT",
+  "packageManager": "pnpm@11.18.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @scorched/server dev",
+    "build": "pnpm --filter @scorched/client build",
+    "lint": "eslint . && prettier --check .",
+    "lint:fix": "eslint . --fix && prettier --write .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r --sequential --filter=!@scorched/e2e test",
+    "verify:supply-chain": "node scripts/verify-supply-chain.mjs",
+    "check": "pnpm verify:supply-chain && pnpm lint && pnpm typecheck && pnpm test",
+    "test:e2e": "pnpm --filter @scorched/e2e test",
+    "screenshot": "pnpm --filter @scorched/e2e screenshot",
+    "deploy": "pnpm build && pnpm --filter @scorched/server deploy"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.1.2",
+    "eslint": "10.8.0",
+    "globals": "17.8.0",
+    "prettier": "3.9.6",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10"
+  }
+}

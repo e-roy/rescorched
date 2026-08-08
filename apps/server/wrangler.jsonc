@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "scorched-earth",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Serves the built Vite client. Asset requests are unmetered.
+  // `run_worker_first` keeps /api/* (including the WebSocket upgrade) on the Worker.
+  "assets": {
+    "directory": "../client/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"],
+  },
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GAME_ROOM",
+        "class_name": "GameRoom",
+      },
+    ],
+  },
+
+  // SQLite-backed Durable Objects — required for `ctx.storage.sql`.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GameRoom"],
+    },
+  ],
+
+  "observability": {
+    "enabled": true,
+  },
+
+  "dev": {
+    "port": 8787,
+  },
+}

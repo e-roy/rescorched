@@ -1,0 +1,7 @@
+{
+  "extends": "@scorched/config/tsconfig.lib.json",
+  "compilerOptions": {
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

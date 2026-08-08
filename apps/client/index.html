@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Scorched Earth</title>
+    <meta
+      name="description"
+      content="The mother of all games — open-source multiplayer web remake."
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="game-root"></div>
+
+    <!-- HUD: overlaid on the canvas, plain DOM (no framework — see TECH_STACK.md) -->
+    <div id="hud" class="hud" hidden data-testid="hud">
+      <div class="hud__bar">
+        <div class="hud__group">
+          <span class="hud__label">Angle</span>
+          <button class="hud__step" data-action="angle-down" aria-label="Decrease angle">
+            &minus;
+          </button>
+          <output class="hud__value" id="hud-angle" data-testid="hud-angle">45</output>
+          <button class="hud__step" data-action="angle-up" aria-label="Increase angle">+</button>
+        </div>
+        <div class="hud__group">
+          <span class="hud__label">Power</span>
+          <button class="hud__step" data-action="power-down" aria-label="Decrease power">
+            &minus;
+          </button>
+          <output class="hud__value" id="hud-power" data-testid="hud-power">60</output>
+          <button class="hud__step" data-action="power-up" aria-label="Increase power">+</button>
+        </div>
+        <div class="hud__group hud__group--wide">
+          <span class="hud__label">Weapon</span>
+          <select class="hud__select" id="hud-weapon" data-testid="hud-weapon"></select>
+        </div>
+        <div class="hud__group">
+          <span class="hud__label">Wind</span>
+          <output class="hud__value" id="hud-wind" data-testid="hud-wind">0.0</output>
+        </div>
+        <button class="hud__fire" id="hud-fire" data-testid="fire-button" disabled>FIRE</button>
+      </div>
+      <div class="hud__players" id="hud-players" data-testid="hud-players"></div>
+      <div class="hud__turn" id="hud-turn" data-testid="hud-turn"></div>
+    </div>
+
+    <!-- Menus: title / create / join / lobby / shop / game over -->
+    <div id="overlay" class="overlay" data-testid="overlay">
+      <section class="panel" id="panel-title" data-testid="panel-title">
+        <h1 class="panel__title">SCORCHED<span>EARTH</span></h1>
+        <p class="panel__tagline">The mother of all games.</p>
+        <label class="field">
+          <span>Your name</span>
+          <input id="input-name" data-testid="input-name" maxlength="16" value="Player" />
+        </label>
+        <div class="panel__actions">
+          <button class="btn btn--primary" id="btn-create" data-testid="btn-create">
+            Create room
+          </button>
+        </div>
+        <div class="panel__divider"><span>or</span></div>
+        <label class="field">
+          <span>Room code</span>
+          <input id="input-room" data-testid="input-room" maxlength="4" placeholder="ABCD" />
+        </label>
+        <div class="panel__actions">
+          <button class="btn" id="btn-join" data-testid="btn-join">Join room</button>
+        </div>
+        <p class="panel__error" id="title-error" data-testid="title-error" hidden></p>
+      </section>
+
+      <section class="panel" id="panel-lobby" data-testid="panel-lobby" hidden>
+        <h2 class="panel__heading">
+          Room <span id="lobby-code" data-testid="lobby-code">----</span>
+        </h2>
+        <p class="panel__hint">Share that code. Two players minimum.</p>
+        <ul class="playerlist" id="lobby-players" data-testid="lobby-players"></ul>
+        <div class="panel__actions">
+          <button class="btn btn--primary" id="btn-start" data-testid="btn-start">
+            Start match
+          </button>
+          <button class="btn" id="btn-leave" data-testid="btn-leave">Leave</button>
+        </div>
+        <p class="panel__error" id="lobby-error" data-testid="lobby-error" hidden></p>
+      </section>
+
+      <section class="panel panel--wide" id="panel-shop" data-testid="panel-shop" hidden>
+        <h2 class="panel__heading">Armoury</h2>
+        <p class="panel__hint">
+          Round over. Spend it or lose it &mdash; cash carries over, regrets do not.
+        </p>
+        <div class="shop__money">
+          Cash: <strong id="shop-money" data-testid="shop-money">$0</strong>
+        </div>
+        <ul class="shop" id="shop-items" data-testid="shop-items"></ul>
+        <div class="panel__actions">
+          <button class="btn btn--primary" id="btn-shop-done" data-testid="btn-shop-done">
+            Ready
+          </button>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-gameover" data-testid="panel-gameover" hidden>
+        <h2 class="panel__heading">Match over</h2>
+        <p class="panel__winner" id="gameover-winner" data-testid="gameover-winner"></p>
+        <ul class="playerlist" id="gameover-scores" data-testid="gameover-scores"></ul>
+        <div class="panel__actions">
+          <button class="btn btn--primary" id="btn-again" data-testid="btn-again">
+            Back to title
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div id="toast" class="toast" data-testid="toast" hidden></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
