@@ -10,8 +10,11 @@
  *
  * Where the behaviour depends on the shape of the ground, the test uses
  * `generateTerrain` rather than a hand-built ramp. A constant-grade ramp is a
- * case a roller cannot fail: it has no ties, no ripples and no local minima, so
- * it certified a `flowPath` that stalled on half of all real shots.
+ * case a roller cannot fail: it has no ties, no ripples and no local minima. A
+ * ramp is why a `flowPath` that stopped at the first tie shipped at all, and
+ * the size of that gap is measurable today — collapsing `SLOPE_WINDOW` to one
+ * column takes a Heavy Roller's mean travel over 1050 generated shots from
+ * 110 px to 52.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -33,11 +36,12 @@ import {
   cloneTerrain,
   emptyTerrain,
   generateTerrain,
+  PROBE_TANK_RADIUS,
   surfaceAt,
   TERRAIN_STYLES,
   type Terrain,
 } from '../src/terrain.ts';
-import { damageAtDistance, requireWeapon, WEAPONS } from '../src/weapons.ts';
+import { damageAtDistance, requireWeapon, WEAPONS, type WeaponDef } from '../src/weapons.ts';
 
 const WIDTH = 480;
 const HEIGHT = 320;
@@ -52,6 +56,13 @@ const RULES: DetonationRules = { damageBounty: 20, killBounty: 5000 };
  * do.
  */
 const MAX_BLAST_SLOPE = 5;
+
+/**
+ * How tall a tank is, in pixels — `PROBE_TANK_RADIUS` is its hit circle, so the
+ * hull spans twice that. Used as the bar for "cover you could hide behind",
+ * which is what the dirt weapons' shop text sells.
+ */
+const TANK_HEIGHT = PROBE_TANK_RADIUS * 2;
 
 function flatTerrain(surfaceY = 200): Terrain {
   const terrain = emptyTerrain(WIDTH, HEIGHT);
@@ -106,6 +117,10 @@ const damages = (events: DetonationEvent[]) =>
   events.filter((event): event is Extract<DetonationEvent, { type: 'damage' }> =>
     Boolean(event.type === 'damage'),
   );
+const arcs = (events: DetonationEvent[]) =>
+  events.filter((event): event is Extract<DetonationEvent, { type: 'shot' }> =>
+    Boolean(event.type === 'shot'),
+  );
 
 /** Steepest column-to-column step anywhere on the map. */
 function steepestStep(terrain: Terrain): number {
@@ -147,6 +162,20 @@ function eventProblem(events: readonly DetonationEvent[]): string | null {
       if (!Number.isInteger(event.amount) || event.amount < 0) return `bad amount ${event.amount}`;
       if (!Number.isInteger(event.healthAfter) || event.healthAfter < 0) {
         return `bad healthAfter ${event.healthAfter}`;
+      }
+    }
+    if (event.type === 'shot') {
+      // @scorched/protocol: tankIndex is a non-negative integer and every path
+      // coordinate is finite. A sub-munition's arc crosses the same wire as the
+      // shell's, so it has to satisfy the same schema.
+      if (!Number.isInteger(event.tankIndex) || event.tankIndex < 0) {
+        return `bad tankIndex ${event.tankIndex}`;
+      }
+      if (event.path.length < 4 || event.path.length % 2 !== 0) {
+        return `bad path length ${event.path.length}`;
+      }
+      for (const value of event.path) {
+        if (!Number.isFinite(value)) return `non-finite path coordinate ${value}`;
       }
     }
   }
@@ -201,14 +230,88 @@ describe('dirt', () => {
       }
 
       expect(rise).toBeGreaterThan(8); // it did something
-      expect(rise).toBeLessThan(120); // and it is not a spire
-      // The anti-spire property, stated the way a player sees it: dirt lies at
-      // 2 px per column and liquid dirt at 1, so a heap comes out about as wide
-      // as it is tall and a pool twice as wide. Eight stacked circular mounds
-      // gave a 136 px rise across 35 columns.
-      expect(width).toBeGreaterThan(rise * 0.8);
+      // Not a spire. A cone of the largest volume in the table (Ton of Dirt,
+      // 4100 square pixels) standing at the solid-dirt repose is 111 px tall,
+      // which is the ceiling this has to clear; the eight stacked circular
+      // mounds it replaced stood 136.
+      expect(rise).toBeLessThan(120);
+      // The anti-spire property, stated the way a player sees it: dirt stands
+      // at its angle of repose, so a heap is about `2 / repose` times as wide
+      // as it is tall. Measured here: 0.65 for all three solid weapons and 7.8
+      // for Liquid Dirt. The stacked mounds gave 136 px across 35 columns —
+      // 0.26 — and nothing in the suite noticed.
+      expect(width).toBeGreaterThan(rise * 0.5);
       // And it never leaves a face steeper than blast-loosened dirt will hold.
       expect(steepestStep(terrain)).toBeLessThanOrEqual(MAX_BLAST_SLOPE);
+    },
+  );
+
+  // The property the shop text is actually selling — "a shovelful of cover",
+  // "bury a tank", "drops a hill" — measured on ground that slopes, because
+  // flat ground is the one case where a heap cannot run away from itself.
+  //
+  // Dirt laid SHALLOWER than the ground it lands on does not stand up: the
+  // profile never catches the hill, so it films out downhill instead of piling.
+  // At 2 px/column against a generator capped at 3, and with a pool rim that
+  // continued the body at the body's own slope, a Dirt Clod spread its 900
+  // square pixels over 115 columns of a 2 px/column grade and stood 8 px tall;
+  // over the 200 generated shots below its shallowest pile was 11 px and its
+  // widest 158 columns. A tank is 18 px tall. Eleven pixels of cover is a
+  // doormat.
+  it.each(['dirt_clod', 'dirt_ball', 'ton_of_dirt', 'liquid_dirt'])(
+    '%s leaves cover a tank could hide behind, on ground that slopes',
+    (id) => {
+      const weapon = requireWeapon(id);
+      const rises: number[] = [];
+      const spreadRatios: number[] = [];
+
+      for (const style of TERRAIN_STYLES) {
+        for (let seed = 0; seed < 8; seed += 1) {
+          const base = generateTerrain(
+            { width: 1280, height: 720, style },
+            makeRng(seed * 7919 + 13),
+          );
+          for (const column of [200, 480, 640, 800, 1080]) {
+            const terrain = cloneTerrain(base);
+            const start = Array.from(terrain.surface);
+            detonate(
+              makeTarget(terrain),
+              weapon,
+              column,
+              surfaceAt(terrain, column),
+              null,
+              makeRng(3),
+              RULES,
+            );
+
+            let peak = 0;
+            let touched = 0;
+            for (let x = 0; x < 1280; x += 1) {
+              const added = (start[x] as number) - (terrain.surface[x] as number);
+              if (added !== 0) touched += 1;
+              if (added > peak) peak = added;
+            }
+            rises.push(peak);
+            spreadRatios.push(touched / peak);
+          }
+        }
+      }
+
+      const lowest = Math.min(...rises);
+      const flattest = Math.max(...spreadRatios);
+      // Measured minimum over these 200 shots: 31 px for the Dirt Clod, 24 for
+      // Liquid Dirt, 41 for the Dirt Ball, 67 for the Ton of Dirt.
+      expect(lowest, `shallowest pile was ${lowest} px`).toBeGreaterThanOrEqual(TANK_HEIGHT);
+      // And it is a pile rather than a film: columns touched per pixel of
+      // height. A heap at repose `r` gives `2 / r`, so 0.66 for solid dirt and
+      // 8 for the liquid; measured worst case over these shots is 1.3 and 9.7,
+      // where the ground it landed on carried some of it away. Reverted to the
+      // shallow repose and the no-op rim, the same shots reach 14.4 for the
+      // Dirt Clod, 15.9 for the Dirt Ball and 14.6 for Liquid Dirt.
+      const bar = weapon.detonation === 'liquid_dirt' ? 12 : 3;
+      expect(flattest, `flattest pile spread ${flattest.toFixed(1)} columns per px`).toBeLessThan(
+        bar,
+      );
     },
   );
 
@@ -409,6 +512,53 @@ describe('roller', () => {
     expect(explosions(events)[0]!.x).toBe(240);
   });
 
+  it('is not pulled toward a drop it is not standing on', () => {
+    // The downhill test integrates over 96 columns, and for a while that width
+    // applied to a shell at rest as well as a moving one: level ground with a
+    // drop anywhere in the window read as downhill. On a dead-flat plateau
+    // ending in a cliff, a Heavy Roller dropped 100 px back from the edge sat
+    // where it landed and one dropped 60 px back rolled off and crossed the
+    // map — two shots on ground that looks identical, with nothing on screen to
+    // say which you would get.
+    //
+    // The rule now is local: nothing at rest starts moving unless the ground
+    // falls away under it, within one stride. So the transition happens at the
+    // visible lip, and this measures exactly where.
+    const plateau = (): Terrain => {
+      const terrain = emptyTerrain(WIDTH, HEIGHT);
+      // Dead flat to x = 300, then a cliff into a long descending run.
+      for (let x = 0; x < WIDTH; x += 1) {
+        terrain.surface[x] = x < 300 ? 120 : Math.min(HEIGHT - 1, 200 + (x - 300));
+      }
+      return terrain;
+    };
+
+    const restingX = (id: string, landing: number): number => {
+      const terrain = plateau();
+      const events = fire(makeTarget(terrain), id, landing, surfaceAt(terrain, landing));
+      return (explosions(events)[0] as { x: number }).x;
+    };
+
+    // A Heavy Roller's stride is 12 px, a Baby Roller's 7 (radius / 3, clamped).
+    for (const [id, stride] of [
+      ['heavy_roller', 12],
+      ['baby_roller', 7],
+    ] as const) {
+      // Anywhere on the flat table it stays exactly where it landed, however
+      // close the edge gets — no invisible pull.
+      for (const back of [200, 100, 60, 40, 20, stride + 1]) {
+        expect(restingX(id, 300 - back), `${id} landed ${back} px back`).toBe(300 - back);
+      }
+      // Within one stride of the lip it goes over, and then keeps going: the
+      // run past the cliff descends for hundreds of pixels.
+      for (const back of [stride, Math.floor(stride / 2), 1]) {
+        expect(restingX(id, 300 - back), `${id} landed ${back} px from the lip`).toBeGreaterThan(
+          300 + requireWeapon(id).radius,
+        );
+      }
+    }
+  });
+
   it('stays on the map when it lands against the edge', () => {
     const target = makeTarget(slopedTerrain());
     const events = fire(target, 'heavy_roller', WIDTH - 3, surfaceAt(target.terrain, WIDTH - 3));
@@ -420,8 +570,8 @@ describe('roller', () => {
 
   // The one that matters. A hand-built ramp is a case `flowPath` cannot fail:
   // it has no ties, no ripples and no local minima. Generated maps have all
-  // three, and on them the previous implementation stalled where it landed on
-  // between a fifth and a half of all shots.
+  // three, which is why the numbers the bars below are set against are measured
+  // here and nowhere else.
   describe.each(TERRAIN_STYLES)('on generated %s terrain', (style) => {
     const MAP_WIDTH = 1280;
     const MAP_HEIGHT = 720;
@@ -430,7 +580,7 @@ describe('roller', () => {
       generateTerrain({ width: MAP_WIDTH, height: MAP_HEIGHT, style }, makeRng(seed * 7919 + 13)),
     );
 
-    it.each(ROLLERS)('%s rolls when there is anywhere to roll to', (id) => {
+    it.each(ROLLERS)('%s rolls when it lands on ground that slopes', (id) => {
       const weapon = requireWeapon(id);
       const travelled: number[] = [];
 
@@ -440,6 +590,13 @@ describe('roller', () => {
           // reach. A roller that lands in the bottom of a dip is supposed to
           // stay there — that is the same place it would have rolled to.
           if (descentNear(map, column, 60) <= 12) continue;
+          // …and only where the ground under the shell itself slopes. A roller
+          // sitting on a level shelf stays on it by design (see 'is not pulled
+          // toward a drop it is not standing on'), so counting those shots here
+          // would be asking the weapon to break its own rule. Four columns is
+          // inside every roller's stride, so a shot that passes this filter is
+          // one every roller in the table is allowed to move on.
+          if (descentNear(map, column, 4) <= 0) continue;
 
           const terrain = cloneTerrain(map);
           const events = detonate(
@@ -455,16 +612,21 @@ describe('roller', () => {
         }
       }
 
-      expect(travelled.length).toBeGreaterThan(30); // the sample is real
+      expect(travelled.length).toBeGreaterThan(18); // the sample is real
       const sorted = [...travelled].sort((a, b) => a - b);
       const median = sorted[Math.floor(sorted.length / 2)] as number;
       const stalled = travelled.filter((distance) => distance < weapon.radius).length;
+      const wentNowhere = travelled.filter((distance) => distance === 0).length;
 
-      // Measured worst case over these maps is a median of 42 px and a 13%
-      // stall rate; the bar is set below that with room for terrain.ts to be
-      // retuned, and far above the 0 px / 33-49% the old flowPath managed.
+      // Measured worst case over these maps, across all five styles and all
+      // three rollers: a median of 70 px, 23% travelling under one blast radius
+      // and 10% not moving at all. The smallest sample any style/weapon pair
+      // produces is 22 shots. The bars sit outside those with room for
+      // terrain.ts to be retuned. Neutering `flowPath` so a roller detonates
+      // where it lands fails all fifteen of these cases.
       expect(median).toBeGreaterThanOrEqual(30);
       expect(stalled / travelled.length).toBeLessThan(0.25);
+      expect(wentNowhere / travelled.length).toBeLessThan(0.15);
     });
 
     it('rolls further the heavier it is', () => {
@@ -496,7 +658,7 @@ describe('leapfrog', () => {
   it('walks its explosions across the ground instead of stacking them', () => {
     const weapon = requireWeapon('leapfrog');
     const target = makeTarget(flatTerrain());
-    const xs = explosions(fire(target, 'leapfrog', 240, 200)).map((bang) => bang.x);
+    const xs = explosions(fire(target, 'leapfrog', 140, 200)).map((bang) => bang.x);
 
     expect(xs).toHaveLength(weapon.hops as number);
     expect(new Set(xs).size).toBe(xs.length); // four bangs, four places
@@ -507,16 +669,157 @@ describe('leapfrog', () => {
     for (let i = 1; i < xs.length; i += 1) gaps.push(Math.abs(xs[i]! - xs[i - 1]!));
     const expected = Math.round(weapon.radius * (weapon.hopSpacing as number));
     for (const gap of gaps) expect(gap).toBe(expected);
-    // Overlapping, so a target between two hops is caught by both.
-    expect(expected).toBeLessThan(weapon.radius);
+    // A hop shorter than the blast is a smear, not a march: at 0.6 the gap was
+    // 18 px under a 30 px radius and the whole weapon moved 54 px — a 114 px
+    // footprint against a Baby Nuke's 110.
+    expect(expected).toBeGreaterThanOrEqual(weapon.radius);
+    // Total footprint: four blasts spread over more ground than the biggest
+    // single explosion at anything like this price covers. Baby Nuke: 110 px.
+    const span = Math.max(...xs) - Math.min(...xs) + weapon.radius * 2;
+    expect(span).toBeGreaterThan(2 * requireWeapon('baby_nuke').radius);
+  });
+
+  it('aims every hop at the ground as it was, not down the last crater', () => {
+    // The bug this exists for: each hop used to measure the surface AFTER the
+    // hop before it had carved a crater there, so hops two onward went off 30
+    // to 60 px underground. A tank standing at the impact point took one damage
+    // event out of four blasts and the whole event stream was `dmg 47` followed
+    // by three silent bangs.
+    //
+    // Measured with the hops deliberately set to overlap as well as at the
+    // shipped spacing, because at two radii apart a hop lands clear of the
+    // crater before it and the defect is simply out of reach — it would come
+    // straight back the day someone retuned `hopSpacing`. Aiming before
+    // carving is a property of the code, so it is tested against the code.
+    const shipped = requireWeapon('leapfrog');
+    const overlapping: WeaponDef = { ...shipped, hopSpacing: 0.6 };
+
+    for (const weapon of [shipped, overlapping]) {
+      const label = `${weapon.hopSpacing as number} radii apart`;
+
+      const flat = flatTerrain();
+      const onFlat = detonate(makeTarget(flat), weapon, 140, 200, null, makeRng(1234), RULES);
+      for (const bang of explosions(onFlat)) {
+        expect(bang.y, `${label}: hop at x ${bang.x}`).toBe(200);
+      }
+
+      // And on ground the generator actually produces, where "the ground line"
+      // is a different number in every column.
+      const hill = generateTerrain(
+        { width: 1280, height: 720, style: 'rolling' },
+        makeRng(7919 + 13),
+      );
+      const before = Array.from(hill.surface);
+      const onHill = detonate(
+        makeTarget(cloneTerrain(hill)),
+        weapon,
+        640,
+        surfaceAt(hill, 640),
+        null,
+        makeRng(1234),
+        RULES,
+      );
+      for (const bang of explosions(onHill)) {
+        expect(bang.y, `${label}: hop at x ${bang.x}`).toBe(before[bang.x] as number);
+      }
+    }
+
+    // What that buys, measured: one tank standing at each landing point, and
+    // every one of them takes a near-direct hit rather than the first taking
+    // 47 and the rest nothing.
+    const terrain = flatTerrain();
+    const hopX = explosions(
+      detonate(makeTarget(cloneTerrain(terrain)), shipped, 140, 200, null, makeRng(1234), RULES),
+    ).map((bang) => bang.x);
+    const tanks = hopX.map((x) => testTank(x, 200, 1_000_000));
+    const events = detonate(
+      makeTarget(terrain, tanks),
+      shipped,
+      140,
+      200,
+      null,
+      makeRng(1234),
+      RULES,
+    );
+
+    const dealt = tanks.map((_tank, index) =>
+      damages(events)
+        .filter((hit) => hit.tankIndex === index)
+        .reduce((sum, hit) => sum + hit.amount, 0),
+    );
+    for (const [index, amount] of dealt.entries()) {
+      expect(amount, `hop ${index} dealt ${amount}`).toBeGreaterThan(shipped.damage * 0.9);
+    }
+    expect(damages(events)).toHaveLength(shipped.hops as number);
+  });
+
+  it('leaves four craters a player can count, not one smear', () => {
+    const terrain = flatTerrain();
+    const xs = explosions(fire(makeTarget(terrain), 'leapfrog', 140, 200))
+      .map((bang) => bang.x)
+      .sort((a, b) => a - b);
+
+    // Between every pair of craters the ground still stands well above both
+    // floors: four bowls with rims, not a trench. Measured rim height: 44 px.
+    for (let i = 1; i < xs.length; i += 1) {
+      const floor = Math.min(surfaceAt(terrain, xs[i]!), surfaceAt(terrain, xs[i - 1]!));
+      const between = surfaceAt(terrain, (xs[i]! + xs[i - 1]!) / 2);
+      expect(floor - between, `rim between hop ${i - 1} and ${i}`).toBeGreaterThan(TANK_HEIGHT);
+    }
+  });
+
+  it('emits an arc for every bounce so the client can draw the hop', () => {
+    // `e2e/reference/README.md` on the original: several trajectory arcs
+    // visible at once. A weapon that teleports between blast points cannot be
+    // drawn that way, so the flight is part of what a detonation reports.
+    const weapon = requireWeapon('leapfrog');
+    const events = fire(makeTarget(flatTerrain()), 'leapfrog', 140, 200, 0);
+    const bangs = explosions(events);
+    const flights = arcs(events);
+
+    expect(flights).toHaveLength((weapon.hops as number) - 1);
+    for (const flight of flights) {
+      expect(flight.tankIndex).toBe(0);
+      expect(flight.weapon).toBe(weapon.id);
+      expect(flight.path.length % 2).toBe(0);
+      expect(flight.path.length / 2).toBeGreaterThanOrEqual(4);
+      for (const value of flight.path) expect(Number.isFinite(value)).toBe(true);
+    }
+
+    // Each arc runs from the blast it left to the blast it lands in, and it is
+    // an arc: it rises above the straight line between them.
+    for (let i = 0; i < flights.length; i += 1) {
+      const path = flights[i]!.path;
+      expect([path[0], path[1]]).toEqual([bangs[i]!.x, bangs[i]!.y]);
+      expect([path[path.length - 2], path[path.length - 1]]).toEqual([
+        bangs[i + 1]!.x,
+        bangs[i + 1]!.y,
+      ]);
+      const apex = Math.min(...path.filter((_v, index) => index % 2 === 1));
+      expect(apex).toBeLessThan(Math.min(path[1] as number, path[path.length - 1] as number));
+    }
+
+    // Interleaved with the explosions, because a leapfrog is sequential: bang,
+    // hop, bang. The client can play the stream straight through.
+    expect(events.filter((event) => event.type === 'explosion' || event.type === 'shot')).toEqual([
+      bangs[0],
+      flights[0],
+      bangs[1],
+      flights[1],
+      bangs[2],
+      flights[2],
+      bangs[3],
+    ]);
   });
 
   it('hops downhill when the ground has an opinion', () => {
-    const target = makeTarget(slopedTerrain());
-    const xs = explosions(fire(target, 'leapfrog', 100, surfaceAt(target.terrain, 100))).map(
-      (bang) => bang.x,
-    );
-    for (let i = 1; i < xs.length; i += 1) expect(xs[i]!).toBeGreaterThan(xs[i - 1]!);
+    const terrain = slopedTerrain();
+    const ground = Array.from(terrain.surface);
+    const target = makeTarget(terrain);
+    const bangs = explosions(fire(target, 'leapfrog', 100, surfaceAt(terrain, 100)));
+    for (let i = 1; i < bangs.length; i += 1) expect(bangs[i]!.x).toBeGreaterThan(bangs[i - 1]!.x);
+    // …and every one of them on the hillside as it was before the first bang.
+    for (const bang of bangs) expect(bang.y).toBe(ground[bang.x] as number);
   });
 
   it('picks a side from the seed when the ground is level', () => {
@@ -533,12 +836,13 @@ describe('leapfrog', () => {
 
   it('bounces back off the edge of the world rather than piling into it', () => {
     const target = makeTarget(flatTerrain());
-    const xs = explosions(fire(target, 'leapfrog', WIDTH - 4, 200)).map((bang) => bang.x);
-    for (const x of xs) {
-      expect(x).toBeGreaterThanOrEqual(0);
-      expect(x).toBeLessThanOrEqual(WIDTH - 1);
+    const bangs = explosions(fire(target, 'leapfrog', WIDTH - 4, 200));
+    for (const bang of bangs) {
+      expect(bang.x).toBeGreaterThanOrEqual(0);
+      expect(bang.x).toBeLessThanOrEqual(WIDTH - 1);
+      expect(bang.y).toBe(200); // still on the ground line after turning round
     }
-    expect(new Set(xs).size).toBe(xs.length);
+    expect(new Set(bangs.map((bang) => bang.x)).size).toBe(bangs.length);
   });
 });
 
@@ -583,6 +887,45 @@ describe('cluster', () => {
 
     // Every child detonated on the original ground line, not in a hole.
     for (const bang of explosions(events)) expect(bang.y).toBe(200);
+  });
+
+  it.each(['mirv', 'funky_bomb'])('%s gives every warhead its own arc to draw', (id) => {
+    // The look `e2e/reference/README.md` singles out from the 1991 screenshots:
+    // "a Funky Bomb splitting into multiple sub-munitions, each drawing its own
+    // arc", several in the air at once. A detonation that only ever reported
+    // circles could not be drawn that way at all, whatever the client did.
+    const weapon = requireWeapon(id);
+    const count = weapon.clusterCount as number;
+    const events = fire(makeTarget(flatTerrain()), id, 240, 200, 0);
+    const bangs = explosions(events);
+    const flights = arcs(events);
+
+    expect(flights).toHaveLength(count);
+
+    // Parent blast, then every warhead's flight as ONE contiguous run, then the
+    // warheads landing in the same order. Contiguous is the point: a client can
+    // only put several arcs in the air at once if the events it should play
+    // together arrive together.
+    const drawable = events.filter((event) => event.type === 'explosion' || event.type === 'shot');
+    expect(drawable).toEqual([bangs[0], ...flights, ...bangs.slice(1)]);
+
+    for (let i = 0; i < count; i += 1) {
+      const path = flights[i]!.path;
+      expect(flights[i]!.tankIndex).toBe(0);
+      expect(flights[i]!.weapon).toBe(weapon.id);
+      expect(path.length / 2).toBeGreaterThanOrEqual(4);
+      for (const value of path) expect(Number.isFinite(value)).toBe(true);
+      // Thrown from the parent burst, landing where warhead i goes off.
+      expect([path[0], path[1]]).toEqual([bangs[0]!.x, bangs[0]!.y]);
+      expect([path[path.length - 2], path[path.length - 1]]).toEqual([
+        bangs[i + 1]!.x,
+        bangs[i + 1]!.y,
+      ]);
+    }
+
+    // Warheads land on both sides of the burst, and no two arcs are the same
+    // line — eight identical paths would draw as one.
+    expect(new Set(flights.map((flight) => JSON.stringify(flight.path))).size).toBe(count);
   });
 
   it('keeps every sub-munition on the map', () => {

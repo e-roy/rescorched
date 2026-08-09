@@ -25,10 +25,13 @@
  * its valleys had less relief than the 280 px asserted here. Consistency, not
  * average ruggedness, is what makes a map worth loading.
  *
- * The numbers below are all from the current cap of 3 px per column. At the 2
- * this used to run at, mountains averaged 1.26 px of slope; they now average
- * 1.80 and never drop below 1.27 — the whole map is steeper than the old
- * generator's best seed.
+ * The numbers below are all from the current cap of 3 px per column, and all
+ * re-measured over 200 seeds of every style against the generator as it ships
+ * today — which matters, because the playability check now samples 25 columns
+ * instead of 7 and therefore accepts a different (slightly tamer) subset of
+ * mountain maps. Mountains average 1.69 px of slope per column and never drop
+ * below 1.25; at the 2 px/column cap this used to run at they averaged 1.26, so
+ * the whole distribution is still steeper than the old generator's best seed.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -64,7 +67,22 @@ function meanAbsSlope(terrain: Terrain): number {
   return sum / (terrain.width - 1);
 }
 
-function localMaxima(terrain: Terrain, window = 24): number {
+/**
+ * Hilltops that dominate +/-24 columns.
+ *
+ * Memoised, and `maps` below is too. Not premature: the generator now runs a
+ * 25-column playability check with up to 48 retries behind it, so a map costs
+ * ~8 ms (mountains ~17 ms) instead of well under one, and this file used to
+ * regenerate the same five sets of 40 for every assertion. Cached, the whole
+ * file builds 260 maps once.
+ */
+const maximaCache = new WeakMap<Terrain, number>();
+
+function localMaxima(terrain: Terrain): number {
+  const memo = maximaCache.get(terrain);
+  if (memo !== undefined) return memo;
+
+  const window = 24;
   let count = 0;
   for (let x = window; x < terrain.width - window; x += 1) {
     const y = terrain.surface[x] as number;
@@ -78,6 +96,7 @@ function localMaxima(terrain: Terrain, window = 24): number {
     }
     if (dominant) count += 1;
   }
+  maximaCache.set(terrain, count);
   return count;
 }
 
@@ -95,11 +114,18 @@ function meanSurface(terrain: Terrain, from: number, to: number): number {
   return sum / (to - from);
 }
 
+const mapCache = new Map<string, Terrain[]>();
+
 function maps(style: TerrainStyle, count = SEEDS): Terrain[] {
+  const key = `${style}:${count}`;
+  const cached = mapCache.get(key);
+  if (cached !== undefined) return cached;
+
   const out: Terrain[] = [];
   for (let seed = 0; seed < count; seed += 1) {
     out.push(generateTerrain({ width: WIDTH, height: HEIGHT, style }, makeRng(seed)));
   }
+  mapCache.set(key, out);
   return out;
 }
 
@@ -108,18 +134,32 @@ function average(values: number[]): number {
 }
 
 describe('the terrain is rugged, not soft noise', () => {
-  it.each(TERRAIN_STYLES)('style "%s" always has real relief and real slope', (style) => {
-    for (const [seed, terrain] of maps(style).entries()) {
-      // Flattest map measured across 200 seeds of every style: 288 px, 40% of
-      // the world height. The land climbs and falls across more than a third
-      // of the screen even on the tamest seed.
-      expect(relief(terrain), `${style} seed ${seed} relief`).toBeGreaterThanOrEqual(280);
+  // This is the case that fills `mapCache`, so it pays for most of the
+  // generation in the file: 0.72-0.93 s for mountains over three full-suite
+  // runs. Both cases here that generate maps rather than reading the cache
+  // declare a 60 s budget instead of running against Vitest's undeclared
+  // 5000 ms default — at the per-map cost noted on `localMaxima` above, the
+  // default is not a budget anybody chose.
+  it.each(TERRAIN_STYLES)(
+    'style "%s" always has real relief and real slope',
+    (style) => {
+      for (const [seed, terrain] of maps(style).entries()) {
+        // Flattest map measured across 200 seeds of every style: 288 px, 40% of
+        // the world height. The land climbs and falls across more than a third
+        // of the screen even on the tamest seed.
+        expect(relief(terrain), `${style} seed ${seed} relief`).toBeGreaterThanOrEqual(280);
 
-      // Flattest measured: 0.34 px per column, a wide-terrace plateau map.
-      expect(meanAbsSlope(terrain), `${style} seed ${seed} slope`).toBeGreaterThanOrEqual(0.32);
-    }
-  });
+        // Flattest measured over the same 200: 0.338 px per column, a
+        // wide-terrace plateau map.
+        expect(meanAbsSlope(terrain), `${style} seed ${seed} slope`).toBeGreaterThanOrEqual(0.32);
+      }
+    },
+    60_000,
+  );
 
+  // `maps(style, 12)` is a second cache key, so this builds 60 more maps of its
+  // own: 1.81 s under full-suite load, the second most expensive case in the
+  // file and well inside a budget it now declares.
   it('never leaves a face too steep to stand a tank on', () => {
     // The flip side of ruggedness, and the reason the cap is a named constant
     // rather than a literal here: it is the same number the destruction path's
@@ -134,7 +174,7 @@ describe('the terrain is rugged, not soft noise', () => {
         }
       }
     }
-  });
+  }, 60_000);
 
   it('gives a match several separate features to fight over', () => {
     // Averaged, not per-seed: a single valley map legitimately has one hill on
@@ -165,9 +205,9 @@ describe('the styles are genuinely different maps', () => {
   });
 
   it('mountains have narrow peaks, not rolling hills', () => {
-    // Worst mountain seed of 200 measures 1.27 px per column, against a rolling
-    // average of 1.05: the tamest mountain map is still rougher than a typical
-    // rolling one.
+    // Worst mountain seed of 200 measures 1.255 px per column, against a
+    // rolling average of 1.00: the tamest mountain map is still rougher than a
+    // typical rolling one.
     for (const terrain of maps('mountains')) {
       expect(meanAbsSlope(terrain)).toBeGreaterThanOrEqual(1.2);
     }
@@ -197,8 +237,7 @@ describe('the styles are genuinely different maps', () => {
       for (let x = 0; x < WIDTH; x += 1) highest = Math.min(highest, terrain.surface[x] as number);
 
       // 400 px of drop between the mesa top and the canyon floor — more than
-      // half the height of the world. The next deepest style (mountains) only
-      // manages 204 at its worst.
+      // half the height of the world. Worst canyon seed of 200 measures 413.
       expect(deepestInside - highest, `canyon seed ${seed}`).toBeGreaterThanOrEqual(400);
     }
   });

@@ -73,7 +73,15 @@ export interface WeaponDef {
   readonly rollDistance?: number;
   /** 'leapfrog': how many times it goes off. */
   readonly hops?: number;
-  /** 'leapfrog': gap between hops, as a multiple of `radius`. */
+  /**
+   * 'leapfrog': gap between hops, as a multiple of `radius`.
+   *
+   * At or above 2 the blasts are tangent or clear of each other, so the weapon
+   * marches — four craters a player can count, covering ground no single shell
+   * reaches. Below 1 they overlap into one smear: at 0.6 the Leapfrog moved 54
+   * px in total on every terrain and every seed, a 114 px footprint against a
+   * Baby Nuke's 110, which is a wobbly Baby Nuke and not a weapon.
+   */
   readonly hopSpacing?: number;
   /** 'napalm': burning pools laid down after the initial splash. */
   readonly burnSteps?: number;
@@ -254,9 +262,9 @@ export const WEAPONS: readonly WeaponDef[] = [
     damage: 50,
     detonation: 'leapfrog',
     hops: 4,
-    hopSpacing: 0.6,
+    hopSpacing: 2,
     tier: 2,
-    description: 'Explodes, hops, explodes again. Four times, marching off the impact point.',
+    description: 'Explodes, hops sixty pixels, explodes again. Four times, walking off downhill.',
   },
   {
     id: 'sandhog',
@@ -397,6 +405,13 @@ export function pricePerShot(weapon: WeaponDef): number {
  * guard plus the clamp on `t` is the whole of the input hardening — with
  * `t` in [0, 1] the polynomial `t*t*(3-2t)` is also in [0, 1], so the result
  * can never exceed `weapon.damage` and needs no second clamp.
+ *
+ * The parentheses in the return are load-bearing, not style. `damage * (poly)`
+ * scales a value that is provably in [0, 1]; `damage * t * t * (3 - 2 * t)`
+ * multiplies the damage in first and rounds at every step, and for about a
+ * third of the doubles immediately below `t = 1` it lands above `weapon.damage`
+ * — which is exactly the second clamp this claims not to need. `weapons.test.ts`
+ * sweeps those doubles.
  */
 export function damageAtDistance(weapon: WeaponDef, distance: number): number {
   if (!(weapon.radius > 0) || !(distance < weapon.radius)) return 0;

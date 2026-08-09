@@ -11,8 +11,31 @@ import { z } from 'zod';
 
 export const PROTOCOL_VERSION = 1;
 
-/** Cap on any single frame the server will even attempt to parse. */
-export const MAX_MESSAGE_BYTES = 16 * 1024;
+/**
+ * Frame size caps, which are deliberately NOT the same in both directions.
+ *
+ * Inbound client frames are hostile until proven otherwise: nothing a player
+ * legitimately sends is anywhere near 16 KB (the largest is a `fire` at a few
+ * hundred bytes), so a tight cap is free protection against someone trying to
+ * make the room chew on a megabyte of JSON.
+ *
+ * Outbound server frames are a different problem. An `events` frame carries the
+ * turn's trajectories plus the authoritative snapshot, and the snapshot alone is
+ * ~5.7 KB because it contains the full 1280-column heightmap. A Funky Bomb —
+ * one blast plus eight sub-munition arcs — measured 18,255 bytes. Under a shared
+ * 16 KB cap the client HARD-REJECTED those frames, so the game simply broke on
+ * about 5% of shots (38 of 756 measured), and it broke worse the more
+ * interesting the weapon was.
+ *
+ * The generous cap here is still a bound, not an absence of one: it exists to
+ * stop a runaway frame exhausting client memory, not to police a server the
+ * client is already trusting to adjudicate the whole match.
+ */
+export const MAX_CLIENT_MESSAGE_BYTES = 16 * 1024;
+export const MAX_SERVER_MESSAGE_BYTES = 512 * 1024;
+
+/** @deprecated Use the direction-specific cap. Kept so callers do not silently change meaning. */
+export const MAX_MESSAGE_BYTES = MAX_CLIENT_MESSAGE_BYTES;
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -268,9 +291,9 @@ export type ServerMessage = z.infer<typeof ServerMessageSchema>;
 
 export type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
-function parseJson(raw: string): ParseResult<unknown> {
-  if (raw.length > MAX_MESSAGE_BYTES) {
-    return { ok: false, error: `Message too large (${raw.length} bytes)` };
+function parseJson(raw: string, limit: number): ParseResult<unknown> {
+  if (raw.length > limit) {
+    return { ok: false, error: `Message too large (${raw.length} bytes, limit ${limit})` };
   }
   try {
     return { ok: true, value: JSON.parse(raw) as unknown };
@@ -284,7 +307,7 @@ function parseJson(raw: string): ParseResult<unknown> {
  * error message back, not take the room down.
  */
 export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
-  const json = parseJson(raw);
+  const json = parseJson(raw, MAX_CLIENT_MESSAGE_BYTES);
   if (!json.ok) return json;
 
   const result = ClientMessageSchema.safeParse(json.value);
@@ -296,7 +319,7 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
 
 /** Parse an inbound server frame on the client. Never throws. */
 export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
-  const json = parseJson(raw);
+  const json = parseJson(raw, MAX_SERVER_MESSAGE_BYTES);
   if (!json.ok) return json;
 
   const result = ServerMessageSchema.safeParse(json.value);

@@ -7,12 +7,22 @@
  * of "this map is worth playing on", and `generateTerrain` refuses to hand back
  * a map that fails it.
  *
- * A check like this is only worth what its verdicts are worth, so two of the
- * tests below do not test the check against itself: they brute-force the real
- * `simulateFlight` over the player's entire 179 x 100 grid of angles and powers
- * and compare. One measures how often a `blocked` verdict is wrong, the other
- * how often a pass is. Both used to be unmeasured, and `blocked` was wrong five
- * times out of six.
+ * Three things have to be true for that to mean anything, and there is a test
+ * for each:
+ *
+ *  1. A `blocked` verdict has to be right, or the generator throws away good
+ *     seeds. Brute-forced against the real `simulateFlight` over the player's
+ *     entire 179 x 100 grid of angles and powers. It used to be wrong five
+ *     times out of six.
+ *  2. A pass has to be right, or the generator ships a stalemate. Same brute
+ *     force, other direction.
+ *  3. The check has to hold WHERE IT IS CONSUMED. This is the one that was
+ *     missing, and it leaked: the check samples the placement band, `game.ts`
+ *     drops tanks anywhere in it, and at the 7 columns this used to sample,
+ *     30 of 1000 real `createGame` matches contained a pair of real tanks that
+ *     could not hit each other — 28 of those 35 pairs with zero connecting
+ *     shots in the whole grid. The last test in "generated maps are always
+ *     fightable" is that sweep, run at the real tank columns.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -99,6 +109,9 @@ function judgedPairs(terrain: Terrain, spawns: readonly number[]): [number, numb
   return pairs;
 }
 
+const players = (count: number): PlayerSeed[] =>
+  Array.from({ length: count }, (_, i) => ({ id: `p${i}`, name: `P${i}` }));
+
 function firstRejectedSeed(style: TerrainStyle): number {
   for (let seed = 0; seed < 200; seed += 1) {
     const raw = generateTerrain(
@@ -129,8 +142,10 @@ describe('the probe agrees with the real engine', () => {
     // sizes a shot lobbed off the top of the screen, the probe only ever aims
     // at a point on this map. Shorter is fine; longer would be wasted work.
     expect(PROBE.maxSteps).toBeLessThan(PHYSICS.maxSteps);
-    // A high arc at power 100 across the full map is about 4 s of flight.
-    expect(PROBE.maxSteps * PROBE.dt).toBeGreaterThan(8);
+    // The slowest arc the probe can pick is a high lob at power 100 across the
+    // full map, under 4 s of flight. 1200 steps at dt = 1/60 is 20 s, a 5x
+    // margin — the budget must never be the reason a probe gives up.
+    expect(PROBE.maxSteps * PROBE.dt).toBeGreaterThanOrEqual(4 * 5);
   });
 
   it('measures reachability with the weapon every tank always has', () => {
@@ -140,12 +155,16 @@ describe('the probe agrees with the real engine', () => {
   it('a pair the check calls blocked really is a needle at best', () => {
     // The verdict that matters, because it is the one that throws a seed
     // away. Brute-forced against the real engine over all 17,900 shots a
-    // player can fire. Measured over twenty such verdicts, one per style per
-    // seed: seventeen had no connecting shot at all and the other three had
-    // one, one and three — arcs nobody finds by aiming.
+    // player can fire. Widened to four verdicts per style and re-measured
+    // against the shipped sampling density: of those twenty, sixteen have NO
+    // connecting shot at all and the rest have one, two, two and three — arcs
+    // nobody finds by aiming. This test runs the first two per style to keep
+    // the brute force inside a sane wall clock; the bound is the worst of the
+    // full twenty with a little slack.
     const cases: { style: TerrainStyle; seed: number; from: number; to: number }[] = [];
     for (const style of TERRAIN_STYLES) {
-      for (let seed = 0; seed < 200 && cases.length < TERRAIN_STYLES.length; seed += 1) {
+      let found = 0;
+      for (let seed = 0; seed < 200 && found < 2; seed += 1) {
         const terrain = generateTerrain(
           { width: WIDTH, height: HEIGHT, style, ensurePlayable: false },
           makeRng(seed),
@@ -155,40 +174,54 @@ describe('the probe agrees with the real engine', () => {
         );
         if (issue === undefined) continue;
         cases.push({ style, seed, from: issue.column, to: issue.target as number });
-        break;
+        found += 1;
       }
     }
-    expect(cases.length).toBeGreaterThanOrEqual(3);
+    expect(cases.length).toBe(2 * TERRAIN_STYLES.length);
 
+    let deadPairs = 0;
     for (const probe of cases) {
       const terrain = generateTerrain(
         { width: WIDTH, height: HEIGHT, style: probe.style, ensurePlayable: false },
         makeRng(probe.seed),
       );
       const found = connections(terrain, probe.from, probe.to);
+      if (found.hits === 0) deadPairs += 1;
       expect(
         found.hits,
         `${probe.style} seed ${probe.seed} ${probe.from}->${probe.to} has ${found.hits} connecting shots (best miss ${found.best.toFixed(1)})`,
-      ).toBeLessThanOrEqual(8);
+      ).toBeLessThanOrEqual(4);
     }
-  }, 120_000);
+    // Most of them are not "hard", they are impossible. If that stopped being
+    // true the check would have drifted into rejecting playable ground.
+    expect(deadPairs).toBeGreaterThanOrEqual(cases.length - 2);
+  }, 300_000);
 
   it('every pair on an accepted map really can be hit', () => {
     // The other direction, and the more important one: a map that passes must
-    // not contain a pair the real engine cannot connect. Sampled over 60
-    // judged pairs; the full sweep of 433 pairs across every style also finds
-    // none, it just takes several minutes.
+    // not contain a pair the real engine cannot connect. Seed 5 of every style
+    // offers 2232 judged pairs between the 25 sampled columns; this walks 12
+    // of each map's list at an even stride, so the sample spans the whole
+    // range of separations (46 px neighbours up to 833 px) instead of the
+    // dozen shortest, which is all `slice(0, 12)` reached once the sampling
+    // got dense.
     const babyMissile = requireWeapon('baby_missile');
     let checked = 0;
+    let longest = 0;
 
     for (const style of TERRAIN_STYLES) {
       const terrain = generateTerrain({ width: WIDTH, height: HEIGHT, style }, makeRng(5));
       expect(checkPlayability(terrain).ok).toBe(true);
 
       const pairs = judgedPairs(terrain, defaultSpawnColumns(WIDTH));
-      for (const [from, to] of pairs.slice(0, 12)) {
+      expect(pairs.length).toBeGreaterThan(400);
+      const stride = Math.max(1, Math.floor(pairs.length / 12));
+      const spread = pairs.filter((_, index) => index % stride === 0).slice(0, 12);
+
+      for (const [from, to] of spread) {
         const found = connections(terrain, from, to);
         checked += 1;
+        longest = Math.max(longest, Math.abs(to - from));
         expect(
           found.hits,
           `${style} ${from}->${to}: best miss ${found.best.toFixed(1)} vs blast ${babyMissile.radius}`,
@@ -196,20 +229,32 @@ describe('the probe agrees with the real engine', () => {
       }
     }
     expect(checked).toBeGreaterThanOrEqual(50);
+    // The sample really did include the hard end of the range, not 60 pairs of
+    // neighbouring columns.
+    expect(longest).toBeGreaterThan(600);
   }, 300_000);
 });
 
 describe('generated maps are always fightable', () => {
-  it.each(TERRAIN_STYLES)('style "%s" passes the check for 40 consecutive seeds', (style) => {
-    for (let seed = 0; seed < 40; seed += 1) {
-      const terrain = generateTerrain({ width: WIDTH, height: HEIGHT, style }, makeRng(seed));
-      const report = checkPlayability(terrain);
-      expect(
-        report.ok,
-        `${style} seed ${seed}: ${report.issues.map((i) => `${i.kind}@${i.column}`).join(', ')}`,
-      ).toBe(true);
-    }
-  });
+  // 40 generations of mountains, the style the retry loop works hardest on:
+  // 0.85-0.88 s over four full-suite runs, the most expensive case in this file
+  // that does not already declare a budget. It declares one now, for the same
+  // reason the sweeps below do — Vitest's 5000 ms default is not a budget
+  // anybody chose, and generation is no longer cheap.
+  it.each(TERRAIN_STYLES)(
+    'style "%s" passes the check for 40 consecutive seeds',
+    (style) => {
+      for (let seed = 0; seed < 40; seed += 1) {
+        const terrain = generateTerrain({ width: WIDTH, height: HEIGHT, style }, makeRng(seed));
+        const report = checkPlayability(terrain);
+        expect(
+          report.ok,
+          `${style} seed ${seed}: ${report.issues.map((i) => `${i.kind}@${i.column}`).join(', ')}`,
+        ).toBe(true);
+      }
+    },
+    60_000,
+  );
 
   it('holds at the smaller sizes the tests use', () => {
     for (let seed = 0; seed < 20; seed += 1) {
@@ -224,6 +269,83 @@ describe('generated maps are always fightable', () => {
       expect(checkPlayability(terrain).ok).toBe(true);
     }
   });
+
+  it('holds at the columns createGame really drops tanks on', () => {
+    // THE TEST THIS SUITE WAS MISSING. Everything else here judges maps at
+    // `defaultSpawnColumns`, which is the same set the generator judged them
+    // with — so it can only ever agree with itself. This runs the real
+    // `createGame` and then asks the check about the columns the real tanks
+    // are standing on.
+    //
+    // Measured over these exact 1000 matches at `SPAWN_SAMPLES` = 25: four
+    // contain a blocked pair (rolling 4p seed 10, rolling 8p seed 19,
+    // mountains 6p seed 38, plateaus 8p seed 4), and nothing else fails. At
+    // the 7 columns this used to sample, thirty did. The bound below sits
+    // between the two on purpose: thinning the sampling fails here.
+    const counts = [2, 3, 4, 6, 8];
+    const failures: string[] = [];
+    const otherKinds: string[] = [];
+    let shortestBlocked = Infinity;
+    let tameMaps = 0;
+    let matches = 0;
+
+    for (const style of TERRAIN_STYLES) {
+      for (const count of counts) {
+        for (let seed = 0; seed < 40; seed += 1) {
+          const state = createGame(
+            {
+              seed: `real-${style}-${count}-${seed}`,
+              width: WIDTH,
+              height: HEIGHT,
+              terrainStyle: style,
+            },
+            players(count),
+          );
+          const columns = state.tanks.map((tank) => tank.x);
+          const report = checkPlayability(state.terrain, { spawns: columns });
+          matches += 1;
+
+          // `generateSafeTerrain` squeezes the ground into 45% of the band, so
+          // it cannot exceed ~195 px of relief; every styled map in this sweep
+          // measures at least 316. Counting the tame ones is how the retry
+          // budget gets tested: the denser check rejects 82% of raw mountain
+          // maps, and at 8 attempts 40 of these 1000 rounds came back tame.
+          const surface = Array.from(state.terrain.surface);
+          if (Math.max(...surface) - Math.min(...surface) < 240) tameMaps += 1;
+
+          for (const issue of report.issues) {
+            const where = `${style} ${count}p seed ${seed}: ${issue.kind} @${issue.column}`;
+            if (issue.kind !== 'blocked' || issue.target === undefined) {
+              otherKinds.push(where);
+              failures.push(where);
+              continue;
+            }
+            const separation = Math.abs(issue.target - issue.column);
+            shortestBlocked = Math.min(shortestBlocked, separation);
+            failures.push(`${where}->${issue.target} (${separation} px apart)`);
+          }
+        }
+      }
+    }
+
+    expect(matches).toBe(TERRAIN_STYLES.length * counts.length * 40);
+    expect(failures.length, failures.join('\n')).toBeLessThanOrEqual(12);
+
+    // Nothing that ruins a round on its own may slip through. A tank on a
+    // cliff, in a shaft or buried at the ceiling is a per-column property the
+    // sampled check cannot see between its samples at all, so this is the part
+    // of the guarantee that has to be exactly zero — and the generator's slope
+    // cap is what makes it so.
+    expect(otherKinds).toEqual([]);
+
+    // And the residue that is left is confined to shots near the gun's limit,
+    // where a hill wins because the arc has to be flat. A blocked pair at
+    // short range would be the stalemate this whole file exists to prevent.
+    if (failures.length > 0) expect(shortestBlocked).toBeGreaterThan(600);
+
+    // No round was handed the boring fallback map to buy that number.
+    expect(tameMaps).toBe(0);
+  }, 300_000);
 });
 
 describe('retrying and falling back', () => {
@@ -376,9 +498,6 @@ describe('the check catches what it claims to', () => {
 });
 
 describe('default spawn columns', () => {
-  const players = (count: number): PlayerSeed[] =>
-    Array.from({ length: count }, (_, i) => ({ id: `p${i}`, name: `P${i}` }));
-
   it('covers the band game.ts actually places tanks in', () => {
     // Derived from the real placement code, not from restating the two literals
     // `defaultSpawnColumns` is built out of. `game.ts` narrows its margins as
@@ -414,12 +533,21 @@ describe('default spawn columns', () => {
     expect(band.hi).toBeGreaterThan(Math.round(WIDTH * 0.9));
 
     const columns = defaultSpawnColumns(WIDTH);
-    expect(columns).toHaveLength(7);
     expect(columns[0]).toBe(band.lo);
-    expect(columns[6]).toBe(band.hi);
+    expect(columns[columns.length - 1]).toBe(band.hi);
+
+    // Not "there are SPAWN_SAMPLES of them" — that is the constant restating
+    // itself. What matters is how far apart they are, because the gap is where
+    // a real tank lands unchecked: at 3 px/column of generated slope a tank
+    // half a step from a sample stands up to 1.5 * gap px off the ground the
+    // check stood on. 50 px keeps that under a tank height and change.
+    let widestGap = 0;
     for (let i = 1; i < columns.length; i += 1) {
-      expect(columns[i] as number).toBeGreaterThan(columns[i - 1] as number);
+      const gap = (columns[i] as number) - (columns[i - 1] as number);
+      expect(gap).toBeGreaterThan(0);
+      widestGap = Math.max(widestGap, gap);
     }
+    expect(widestGap).toBeLessThanOrEqual(50);
   }, 120_000);
 
   it('degenerates sanely for one spawn', () => {

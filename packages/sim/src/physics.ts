@@ -75,6 +75,10 @@ export const PHYSICS = {
    * covers 60 px, so `ceil(distance)` can never reach `maxSubSteps` and the
    * clamp there can never silently coarsen the sampling. Without it, a caller
    * passing a large `velocity` override could tunnel.
+   *
+   * It is a real clamp at every finite velocity, up to and including
+   * `Number.MAX_VALUE` — see the overflow note at the clamp site, and the test
+   * that fires at 1e308 and measures the step length.
    */
   maxSpeed: 3600,
   /** Hard cap so a shot fired straight up into low gravity still terminates. */
@@ -97,6 +101,11 @@ export const PHYSICS = {
    * (The appended impact point is the one exception — it lands wherever the
    * shell actually hit.)
    *
+   * MUST BE EVEN. That is what keeps the step a halving fires on a multiple of
+   * the doubled stride — see the emit site — and it is asserted in
+   * `test/physics.test.ts`, because an odd budget would silently put one point
+   * per halving off-rhythm.
+   *
    * `test/physics.test.ts` pins the resulting point count and JSON size as
    * absolute numbers, not as a restatement of this constant.
    */
@@ -118,19 +127,28 @@ export const PHYSICS = {
    * file. 1.5 is half a radius of clear air past the rim — 4.5 px for the
    * standard 9 px tank, a quarter of the hull's width.
    *
-   * The value is pinned from BOTH sides in `test/physics.test.ts`, because there
-   * is no knee in the data to appeal to: raising it walks the shortest lob that
-   * can land on your own head steadily upward (one power notch per pixel), and
-   * pushed far enough it would quietly delete that behaviour altogether. The
-   * test asserts the exact lowest self-detonating power, so any movement in
-   * either direction fails.
+   * There is no knee in the data to appeal to — self-hits fall off smoothly as
+   * the margin grows — so the value is pinned from both sides by measurement
+   * instead. `test/physics.test.ts` runs the whole 181 x 101 angle/power grid
+   * and asserts the EXACT self-hit count, 346, plus the exact shortest self-hit
+   * flight, 27 steps. Measured over that grid, those two numbers hold on
+   * armFactor in [1.4998, 1.5002] and nowhere else: 1.4997 gives 348 self-hits,
+   * 1.5003 gives 344 and a 28-step shortest. The coarser landmarks either side
+   * are the ones that matter for feel — the lowest self-detonating power is 12
+   * from 1.37 to 1.502, drops to 11 at 1.36 and below (and to 8 with no margin
+   * at all), and climbs to 13 at 1.503, 16 at 2 and 21 at 3.
    */
   armFactor: 1.5,
   /** How far off-screen (left/right/top) a projectile may drift before it is lost. */
   offscreenMargin: 400,
 } as const;
 
-const MAX_SPEED_SQUARED = PHYSICS.maxSpeed * PHYSICS.maxSpeed;
+/**
+ * Cheap pre-filter for the speed clamp: |v| <= sqrt(2) * max(|vx|, |vy|), so no
+ * velocity whose largest component is under this can possibly exceed
+ * `maxSpeed`. Below it the per-step work is two `abs`, a `max` and a compare.
+ */
+const CLAMP_TRIGGER = PHYSICS.maxSpeed / Math.sqrt(2);
 
 export interface ProjectileSpawn {
   x: number;
@@ -303,11 +321,22 @@ export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): 
     vx += windAccel * dt;
     vy += gravity * dt;
 
-    const speedSquared = vx * vx + vy * vy;
-    if (speedSquared > MAX_SPEED_SQUARED) {
-      const scale = PHYSICS.maxSpeed / Math.sqrt(speedSquared);
-      vx *= scale;
-      vy *= scale;
+    // Clamp to `maxSpeed`, scaling by the LARGEST COMPONENT rather than by the
+    // speed itself. `vx*vx + vy*vy` overflows to Infinity once |v| passes
+    // sqrt(Number.MAX_VALUE) = 1.3407807929942596e154, and `maxSpeed / Infinity`
+    // is 0 — the clamp would then zero the velocity outright instead of capping
+    // it. That was measurable: with `velocity: {vx: 1e160, vy: 0}` the shell
+    // dropped at the muzzle instead of flying at the ceiling. Both ratios below
+    // are in [-1, 1], so nothing here can overflow for any finite input, and
+    // `maxSpeed / unit` is between maxSpeed/sqrt(2) and maxSpeed.
+    const largest = Math.max(Math.abs(vx), Math.abs(vy));
+    if (largest > CLAMP_TRIGGER) {
+      const unit = hypot2(vx / largest, vy / largest); // 1 <= unit <= sqrt(2)
+      if (largest > PHYSICS.maxSpeed / unit) {
+        const scale = PHYSICS.maxSpeed / unit / largest;
+        vx *= scale;
+        vy *= scale;
+      }
     }
 
     const nextX = x + vx * dt;
@@ -323,11 +352,17 @@ export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): 
     y = nextY;
 
     if (steps % stride === 0) {
+      // The halving doubles the stride, and this very step must still be a
+      // multiple of the doubled one or the emit below would land off-rhythm.
+      // It always is, and that follows from `maxPathPoints` being EVEN: `length`
+      // only ever grows one point per emit, so it arrives at the budget exactly,
+      // at step `length * stride`; with length = maxPathPoints even, that step
+      // divides by the doubled stride too (quotient maxPathPoints/2). Replaying
+      // the whole schedule confirms it — halvings fire at steps 512, 1024, 2048
+      // with quotient 256 every time, and there is no off-rhythm step for any
+      // even budget or any step budget. `test/physics.test.ts` pins the parity.
       if (length >= PHYSICS.maxPathPoints) halveResolution();
-      // Re-test: halving doubled the stride, and this step may no longer be a
-      // multiple of it. Skipping the emit is correct — the next multiple is
-      // still exactly one new stride after the last surviving point.
-      if (steps % stride === 0) emit(x, y);
+      emit(x, y);
     }
 
     // Off the sides or below the world: gone. Above the world is legal —

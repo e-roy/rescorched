@@ -11,7 +11,13 @@
  */
 
 import { clamp, hypot2 } from './math.ts';
-import { applyCrater, surfaceAt, type Terrain } from './terrain.ts';
+import {
+  applyCrater,
+  MAX_BLAST_SLOPE,
+  MAX_TERRAIN_SLOPE,
+  surfaceAt,
+  type Terrain,
+} from './terrain.ts';
 import type { Rng } from './rng.ts';
 import { damageAtDistance, type WeaponDef } from './weapons.ts';
 
@@ -34,11 +40,35 @@ export interface DetonationTarget {
   }[];
 }
 
+/**
+ * What a detonation reports to the outside world.
+ *
+ * `shot` is the odd one out and is here on purpose. `e2e/reference/README.md`,
+ * written from the 1991 screenshots, names as a defining look: "Trajectory arcs
+ * are thin blue/violet lines and several are visible at once (a Funky Bomb
+ * splitting into multiple sub-munitions, each drawing its own arc)." A weapon
+ * that teleports its warheads to a ground position and detonates them cannot be
+ * drawn that way at all — the player sees one arc and then eight instantaneous
+ * circles — and the vocabulary, not the client, is what forecloses it. So a
+ * sub-munition that travels emits its flight, and the client draws it with the
+ * same code that draws the parent shell's.
+ *
+ * It reuses `shot` rather than introducing a `submunition` type deliberately.
+ * A shell in flight is a shell in flight: `shot` already carries exactly
+ * (weapon, path) and nothing else a warhead needs, `game.ts` already forwards
+ * detonation events onto the wire unchanged, and `@scorched/protocol` already
+ * accepts it — a new member would be rejected by `encodeServerMessage` the
+ * moment a Funky Bomb went off. The one thing `shot` requires that a detonation
+ * does not always have is a tank to attribute it to, so an arc is emitted only
+ * when there is a shooter; a detonation with no shooter (a test fixture, fall
+ * damage) still resolves identically, it just has no flight to draw.
+ */
 export type DetonationEvent =
   | { type: 'explosion'; x: number; y: number; radius: number; weapon: string }
   | { type: 'dirt'; x: number; y: number; radius: number }
   | { type: 'damage'; tankIndex: number; amount: number; healthAfter: number }
-  | { type: 'death'; tankIndex: number; byTankIndex: number | null };
+  | { type: 'death'; tankIndex: number; byTankIndex: number | null }
+  | { type: 'shot'; tankIndex: number; weapon: string; path: number[]; impactKind: string };
 
 /** Vertical offset from a tank's feet to the point blasts are measured against. */
 export const TANK_DAMAGE_OFFSET = 4.5;
@@ -77,17 +107,27 @@ const NAPALM_VISUAL_SCALE = 0.85;
  * Angle of repose for dropped dirt, in pixels per column.
  *
  * Two numbers because the two dirt families behave differently in the hand. A
- * Dirt Ball is a heap of soil and stands at the same 2 px/column the terrain
- * generator allows virgin ground, so a dropped hill is exactly as climbable as
- * a natural one. Liquid Dirt is a liquid — a quarter of a pixel per column is
- * near enough level that it floods a crater instead of capping it, and it is
- * why the same code produces a compact mound for one and a wide flat pool for
- * the other.
+ * Dirt Ball is a heap of soil and stands at `MAX_TERRAIN_SLOPE` — as steep as
+ * the generator's own hillsides, and no steeper. Liquid Dirt is a liquid: a
+ * quarter of a pixel per column is near enough level that it floods a crater
+ * instead of capping it, and it is why the same code produces a compact mound
+ * for one and a wide flat pool for the other.
  *
- * Both sit under `MAX_BLAST_SLOPE` in terrain.ts, so no dirt weapon can leave
- * the steepest face on the map behind it.
+ * Tied to the generator's cap rather than written as a number, because a heap
+ * laid SHALLOWER than the ground it lands on does not stand up at all: it runs
+ * away downhill for as long as the hill falls faster than the profile rises. At
+ * 2 px/column against a generator that allows 3, a Dirt Clod — "a shovelful of
+ * cover" — spread 900 square pixels of soil over 115 columns of a 2 px/column
+ * grade and stood 8 px tall, and on generated maps its shallowest pile over 200
+ * shots was 11 px. It is a shovelful of cover; it has to be a pile.
+ *
+ * Measured against the same 200 shots, raising it from 2 to 3 takes the Dirt
+ * Clod's median pile from 41 px to 51 and the Ton of Dirt's from 88 to 109.
+ *
+ * Both sit under `MAX_BLAST_SLOPE`, so no dirt weapon can leave a face steeper
+ * than the destruction path is allowed to hold.
  */
-const DIRT_REPOSE = 2;
+const DIRT_REPOSE = MAX_TERRAIN_SLOPE;
 const LIQUID_REPOSE = 0.25;
 
 /**
@@ -98,21 +138,35 @@ const LIQUID_REPOSE = 0.25;
  * for as long as the hill falls faster than the profile rises, which on a
  * constant grade is forever, and the level that would hold the right volume
  * then does not exist. Past its reach the pool stops behaving like a liquid and
- * piles like soil, which both bounds it and — being under `MAX_BLAST_SLOPE` —
- * leaves no step behind when it does.
+ * piles like soil.
+ *
+ * `MAX_BLAST_SLOPE` and not `DIRT_REPOSE`, which is what it used to be: at
+ * `DIRT_REPOSE` the rim continues the body at exactly the body's own slope, so
+ * for every weapon in the `dirt` family it was a strict no-op and bounded
+ * nothing. The steepest face blast-loosened dirt will hold is the steepest edge
+ * a heap of it can end on, so it is also the tightest bound available that
+ * still leaves no step the rest of the file would have to slump away.
  */
-const POOL_RIM = DIRT_REPOSE;
+const POOL_RIM = MAX_BLAST_SLOPE;
 
 /**
  * How far ahead the downhill test looks, in columns.
  *
  * Sampling one column either side is useless on an integer heightmap: virgin
- * ground is capped at 2 px per column, so over a short span the two sides tie
- * constantly, and a tie used to stop a roll dead. It also has to be wide enough
- * to see past the noise — generated terrain carries detail down to ~13 px, and
- * a roller that stops at every 13 px ripple never reaches the valley. Measured
- * over 30 maps in each of the five styles, widening this from 16 to 96 columns
- * took a Heavy Roller's mean travel from 55 px to 134 px.
+ * ground is capped at `MAX_TERRAIN_SLOPE` px per column, so over a short span
+ * the two sides tie constantly, and a tie stops a roll dead. It also has to be
+ * wide enough to see past the noise — generated terrain carries detail down to
+ * ~13 px, and a roller that stops at every 13 px ripple never reaches the
+ * valley. Re-measured over 1050 Heavy Roller shots (30 maps in each of the five
+ * styles, seven landing columns each) against the code as it now stands: mean
+ * travel is 52 px at a 1-column window, 59 px at 16 and 110 px at 96.
+ *
+ * It decides direction and how much descent is left. It deliberately does NOT
+ * decide whether a roller starts moving at all — see `flowPath`'s fourth rule.
+ * When it did, a window this wide behaved as a 96-column gravity well: on a
+ * dead-flat plateau ending in a cliff, a Heavy Roller dropped 100 px back from
+ * the edge sat where it landed and one dropped 60 px back rolled off, with
+ * nothing on screen to tell a player which they were about to get.
  */
 const SLOPE_WINDOW = 96;
 
@@ -284,31 +338,41 @@ export function detonate(
       // position instead put all four on one pixel wherever the ground happened
       // to be level, which is both invisible and worthless.
       const hops = Math.max(2, Math.floor(weapon.hops ?? 4));
-      const gap = Math.max(4, Math.round(weapon.radius * (weapon.hopSpacing ?? 0.7)));
+      const gap = Math.max(4, Math.round(weapon.radius * (weapon.hopSpacing ?? 2)));
 
       // Which way it bounces: downhill if the ground has an opinion, otherwise
       // the impact throws it one way or the other and only the seed knows which.
       let heading = downhillDirection(target.terrain, originX, Math.max(gap, SLOPE_WINDOW));
       if (heading === 0) heading = rng.chance(0.5) ? 1 : -1;
 
+      // Every landing point is measured against the ground as it is NOW, before
+      // any hop has carved anything — the same rule, and for the same reason, as
+      // the salvo in the `cluster` case below. Measuring each hop after the
+      // previous blast dropped hops two onward 30 to 60 px into the crater the
+      // hop before them had just dug, and a tank standing at the impact point
+      // took damage from the first bang and nothing from the other three.
+      const stops: { x: number; y: number }[] = [{ x: originX, y }];
       let cursor = originX;
-      for (let i = 0; i < hops; i += 1) {
-        blast(
-          target,
-          weapon,
-          cursor,
-          surfaceAt(target.terrain, cursor),
-          shooterIndex,
-          rules,
-          events,
-        );
-
+      for (let i = 1; i < hops; i += 1) {
         let next = cursor + heading * gap;
         if (next < 0 || next > width - 1) {
           heading = -heading; // bounced off the edge of the world
           next = cursor + heading * gap;
         }
         cursor = clamp(next, 0, width - 1);
+        stops.push({ x: cursor, y: surfaceAt(target.terrain, cursor) });
+      }
+
+      for (let i = 0; i < stops.length; i += 1) {
+        const stop = stops[i] as { x: number; y: number };
+        // Interleaved, unlike the cluster salvo: a leapfrog really is
+        // sequential — bang, hop, bang — so the arc belongs between the two
+        // explosions it connects.
+        if (i > 0) {
+          const from = stops[i - 1] as { x: number; y: number };
+          pushArc(events, weapon, shooterIndex, from.x, from.y, stop.x, stop.y);
+        }
+        blast(target, weapon, stop.x, stop.y, shooterIndex, rules, events);
       }
       return events;
     }
@@ -334,6 +398,15 @@ export function detonate(
       }
 
       blast(target, weapon, originX, y, shooterIndex, rules, events);
+
+      // Every warhead's flight, as a contiguous run, before any of them lands.
+      // Contiguous on purpose: the look the reference singles out is several
+      // arcs in the air AT ONCE, and a client can only draw that if the events
+      // it is meant to play together arrive together. Arc `i` pairs with the
+      // i-th explosion that follows the run.
+      for (const child of salvo) {
+        pushArc(events, weapon, shooterIndex, originX, y, child.x, child.y);
+      }
       for (const child of salvo) {
         blast(target, weapon, child.x, child.y, shooterIndex, rules, events);
       }
@@ -396,6 +469,88 @@ export function detonate(
 }
 
 // ---------------------------------------------------------------------------
+// Sub-munition flight
+// ---------------------------------------------------------------------------
+
+/**
+ * Pixels of ground per point of a sub-munition's arc.
+ *
+ * A drawing resolution, not a physics timestep: the client walks the path point
+ * to point and draws straight lines between them, and a parabola sags below its
+ * own chord by `apex * (segment / span)^2`. At one point per 24 px a Funky
+ * Bomb's longest throw is five points and that error is about a pixel, so the
+ * polyline reads as a curve. Sampling finer buys nothing visible and costs real
+ * bytes — every event in a volley shares one frame, and `@scorched/protocol`
+ * refuses to parse one over 16 KB.
+ */
+const ARC_SAMPLE_SPACING = 24;
+const ARC_MIN_POINTS = 4;
+const ARC_MAX_POINTS = 10;
+/**
+ * Apex of a sub-munition's arc, as a fraction of how far it is thrown.
+ *
+ * The arc is cosmetic — where the warhead lands was decided before it was
+ * thrown — so this is chosen to read, not to integrate: a fifth of the throw
+ * gives a Funky Bomb's outermost warheads a lob a player can follow and its
+ * innermost a short skip, which is the difference between "eight arcs" and
+ * "eight lines".
+ */
+const ARC_LIFT = 0.2;
+
+/**
+ * Sample the parabola a thrown sub-munition follows, as a flat
+ * `[x0, y0, x1, y1, …]` path. Built from `+ - *` only, so it is bit-identical
+ * everywhere, and it starts and ends exactly on the two points it connects.
+ *
+ * The points in between are rounded to whole pixels — they are positions to
+ * draw a shell at, and `189` costs four bytes on the wire where
+ * `189.33333333333334` costs eighteen. The two ends are not rounded: they have
+ * to line up exactly with the explosions they run between, and a client that
+ * drew the trail to a pixel other than the one the blast is centred on would
+ * show the shell jumping at the moment it went off.
+ */
+function arcPath(fromX: number, fromY: number, toX: number, toY: number): number[] {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const span = hypot2(dx, dy);
+  const points = clamp(Math.round(span / ARC_SAMPLE_SPACING), ARC_MIN_POINTS, ARC_MAX_POINTS);
+  const lift = span * ARC_LIFT;
+
+  const path: number[] = [fromX, fromY];
+  for (let i = 1; i < points - 1; i += 1) {
+    const t = i / (points - 1);
+    // Zero at both ends, one in the middle. Screen Y grows down, so up is minus.
+    const hump = 4 * t * (1 - t);
+    path.push(Math.round(fromX + dx * t), Math.round(fromY + dy * t - lift * hump));
+  }
+  path.push(toX, toY);
+  return path;
+}
+
+/** Record one sub-munition's flight, if there is a shooter to attribute it to. */
+function pushArc(
+  events: DetonationEvent[],
+  weapon: WeaponDef,
+  shooterIndex: number | null,
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+): void {
+  if (shooterIndex === null || !Number.isInteger(shooterIndex) || shooterIndex < 0) return;
+  if (!Number.isFinite(fromX) || !Number.isFinite(fromY)) return;
+  if (!Number.isFinite(toX) || !Number.isFinite(toY)) return;
+
+  events.push({
+    type: 'shot',
+    tankIndex: shooterIndex,
+    weapon: weapon.id,
+    path: arcPath(fromX, fromY, toX, toY),
+    impactKind: 'terrain',
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Downhill
 // ---------------------------------------------------------------------------
 
@@ -405,11 +560,12 @@ interface Downhill {
    * ground on that side is lower on average. Screen Y grows downward, so a
    * LARGER surface value is lower ground.
    *
-   * Summed rather than sampled at one point, because the heightmap is integers.
+   * Summed rather than sampled at one point, because the heightmap is integers:
    * `surface[x - step]` and `surface[x + step]` tie all over a real generated
-   * map and a tie used to stop a roller dead: measured over 30 maps, half of
-   * all Heavy Roller shots went nowhere. An integral ties only where the two
-   * sides are near mirror images, which is what a dip actually is.
+   * map, and a tie stops a roller dead. An integral ties only where the two
+   * sides are near mirror images, which is what a dip actually is. The size of
+   * the effect is measured on `SLOPE_WINDOW` — collapsing the window to a
+   * single column takes a Heavy Roller's mean travel from 110 px to 52.
    */
   fall: number;
   /** Lowest ground found anywhere in the window — how much descent is left. */
@@ -452,6 +608,17 @@ function downhillDirection(terrain: Terrain, x: number, window: number): number 
  *    has reached, but not a hill. That is what a heavy thing rolling does, and
  *    it is the difference between "crosses the ridge into the next valley" and
  *    "stops on the ridge".
+ *  - Nothing at rest starts moving unless the ground falls away UNDER it, within
+ *    one stride. `SLOPE_WINDOW` is 96 columns wide, and without this rule that
+ *    width applied to a stationary shell as well as a moving one: level ground
+ *    with a drop anywhere in the window read as downhill, so a Heavy Roller
+ *    dropped 100 px back from a cliff on a dead-flat plateau stayed put while
+ *    one dropped 60 px back rolled off — two shots on ground that looks
+ *    identical, and no way to tell them apart before firing. With the rule the
+ *    only place the behaviour changes is within one stride of the visible edge,
+ *    which is exactly where a player expects "it was right on the lip" to
+ *    matter. Momentum is unaffected: once it is moving, the wide window carries
+ *    it across flats and ripples as before.
  */
 function flowPath(
   terrain: Terrain,
@@ -481,6 +648,13 @@ function flowPath(
 
     const ahead = direction === 1 ? right : left;
     if (ahead.lowest <= here) break; // nothing lower within reach: settled
+
+    // Standing start: the ground it is sitting on has to go down, not merely
+    // lead somewhere that does. One stride, because that is the shell's own
+    // size — the smallest window that cannot be fooled by the heightmap's
+    // integer rounding, and small enough that "the ground under it is level"
+    // means what a player would say it means.
+    if (heading === 0 && lookDownhill(terrain, cursor, direction, step).lowest <= here) break;
 
     const next = clamp(cursor + direction * step, 0, terrain.width - 1);
     if (next === cursor) break; // pinned against the edge of the map
@@ -561,18 +735,22 @@ function walkPool(
 /**
  * Pour `volume` square pixels of dirt onto a column and let it settle.
  *
- * The settled profile is `min(surface, level + repose * |x - centre|)` over the
- * connected pool: a heap at the angle of repose, clipped by any ground already
- * standing higher. At the Dirt Ball's 2 px/column that is a compact mound; at
- * Liquid Dirt's quarter pixel it is a wide flat pool that floods a crater
- * rather than capping it. Three properties follow from the shape, and each one
- * is a defect this replaced:
+ * The settled profile is `min(surface, level + repose * |x - centre|)` inside
+ * the pool's reach and `POOL_RIM` per column beyond it, over the connected
+ * pool, clipped by any ground already standing higher. At solid dirt's
+ * `DIRT_REPOSE` that is a compact mound — measured on generated ground, a Dirt
+ * Clod's pile is 0.66 columns wide per pixel of height; at Liquid Dirt's
+ * quarter pixel it is a wide flat pool, 3.5 columns per pixel, that floods a
+ * crater rather than capping it. Three properties follow from the shape, and
+ * each one is a defect this replaced:
  *
  *  - It cannot build a spire. Stacking circular mounds on one column could, and
  *    did: a 136 px tower 35 px wide with a 127 px step down its side.
  *  - It cannot create a cliff that was not already there. Inside the pool the
- *    step is at most `ceil(repose)`; at the boundary the filled column rises
- *    toward the blocking ground, so that step only ever shrinks.
+ *    step is at most `ceil(repose)` and past its reach at most `POOL_RIM`,
+ *    which is `MAX_BLAST_SLOPE` — the limit the whole destruction path is held
+ *    to. At the boundary the filled column rises toward the blocking ground, so
+ *    that step only ever shrinks.
  *  - It cannot overfill a hole it is smaller than, because the level is solved
  *    from the volume rather than assumed.
  *

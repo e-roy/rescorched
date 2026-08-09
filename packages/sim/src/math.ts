@@ -16,13 +16,32 @@
  * Accuracy is a separate question, and it has a domain. Every `detSin`/`detCos`
  * call in this repo goes through `detSinDeg`/`detCosDeg` with an angle in
  * degrees, so the argument is small; over |x| <= 4*PI the worst deviation from
- * the engine's own `Math.sin`/`Math.cos` is below 1e-12, and `detAtan`/
- * `detAtan2` are good to ~1e-15 at any magnitude. Outside that band `detSin`
- * and `detCos` decay, because the first argument fold in `reduceQuadrant` uses
- * a single-double 2*PI: worst error is about 8e-11 at |x| = 1e6, 6e-9 at 1e8
- * and 3e-5 at 1e12. `test/math.test.ts` measures all of those, including the
- * decay, so the limit is a tested fact rather than a footnote. Determinism is
- * unaffected either way. If a caller ever needs a large argument, split TWO_PI
+ * the engine's own `Math.sin`/`Math.cos` is below 1e-12 (measured 3.9e-13), and
+ * `detAtan`/`detAtan2` are good to ~1e-15 at any magnitude.
+ *
+ * That last bound is nearly tight, which means the figure moves with how hard
+ * you look — so each number here names the sweep that produced it, and a bare
+ * "measured N" would say nothing at all. Over 200001 points of [-1, 1], where
+ * `atanCore` runs alone, `detAtan` is worst by 7.8e-16; over 200001 points of
+ * [1, 1.2], where it switches to the reciprocal branch and differences PI/2, by
+ * 8.9e-16 — the branch, not the series, is what sets this bound. `detAtan2` is
+ * worst by 8.9e-16 over the angle grid in its own test. Those three sweeps are
+ * the ones `test/math.test.ts` runs, each bounded from both sides. Searching
+ * harder finds a little more: t = 1 + i/4e6 for i = 0..4e6 holds exactly one
+ * sample at 9.99e-16, nine ulps, and that is the largest deviation found
+ * anywhere — nothing tried reaches 1e-15.
+ *
+ * Inside that domain the binding constraint is `cosCore`'s truncation, at
+ * 3.8e-13 — NOT argument reduction, which contributes nothing measurable there.
+ * Outside it the two swap places and `detSin`/`detCos` decay, because the first
+ * fold in `reduceQuadrant` uses a single-double 2*PI: worst error is about
+ * 8.3e-11 at |x| = 1e6, 1.0e-8 at 1e8 and 3.2e-5 at 1e12. `test/math.test.ts`
+ * measures all of those — both cores separately, the decay, and the three atan
+ * sweeps above — so the numbers in this header are tested facts rather than
+ * footnotes. The single exception is the 9.99e-16 outlier: four million samples
+ * is too slow for a unit test, so the recipe is written out instead and can be
+ * rerun in a second. Determinism is unaffected either way, at every magnitude
+ * and in every direction. If a caller ever needs a large argument, split TWO_PI
  * into hi/lo doubles the way HALF_PI is split below — do not just widen the
  * claim.
  */
@@ -37,18 +56,37 @@ export const RAD_TO_DEG = 57.29577951308232;
  * PI/2 split into two doubles that sum to it exactly.
  *
  * `HALF_PI_HI` has its low mantissa bits cleared, so `k * HALF_PI_HI` is exact
- * for the small integer k that argument reduction produces. Subtracting the two
- * halves separately keeps ~20 extra bits of accuracy that a single subtraction
- * would throw away — which is the difference between cos(0) coming back as 1
- * and coming back as 1.0000000007.
+ * for the small integer k that argument reduction produces, and the second
+ * subtraction puts the cleared bits back without a rounding step in the middle.
+ *
+ * Be clear about how little this buys, because the obvious reading is wrong.
+ * `HALF_PI_HI + HALF_PI_LO === HALF_PI` exactly, so what is reconstructed is
+ * the DOUBLE nearest PI/2, not a wider one — the split cannot recover the
+ * 6.1e-17 by which that double already misses the true PI/2. And the first fold
+ * in `reduceQuadrant` leaves |k| <= 5 for every |x| up to 1e17 (measured), a
+ * range over which `k * HALF_PI` barely rounds anyway.
+ *
+ * Measured over |x| <= 4*PI: the split changes the reduced remainder for about
+ * 75% of arguments, by at most 1.25e-16 — one ulp of the remainder (it reaches
+ * 3.1e-16 only out at |x| ~ 1e17, where |k| gets to 5) — and it moves the worst
+ * error of `detSin` over that domain not at all (3.891e-13 split, 3.890e-13
+ * single), because `cosCore`'s 3.8e-13 truncation swamps it three orders of
+ * magnitude up. It is kept because it is free and correct, NOT because it is
+ * what holds the accuracy claim up. That is `cosCore`'s polynomial degree.
+ *
+ * Concretely: substituting a single-double `HALF_PI` here leaves every test in
+ * `test/math.test.ts` green. Nothing below this line is evidence that the split
+ * works — do not read it as such. (Substituting a single-double is still not
+ * worth doing: it changes 75% of reduced remainders, so it would move every
+ * trajectory in the game by an ulp and churn the golden snapshot, for nothing.)
  */
 const HALF_PI_HI = 1.5707963267341256;
 const HALF_PI_LO = 6.077100506506192e-11;
 
 /**
  * sin(x) for |x| <= PI/4. Taylor through x^13 in Horner form.
- * |error| < 3e-14 on that interval — comfortably below double rounding noise
- * at the magnitudes this game deals in.
+ * |error| < 3e-14 on that interval (measured worst 2.01e-14) — comfortably
+ * below double rounding noise at the magnitudes this game deals in.
  */
 function sinCore(x: number): number {
   const u = x * x;
@@ -63,7 +101,24 @@ function sinCore(x: number): number {
   return x * p;
 }
 
-/** cos(x) for |x| <= PI/4. Taylor through x^12. |error| < 1e-15. */
+/**
+ * cos(x) for |x| <= PI/4. Taylor through x^12.
+ *
+ * |error| < 4e-13 on that interval (measured worst 3.83e-13 near the ends).
+ * This is the largest error anywhere in this file over the domain the sim uses,
+ * and it is truncation, not rounding: the first omitted term is x^14/14!, which
+ * is 3.90e-13 at x = PI/4 and 3.84e-13 at 0.999*PI/4 — the endpoint of the
+ * sweep that measured the 3.83e-13 above, and the two agree to 0.24%. That
+ * agreement is the actual evidence for "truncation, not rounding"; a figure
+ * that missed by a factor would be evidence against it. `sinCore` runs two
+ * orders further in x for the same six multiply-adds, which is why it lands at
+ * 2e-14 instead.
+ *
+ * If a caller ever needs better than 1e-12 here, add the x^14 term — do not
+ * restate the bound. Note that `detSin` routes through this function in
+ * quadrants 1 and 3, so this is the error of sin(45 degrees) too, not some
+ * corner case: `test/math.test.ts` measures both cores separately.
+ */
 function cosCore(x: number): number {
   const u = x * x;
   // 1 - u/2 + u^2/24 - u^3/720 + u^4/40320 - u^5/3628800 + u^6/479001600
@@ -82,11 +137,13 @@ function cosCore(x: number): number {
  * Only `+ - * /` and `Math.round`, all exactly specified, so the result is
  * bit-identical on every engine.
  *
- * The first fold is the accuracy limit of the whole file: `TWO_PI` is one
+ * The first fold is what limits this file at LARGE arguments: `TWO_PI` is one
  * double, so `Math.round(x / TWO_PI) * TWO_PI` carries the ~1e-16 relative
- * error of that constant scaled by the turn count. Harmless for the angles the
- * sim uses (under a handful of turns), visible past |x| ~ 1e5. See the file
- * header.
+ * error of that constant scaled by the turn count. That is invisible for the
+ * angles the sim uses (under a handful of turns), where `cosCore`'s 3.8e-13
+ * truncation is three orders of magnitude larger and sets the file's real
+ * bound; it overtakes `cosCore` somewhere past |x| ~ 1e5 and dominates from
+ * there. See the file header for the measured figures at both ends.
  */
 function reduceQuadrant(x: number): { r: number; quadrant: number } {
   // First fold into [-PI, PI] so the second reduction only ever sees small k.
@@ -149,11 +206,25 @@ const THREE_QUARTER_PI = PI - QUARTER_PI;
  *
  *     atan(t) = 2 * atan( t / (1 + sqrt(1 + t*t)) )
  *
- * shrink the argument from tan(PI/4) = 1 down to tan(PI/32) ~= 0.0985, where the
- * odd Taylor series through t^13 has a truncation error below 1e-16 — so the
- * result is accurate to the last couple of bits rather than the ~1e-5 a bare
- * minimax polynomial on [0,1] manages. Three square roots buy ten decimal
- * digits, which is cheap at the rate this is called.
+ * shrink the argument from tan(PI/4) = 1 down to tan(PI/32) = 0.09849140335716425
+ * exactly, where the odd Taylor series through t^13 has a truncation error of
+ * 5.55e-17 (measured against `Math.atan` at that exact t).
+ *
+ * Do not read that 5.55e-17 as the accuracy of the result. Undoing the three
+ * halvings multiplies it by 8, so the series alone puts about 4.4e-16 into the
+ * returned angle, and rounding through the reduction adds the rest — which is
+ * why `detAtan` measures around 1e-15 rather than 1e-17. Measured directly:
+ * extending the series by a t^15 term drops the worst error on |x| <= 1 from
+ * 7.8e-16 to 4.4e-16 and no further, so roughly half of what is left is
+ * truncation and the other half is rounding. (Do not make that change casually
+ * — `test/math.test.ts` bounds these from both sides precisely so it cannot
+ * happen silently, and it would churn the golden snapshot.)
+ *
+ * The comparison that makes the case for the halvings is against the same
+ * series without them, since that is the one-line simplification someone will
+ * be tempted to make: straight on [0,1] it is worst by 3.55e-2 at t = 1,
+ * against the ~1e-15 `detAtan` actually achieves. Three square roots buy about
+ * thirteen decimal digits, which is cheap at the rate this is called.
  *
  * Every operation here is exactly specified: `Math.sqrt` is correctly rounded by
  * IEEE-754, and the rest is + - * /.

@@ -9,25 +9,25 @@ exports[`golden: ballistics > a fixed shot follows a stable path 1`] = `
 }
 `;
 
-exports[`golden: full match replay > produces a stable final state hash 1`] = `"febae0af"`;
+exports[`golden: full match replay > produces a stable final state hash 1`] = `"51ec3bca"`;
 
 exports[`golden: full match replay > records stable per-tank outcomes 1`] = `
 [
   {
     "alive": true,
-    "health": 3,
+    "health": 99,
     "id": "p1",
-    "score": 0,
+    "score": 24,
     "x": 381,
-    "y": 580,
+    "y": 509,
   },
   {
     "alive": true,
-    "health": 100,
+    "health": 3,
     "id": "p2",
-    "score": 22,
+    "score": 1,
     "x": 582,
-    "y": 454,
+    "y": 637,
   },
   {
     "alive": true,
@@ -35,7 +35,7 @@ exports[`golden: full match replay > records stable per-tank outcomes 1`] = `
     "id": "p3",
     "score": 0,
     "x": 1080,
-    "y": 586,
+    "y": 562,
   },
 ]
 `;
@@ -59,25 +59,25 @@ exports[`golden: rng > sfc32 output is stable 1`] = `
 
 exports[`golden: terrain > a fixed profile of columns is stable 1`] = `
 [
-  318,
-  522,
-  345,
-  264,
-  364,
-  366,
-  623,
-  561,
-  510,
-  379,
-  273,
+  227,
+  235,
+  308,
+  215,
+  238,
+  372,
+  534,
+  627,
+  436,
+  494,
+  476,
 ]
 `;
 
 exports[`golden: terrain > style "canyon" hashes stably 1`] = `"2b42b866"`;
 
-exports[`golden: terrain > style "mountains" hashes stably 1`] = `"2d991e5d"`;
+exports[`golden: terrain > style "mountains" hashes stably 1`] = `"27614a45"`;
 
-exports[`golden: terrain > style "plateaus" hashes stably 1`] = `"380ba13d"`;
+exports[`golden: terrain > style "plateaus" hashes stably 1`] = `"fd8e5c0f"`;
 
 exports[`golden: terrain > style "rolling" hashes stably 1`] = `"8abfaa4f"`;
 

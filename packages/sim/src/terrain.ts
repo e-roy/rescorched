@@ -187,12 +187,18 @@ interface StyleProfile {
  *  - It stays under `MAX_BLAST_SLOPE`, so nothing generated is over the limit
  *    the destruction path holds the map to.
  *  - Steeper ground hides more tanks. That cost is paid by the retry loop, and
- *    it has to be paid in seeds, not in unfightable rounds: measured over 200
- *    raw seeds per style, 3 px/column has the playability check reject 33% of
- *    mountains, 8% of plateaus, 7% of rolling, 5% of valleys, 4% of canyons.
- *    Eight attempts turn even the mountain figure into a 1-in-7000 chance of
- *    falling back to the tame map. At 4 px/column mountains reject 70%, which
- *    is the point where the fallback starts showing up in real matches.
+ *    it has to be paid in seeds, not in unfightable rounds. Measured over 150
+ *    raw seeds per style against the check at its shipped sampling density
+ *    (`SPAWN_SAMPLES`), 3 px/column is rejected on 82% of mountains, 31% of
+ *    plateaus, 27% of rolling, 8% of valleys, 5% of canyons; the mountain
+ *    figure over `MAX_TERRAIN_ATTEMPTS` attempts is 0.82^48, about one round in
+ *    8000 falling back to the tame map. At 4 px/column mountains reject 92%,
+ *    which is 0.92^48 — one mountain round in 50 — and that is the point where
+ *    the fallback starts showing up in real matches. (Both are far above the
+ *    33% / 70% this used to record, because the check now looks at 25 columns
+ *    instead of 7. Re-run at 7 columns on the same 150 seeds the old figures do
+ *    not reproduce either: 31% of mountains at 3 px/column and 54% at 4, not
+ *    33% and 70%.)
  *
  * This used to be 2, on the strength of a measurement that said 3 rejected 60%
  * of maps. That number was an artifact: the probe of the day sampled six powers
@@ -352,8 +358,24 @@ function shapeTerrain(options: TerrainOptions, style: TerrainStyle, rng: Rng): T
 // Generation
 // ---------------------------------------------------------------------------
 
-/** How many reshuffles a seed gets before the safe fallback map is used. */
-export const MAX_TERRAIN_ATTEMPTS = 8;
+/**
+ * How many reshuffles a seed gets before the safe fallback map is used.
+ *
+ * Sized against the rejection rate, not picked round. At `SPAWN_SAMPLES` the
+ * check rejects 82% of raw mountain maps (see `MAX_TERRAIN_SLOPE`), and every
+ * attempt is an independent draw, so the chance of exhausting the loop is
+ * 0.82^attempts. Measured over the 1000 real `createGame` matches
+ * `test/terrain-playability.test.ts` sweeps — 5 styles x {2,3,4,6,8} players x
+ * 40 seeds — the number that came back as the tame fallback map was 40 at 8
+ * attempts (every one of them a mountain round), 3 at 24, and 0 at 48. It was 8
+ * when the check only looked at 7 columns and rejected 31% of mountains; the
+ * denser check needs the longer loop or it trades unfightable rounds for boring
+ * ones.
+ *
+ * The cost is bounded and paid once per round: generation over those same 1000
+ * matches averages 8 ms and peaks at 78 ms.
+ */
+export const MAX_TERRAIN_ATTEMPTS = 48;
 
 /**
  * Derive attempt N's seed from the map's base seed.
@@ -444,11 +466,12 @@ export function generateSafeTerrain(options: TerrainOptions, rng: Rng): Terrain 
  * match `PHYSICS` — a test that compared `PHYSICS` against its own local copies
  * of the literals could not.
  *
- * `maxSteps` is the one deliberate difference: `PHYSICS.maxSteps` is 3600, six
- * seconds of flight, sized for a shot lobbed off the top of the screen in low
- * gravity. The probe fires no such shot — it aims at a point 1280 px away at
- * most, which is under four seconds even on the highest arc power 100 can hold
- * — so 1200 steps is the same budget with the unreachable tail cut off.
+ * `maxSteps` is the one deliberate difference: `PHYSICS.maxSteps` is 3600, and
+ * at `dt` = 1/60 that is sixty seconds of flight, sized for a shot lobbed off
+ * the top of the screen that never comes down. The probe fires no such shot —
+ * it aims at a point on this map, 1280 px away at most, and the slowest arc it
+ * can pick is under four seconds — so 1200 steps (twenty seconds) keeps a 5x
+ * margin with the unreachable tail cut off.
  */
 export const PROBE = {
   gravity: 260,
@@ -582,17 +605,57 @@ export function spawnBand(width: number): { lo: number; hi: number } {
 }
 
 /**
+ * How many columns of the placement band the check samples.
+ *
+ * READ THIS BEFORE TRUSTING `checkPlayability`. The check is a SAMPLE, not a
+ * proof. `game.ts` can drop a tank on any of the 1110 columns of the band at
+ * 1280 wide; the check looks at 25 of them, evenly spaced 46 px apart, and a
+ * pair of real tanks can land in the gaps on ground the samples never stood on.
+ *
+ * The leak is measured, at real `createGame` tank columns, over 5 styles x
+ * {2,3,4,6,8} players x 40 seeds = 1000 matches, all at `MAX_TERRAIN_ATTEMPTS`
+ * = 48 so the rows differ only in sampling density:
+ *
+ *     samples   matches with a blocked pair   rounds handed the fallback map
+ *        7            30 / 1000  (3.0%)                    0
+ *       13            14 / 1000  (1.4%)                    0
+ *       17            15 / 1000  (1.5%)                    0
+ *       25             4 / 1000  (0.4%)                    0
+ *       33             5 / 1000  (0.5%)                    0
+ *       41             4 / 1000  (0.4%)                    1
+ *
+ * Two things that table says, and the comment that used to sit here said
+ * neither. First, 7 was not enough: 28 of the 35 pairs it waved through have
+ * ZERO connecting shots in the real engine's whole 179x100 grid of angles and
+ * powers at zero wind — a genuine stalemate, and in a 2-player round that is
+ * the whole match. Second, density stops paying at 25: 33 and 41 samples leak
+ * the same or worse, reject more maps, and 41 starts pushing rounds onto the
+ * tame fallback. Sampling narrows the gap between spawns; it never closes it,
+ * because a tank can always land between two samples on ground up to
+ * `MAX_TERRAIN_SLOPE` x half a step away in height.
+ *
+ * Cost at 25, measured over those same 1000 seeds: `generateTerrain` averages
+ * 8 ms and peaks at 78 ms, both figures owned by mountains (17 ms mean, 78 ms
+ * worst) where the check rejects most raw maps. Once per round.
+ *
+ * So the honest promise is: every pair of columns 46 px apart across the band
+ * can hit each other, and the residue — 4 rounds in 1000, every one of them a
+ * pair over 700 px apart where the gun is already near its range limit — is
+ * measured rather than assumed. `test/terrain-playability.test.ts` runs that
+ * sweep at the real tank columns and fails if it grows.
+ */
+export const SPAWN_SAMPLES = 25;
+
+/**
  * Columns a tank could plausibly be dropped on.
  *
  * Sampled across the whole span `game.ts` can place a tank in, at any player
  * count from 1 to `MAX_TANKS` — at 1280 wide that is columns 85 to 1195, which
  * is wider than the middle 80% this used to assume and which a 16-player lobby
- * really does reach. Sampling the band is what lets the check make a promise
- * about spawns it does not get to choose; sampling a band the game can place
- * outside of would have made that promise a lie at exactly the edges of the map,
- * where the ground is least reliable.
+ * really does reach. Sampling a band the game can place outside of would have
+ * missed exactly the edges of the map, where the ground is least reliable.
  */
-export function defaultSpawnColumns(width: number, count = 7): number[] {
+export function defaultSpawnColumns(width: number, count = SPAWN_SAMPLES): number[] {
   const { lo, hi } = spawnBand(width);
   if (count <= 1) return [Math.round((lo + hi) / 2)];
   const step = (hi - lo) / (count - 1);
@@ -629,8 +692,9 @@ export const PROBE_TANK_RADIUS = 9;
  * where it stands. What this deliberately does NOT count is an arc that merely
  * passes near the tank on its way to landing somewhere else entirely, which is
  * what the old "closest approach along the path" test accepted: on the accepted
- * maps it waved through three pairs in 433 that no angle and power in the
- * player's whole 179x100 grid can actually hit.
+ * maps it waved through three pairs — of the 433 the check judged back when it
+ * sampled 7 columns, so read that denominator as historical — which no angle
+ * and power in the player's whole 179x100 grid can actually hit.
  */
 function probeShot(
   terrain: Terrain,
@@ -649,6 +713,8 @@ function probeShot(
   const directSquared = PROBE_TANK_RADIUS * PROBE_TANK_RADIUS;
   const tolSquared = tolerance * tolerance;
 
+  const { surface, width: mapWidth, height: mapHeight } = terrain;
+
   for (let step = 0; step < PROBE.maxSteps; step += 1) {
     vy += PROBE.gravity * PROBE.dt;
     const nextX = x + vx * PROBE.dt;
@@ -656,6 +722,53 @@ function probeShot(
 
     const dx = nextX - x;
     const dy = nextY - y;
+
+    // Skip the sub-sampling for a step that is clear of both things it could
+    // possibly report: the ground under it, and the target's hit circle. Both
+    // are bounding tests on the exact segment the loop below would have walked
+    // — no sample inside a step that clears them can be solid or on target —
+    // so this is a short cut, not an approximation. Worth having because most
+    // of a lobbed arc is empty sky and the check now fires 600 ordered pairs
+    // per map: measured over 60 seeds of every style it produces bit-identical
+    // maps and bit-identical issue lists while halving generation (1280x720
+    // mean 18.1 ms -> 8.2 ms, worst 105 ms -> 51 ms), which is what keeps
+    // `SPAWN_SAMPLES` affordable. That the probe still agrees with the real
+    // engine is not taken on trust either: the two brute-force tests in
+    // `test/terrain-playability.test.ts` check it against `simulateFlight`.
+    const loX = dx < 0 ? nextX : x;
+    const hiX = dx < 0 ? x : nextX;
+    const loY = dy < 0 ? nextY : y;
+    const hiY = dy < 0 ? y : nextY;
+    const nearTarget =
+      loX - PROBE_TANK_RADIUS <= targetX &&
+      hiX + PROBE_TANK_RADIUS >= targetX &&
+      loY - PROBE_TANK_RADIUS <= targetY &&
+      hiY + PROBE_TANK_RADIUS >= targetY;
+
+    if (!nearTarget && hiY < mapHeight) {
+      // Highest ground (smallest Y) under the columns this step crosses.
+      // Off-map columns are sky, so they cannot lower the ceiling.
+      let ceiling = mapHeight;
+      const lastColumn = Math.floor(hiX);
+      for (let column = Math.floor(loX); column <= lastColumn; column += 1) {
+        if (column < 0 || column >= mapWidth) continue;
+        const groundY = surface[column] as number;
+        if (groundY < ceiling) ceiling = groundY;
+      }
+      if (hiY < ceiling) {
+        x = nextX;
+        y = nextY;
+        if (
+          x < -PROBE.offscreenMargin ||
+          x > mapWidth + PROBE.offscreenMargin ||
+          y > mapHeight + PROBE.offscreenMargin
+        ) {
+          break;
+        }
+        continue;
+      }
+    }
+
     const samples = clamp(Math.ceil(hypot2(dx, dy)), 1, PROBE.maxSubSteps);
 
     for (let i = 1; i <= samples; i += 1) {
@@ -798,11 +911,19 @@ function hasLineOfFire(
  * fault?
  *
  * Deliberately measured at power 80, not 100. The gun's flat-ground reach is
- * about 1040 px and the map is 1280 wide, so the outermost spawns sit right on
+ * v^2/g = 1040 px and the map is 1280 wide, so the outermost spawns sit right on
  * the edge of what full power can do — those pairs miss because the shell runs
  * out of energy, not because a hill is in the way, and failing a map for that
- * would reject almost every seed. The ~665 px of headroom this leaves is what
+ * would reject almost every seed. Power 80 reaches 666 px on flat ground, so the
+ * gate leaves 374 px of margin below what the gun can really do, which is what
  * keeps the rejection rate low enough for the retry loop to absorb.
+ *
+ * Note the asymmetry, because it is where the check's remaining misjudgements
+ * live: a target BELOW the shooter extends the power-80 solution well past
+ * 666 px (a 300 px drop takes it to ~918), so downhill pairs are judged at
+ * ranges where only a nearly flat arc reaches — and a nearly flat arc clears
+ * nothing. Every pair that slipped past the sampled check in the 1000-match
+ * sweep behind `SPAWN_SAMPLES` is one of these, 727 to 783 px apart.
  */
 const RANGE_GATE_POWER = 80;
 
@@ -836,6 +957,12 @@ function canShootOut(terrain: Terrain, x: number, y: number, minDistance: number
  *
  * Pairs that are simply too far apart for full power are excluded: that is a
  * limit of the gun, not a defect of the map.
+ *
+ * Every answer is about the columns in `spawns` and nothing else. The default
+ * set samples the placement band — see `SPAWN_SAMPLES` for how wide the gaps
+ * between samples are and what has been measured to slip through them. Callers
+ * that know where the tanks really are (`game.ts`, and the sweep in
+ * `test/terrain-playability.test.ts`) should pass those columns.
  */
 export function checkPlayability(
   terrain: Terrain,
@@ -963,18 +1090,37 @@ const CRATER_DEPTH = 1.5;
  *       => terrain still within the bound
  *
  * — which is what stops shell after shell into one column from drilling a
- * one-column well nobody can climb out of. Measured over twelve Baby Missiles
- * into the same spot, the hole goes from 27 px deeper per shot to 13 and widens
- * from 26 columns to 48; over forty, the steepest surviving face is still 5.
+ * one-column well nobody can climb out of. Re-measured over twelve Baby
+ * Missiles into the same column of flat ground: the first shot deepens the hole
+ * by 27 px and the twelfth by 12, while the hole widens from 36 lowered columns
+ * to 98. (The "26 to 48" that stood here does not reproduce under any width
+ * definition; 36 to 98 is the count of columns below the original surface.)
+ * Over forty shots, the steepest surviving face is still 5.
  *
- * The precondition is not decoration. No local, mass-conserving rule can pull
- * an arbitrary map under the bound: on a uniformly over-steep ramp every
- * interior column receives exactly as much dirt from above as it sheds below,
- * so only the two ends of the ramp can ever move, and flattening the middle
- * would mean hauling dirt the length of the map — which is not what an
- * explosion does. Generated terrain is capped at `MAX_TERRAIN_SLOPE`, well
- * under this, so the induction starts true and every blast keeps it true.
- * `test/terrain-slump.test.ts` asserts both halves.
+ * The precondition is not decoration, and the reason is cost, not impossibility.
+ * The sweep below does eventually pull an over-steep map under the bound — the
+ * 600-column ramp at 8 px/column in `test/terrain-slump.test.ts` (a 6000-tall
+ * world, surface `3500 - 8x`) reaches 5 everywhere — but it takes 26954 passes
+ * to do it, 6.6x `MAX_SLUMP_PASSES`, because the dirt has to be hauled the
+ * length of the map one transfer at a time. That count belongs to that exact
+ * fixture, not to "a 600-column ramp": how much of the ramp starts above the
+ * top of the world, and so how much the clamp absorbs, moves it a long way.
+ *
+ * Cut off at the budget, such a map is left mid-avalanche: still over the
+ * limit, and measured over 484 hostile inputs — the 84-case ramp family that
+ * test sweeps plus 400 randomised over-steep maps — its steepest single face
+ * comes out up to 3 px STEEPER than it went in (a 400-column ramp at 8
+ * px/column goes 8 -> 11 under a mound), even though the total excess over the
+ * bound never rises, on any of the 484. (An earlier version of this comment
+ * claimed no local mass-conserving rule could ever fix such a map. That is true
+ * of a Jacobi snapshot, which is what the slump used to be; it is not true of
+ * the ordered sweep it is now, and the measurement above is what settles it.)
+ *
+ * Generated terrain is capped at `MAX_TERRAIN_SLOPE`, well under this, so the
+ * induction starts true and every blast keeps it true — that is the guarantee
+ * the game relies on, and the one `test/terrain-slump.test.ts` asserts from
+ * every side. What it asserts for ground that starts over the limit is only
+ * what is true: bounded work, exact mass, and total excess that never grows.
  */
 export const MAX_BLAST_SLOPE = 5;
 
@@ -1065,15 +1211,32 @@ export function applyCrater(
  * The relaxation below always terminates on its own (every transfer strictly
  * reduces the sum of squared column heights, which is bounded below at fixed
  * mass), so this only decides how bad an input has to be before the sim gives
- * up rather than hangs. Worst case actually measured, sweeping every weapon
- * radius against four ground heights at the world size the game ships: 1210
- * passes, from sixty Death's Heads down one column of ground sitting near the
- * top of a 720 px world — the deepest, widest pit the map can hold. Realistic
- * abuse is far cheaper: forty Baby Missiles into one spot peaks at 218, and a
- * single detonation on generated ground at 592. This leaves 3x headroom over
- * the worst of those, and `test/terrain-slump.test.ts` asserts the margin, so a
- * rule change that quietly stopped converging fails there instead of silently
- * leaving a cliff behind.
+ * up rather than hangs.
+ *
+ * Worst cases actually measured, at the 1280x720 the game ships, sweeping every
+ * distinct radius in `WEAPONS` against the ceiling, the middle and the floor
+ * (ground 80, 360, 719) with sixty rounds into the same column — the sweep
+ * `test/terrain-slump.test.ts` re-runs, so these three numbers are asserted and
+ * not just written down. Widening it to six ground heights moves none of them:
+ *
+ *     applyCrater                                 1251  (r120 on ground 80)
+ *     applyMound, every radius                    1530  (r120 on ground 719)
+ *     applyMound, the dirt weapons' radii only    1322  (r70  on ground 719)
+ *
+ * `applyMound` is the worse path and it is the one the sweep behind the old
+ * "1210 passes" figure never covered, even though the same `slumpBlast` has run
+ * for it since mounds started slumping. r120 is Death's Head, which no mound
+ * weapon uses; the widest dirt weapon really shipped is Ton of Dirt at r70.
+ * Realistic abuse is far cheaper: forty Baby Missiles into one spot peaks at
+ * 218, and a single detonation on generated ground at 592.
+ *
+ * So the headroom over the worst reachable case is 2.7x, not the 3x claimed
+ * here before. `test/terrain-slump.test.ts` asserts the margin on BOTH paths,
+ * so a rule change that quietly stopped converging fails there instead of
+ * silently leaving a cliff behind.
+ *
+ * Ground that starts over `MAX_BLAST_SLOPE` can still exhaust this budget —
+ * that is the guard doing its job, not a bug; see `MAX_BLAST_SLOPE`.
  */
 export const MAX_SLUMP_PASSES = 4096;
 

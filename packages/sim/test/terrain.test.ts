@@ -39,27 +39,38 @@ describe('terrain generation', () => {
     expect(hashTerrain(a)).not.toBe(hashTerrain(b));
   });
 
+  // Generation is not cheap — the playability check samples 25 columns and the
+  // retry loop runs to 48 attempts — so every test below that generates maps in
+  // a loop declares its own timeout instead of running against Vitest's
+  // undeclared 5000 ms default. Measured over three full-suite runs: 0.50 s for
+  // the 32-seed test, 0.39-0.66 s per style for the one below it. The point of
+  // declaring is that neither can creep into the default without somebody
+  // choosing to.
   it('gives 32 consecutive seeds 32 different maps', () => {
     const hashes = new Set<number>();
     for (let seed = 0; seed < 32; seed += 1) {
       hashes.add(hashTerrain(generateTerrain({ width: 1280, height: 720 }, makeRng(seed))));
     }
     expect(hashes.size).toBe(32);
-  });
+  }, 60_000);
 
-  it.each(TERRAIN_STYLES)('keeps every column on screen for style "%s"', (style) => {
-    // 24 seeds, not one: the retry loop means a single seed exercises only one
-    // of the shapes a style can produce.
-    for (let seed = 0; seed < 24; seed += 1) {
-      const terrain = generateTerrain({ width: WIDTH, height: HEIGHT, style }, makeRng(seed));
-      for (let x = 0; x < WIDTH; x += 1) {
-        const y = terrain.surface[x] as number;
-        expect(Number.isInteger(y)).toBe(true);
-        expect(y).toBeGreaterThanOrEqual(0);
-        expect(y).toBeLessThanOrEqual(HEIGHT);
+  it.each(TERRAIN_STYLES)(
+    'keeps every column on screen for style "%s"',
+    (style) => {
+      // 24 seeds, not one: the retry loop means a single seed exercises only one
+      // of the shapes a style can produce.
+      for (let seed = 0; seed < 24; seed += 1) {
+        const terrain = generateTerrain({ width: WIDTH, height: HEIGHT, style }, makeRng(seed));
+        for (let x = 0; x < WIDTH; x += 1) {
+          const y = terrain.surface[x] as number;
+          expect(Number.isInteger(y)).toBe(true);
+          expect(y).toBeGreaterThanOrEqual(0);
+          expect(y).toBeLessThanOrEqual(HEIGHT);
+        }
       }
-    }
-  });
+    },
+    60_000,
+  );
 
   it('leaves both sky above and ground below', () => {
     const terrain = generateTerrain({ width: WIDTH, height: HEIGHT }, makeRng(11));

@@ -87,9 +87,61 @@ describe('deterministic trig', () => {
     expect(worstError(detSin, Math.sin, at1e6)).toBeGreaterThan(1e-11);
     expect(worstError(detSin, Math.sin, at1e6)).toBeLessThan(1e-9);
 
+    // The header quotes 1.0e-8 here. It used to say 6e-9, which is below the
+    // real worst case — the one direction a decay figure must never be wrong in.
+    const at1e8 = band(99999998, 100000002, 40000);
+    expect(worstError(detSin, Math.sin, at1e8)).toBeGreaterThan(5e-9);
+    expect(worstError(detSin, Math.sin, at1e8)).toBeLessThan(5e-8);
+
     const at1e12 = band(999999999999, 1000000000001, 40000);
     expect(worstError(detSin, Math.sin, at1e12)).toBeGreaterThan(1e-6);
     expect(worstError(detSin, Math.sin, at1e12)).toBeLessThan(1e-3);
+  });
+
+  /**
+   * The two Taylor cores, measured separately and bounded from BOTH sides.
+   *
+   * Separately, because they are two orders of magnitude apart and a combined
+   * figure hides that. From both sides, because the doc comments quote these
+   * numbers: a one-sided bound would let the polynomials silently get worse,
+   * and would also let someone add a term without noticing the comment had gone
+   * stale in the other direction.
+   *
+   * `detSin` is `sinCore` verbatim on quadrant 0 and `detCos` is `cosCore`, so
+   * sampling strictly inside |x| < PI/4 measures each core with no reduction in
+   * front of it. Strictly inside matters: at exactly PI/4 the quadrant index
+   * rounds to 1 and `detSin` switches to `cosCore`, which is 19x worse — the
+   * reason sin(45 degrees), an entirely ordinary firing angle, carries
+   * `cosCore`'s error and not `sinCore`'s.
+   */
+  it('is limited by the cosine core, not by argument reduction', () => {
+    const band = (lo: number, hi: number, count: number): number[] => {
+      const out: number[] = [];
+      for (let i = 0; i <= count; i += 1) out.push(lo + ((hi - lo) * i) / count);
+      return out;
+    };
+    const inside = band(-0.999 * (Math.PI / 4), 0.999 * (Math.PI / 4), 20000);
+
+    // sinCore: Taylor through x^13. Measured 2.01e-14.
+    const sinCoreError = worstError(detSin, Math.sin, inside);
+    expect(sinCoreError).toBeGreaterThan(1e-14);
+    expect(sinCoreError).toBeLessThan(3e-14);
+
+    // cosCore: Taylor through x^12, so one truncation order short of sinCore.
+    // Measured 3.83e-13 — NOT the 1e-15 this comment used to claim.
+    const cosCoreError = worstError(detCos, Math.cos, inside);
+    expect(cosCoreError).toBeGreaterThan(3e-13);
+    expect(cosCoreError).toBeLessThan(5e-13);
+
+    // And cosCore, not the argument fold, is what sets the whole file's error
+    // over the domain the sim uses: the worst over |x| <= 4*PI is the same
+    // number, to within a few percent.
+    const domain = band(-4 * Math.PI, 4 * Math.PI, 40000);
+    expect(worstError(detSin, Math.sin, domain)).toBeGreaterThan(cosCoreError * 0.9);
+    expect(worstError(detSin, Math.sin, domain)).toBeLessThan(cosCoreError * 1.1);
+
+    // The everyday case, stated plainly: a 45 degree shot goes through cosCore.
+    expect(Math.abs(detSinDeg(45) - Math.sin(Math.PI / 4))).toBeGreaterThan(1e-13);
   });
 
   it('hits the exact quadrant values', () => {
@@ -131,6 +183,60 @@ describe('deterministic trig', () => {
     expect(worstError(detAtan, Math.atan, samples)).toBeLessThan(TOLERANCE);
   });
 
+  /**
+   * Where `detAtan`'s error actually lives, measured. The header quotes these
+   * two numbers, and the figure it used to quote (6.7e-16) reproduced on no
+   * sample set at all — so the sweeps that produce them are written out here
+   * rather than described.
+   *
+   * Two sweeps, because they exercise different code. Inside |x| <= 1 the
+   * result is `atanCore` alone. Past |x| = 1 `detAtan` returns
+   * PI/2 - atanCore(1/x): the subtrahend is near PI/4 but the minuend is near
+   * PI/2, one binade up, so the same relative accuracy buys an absolute error
+   * twice as coarse. The reciprocal branch, not the series, is what sets this
+   * file's atan bound — which is the opposite of the sin/cos story next door,
+   * where the core is the limit and reduction is free.
+   *
+   * Bounded from BOTH sides, for the reason the trig cores are: a one-sided
+   * bound would let the arithmetic silently get worse, and would also let
+   * someone add a series term without noticing the header had gone stale in the
+   * other direction.
+   */
+  it('is limited by the reciprocal branch, not by the atan series', () => {
+    const band = (lo: number, hi: number, count: number): number[] => {
+      const out: number[] = [];
+      for (let i = 0; i <= count; i += 1) out.push(lo + ((hi - lo) * i) / count);
+      return out;
+    };
+
+    // `atanCore` alone, over the interval it is built for. Measured 7.77e-16.
+    const coreError = worstError(detAtan, Math.atan, band(-1, 1, 200000));
+    expect(coreError).toBeGreaterThan(7e-16);
+    expect(coreError).toBeLessThan(8e-16);
+
+    // Just past the branch flip. Measured 8.88e-16 — worse than the core, and
+    // still inside the header's ~1e-15.
+    const branchError = worstError(detAtan, Math.atan, band(1, 1.2, 200000));
+    expect(branchError).toBeGreaterThan(coreError);
+    expect(branchError).toBeGreaterThan(8e-16);
+    expect(branchError).toBeLessThan(1e-15);
+
+    // "…at any magnitude" is the other half of the header's claim, and it is a
+    // real difference from `detSin`, whose error grows with |x|. The reciprocal
+    // keeps the core's argument inside [0, 1] however large x gets, so nothing
+    // here decays: 25 decades either side stay under the same bound. Measured
+    // 4.44e-16.
+    const decades: number[] = [];
+    let magnitude = 1e-12;
+    for (let decade = -12; decade <= 12; decade += 1) {
+      decades.push(magnitude, -magnitude, magnitude * 3, -magnitude * 3);
+      magnitude *= 10;
+    }
+    const decadeError = worstError(detAtan, Math.atan, decades);
+    expect(decadeError).toBeGreaterThan(4e-16);
+    expect(decadeError).toBeLessThan(branchError);
+  });
+
   it('matches Math.atan2 across the full circle at every scale', () => {
     let worst = 0;
     for (let deciDegrees = 0; deciDegrees < 3600; deciDegrees += 1) {
@@ -143,6 +249,11 @@ describe('deterministic trig', () => {
       }
     }
     expect(worst).toBeLessThan(TOLERANCE);
+    // And pinned from both sides at the real magnitude, because the math.ts
+    // header quotes this grid's worst figure. Measured 8.88e-16 — a bound of
+    // 1e-9 would let it rot by six orders and still pass.
+    expect(worst).toBeGreaterThan(8e-16);
+    expect(worst).toBeLessThan(1e-15);
   });
 
   it('reproduces Math.atan2 exactly on signed zeros and infinities', () => {

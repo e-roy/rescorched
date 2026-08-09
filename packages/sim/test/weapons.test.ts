@@ -106,10 +106,15 @@ describe('the arsenal table', () => {
         break;
       case 'leapfrog':
         expect(weapon.hops ?? 0).toBeGreaterThan(1);
-        // Hops closer together than a radius overlap, which is the point: a
-        // target between two of them is caught by both.
-        expect(weapon.hopSpacing ?? 0).toBeGreaterThan(0);
-        expect(weapon.hopSpacing ?? 0).toBeLessThan(1);
+        // A hop shorter than the blast radius is a smear, not a march. At 0.6
+        // the Leapfrog's four blasts spanned 54 px — identically, on every
+        // terrain style and every seed, min = median = max over 150 shots — for
+        // a 114 px footprint against a Baby Nuke's 110. That is a wobbly Baby
+        // Nuke, not a weapon that "explodes, hops, explodes again". The bar is
+        // 1.5 so the table has design room; what the shipped value has to earn
+        // is the measured rule in `detonation.test.ts`, 'leaves four craters a
+        // player can count, not one smear'.
+        expect(weapon.hopSpacing ?? 0).toBeGreaterThanOrEqual(1.5);
         break;
       case 'napalm':
         expect(weapon.burnSteps ?? 0).toBeGreaterThan(0);
@@ -241,7 +246,7 @@ describe('shop progression', () => {
 
   it('never lets three times the price buy a softer hit', () => {
     // The rule blocker 9 is about: a Missile costs $180 a shot and takes 42 off
-    // a direct hit, so a $3333-a-shot MIRV that took 31 off was not a purchase,
+    // a direct hit, so a $3000-a-shot MIRV that took 31 off was not a purchase,
     // it was a tax on wanting the fancy weapon. Free ammo is excluded — there
     // is no ratio against zero — and covered by its own case below.
     const paid = REALISED.filter((row) => row.weapon.damage > 0 && row.perShot > 0);
@@ -390,26 +395,55 @@ describe('damageAtDistance', () => {
     }
   });
 
-  it('never rounds a near miss up past full damage', () => {
+  it('never rounds a near miss up past full damage, or a graze down to nothing', () => {
     // `damageAtDistance` clamps `t` and then trusts that `t*t*(3-2t)` cannot
     // leave [0, 1]. That claim is what stands in for a second clamp, so it gets
-    // swept rather than asserted: the doubles closest to ground zero, where t
-    // is as near 1 as a double gets, and then the whole radius at fine steps.
+    // swept rather than asserted — but only over distances where rounding
+    // actually decides something.
+    //
+    // Sweeping the doubles just above ZERO, which is what this used to do, is
+    // not one of them: `distance / radius` underflows to zero, so `t` is
+    // exactly 1 from the first iteration and 4000 of them produced one distinct
+    // result. The loop could not fail against any implementation.
     const over: string[] = [];
+    const vanished: string[] = [];
+
     for (const weapon of DAMAGING) {
-      let distance = 0;
+      // Just inside the rim: `t` a few ulps above 0, which is where the guard
+      // decides between "grazed" and "missed" and where the polynomial is all
+      // leading term. A graze is worth almost nothing, but it is not zero and
+      // it is not negative.
+      let distance = weapon.radius;
       for (let i = 0; i < 4000; i += 1) {
-        if (damageAtDistance(weapon, distance) > weapon.damage) {
-          over.push(`${weapon.id} @ ${distance}`);
-        }
-        distance = nextUp(distance);
+        distance = nextDown(distance);
+        const value = damageAtDistance(weapon, distance);
+        if (value > weapon.damage) over.push(`${weapon.id} @ rim -${i} ulp: ${value}`);
+        if (!(value > 0)) vanished.push(`${weapon.id} @ rim -${i} ulp: ${value}`);
       }
+
+      // Just inside ground zero, reached through `t` rather than through the
+      // distance: the doubles immediately below 1, i.e. full damage minus an
+      // ulp. This is the only place `t*t*(3-2t)` can round ABOVE one, and it
+      // catches reassociations of the expression that are algebraically
+      // identical and numerically are not — folding `weapon.damage` into the
+      // product instead of multiplying by the finished polynomial overshoots
+      // here for about a third of these doubles.
+      let t = 1;
+      for (let i = 0; i < 4000; i += 1) {
+        t = nextDown(t);
+        const value = damageAtDistance(weapon, weapon.radius * (1 - t));
+        if (value > weapon.damage) over.push(`${weapon.id} @ t = 1 - ${i} ulp: ${value}`);
+      }
+
+      // And the whole radius at fine steps.
       for (let i = 0; i <= 20_000; i += 1) {
         const d = (i / 20_000) * weapon.radius;
         if (damageAtDistance(weapon, d) > weapon.damage) over.push(`${weapon.id} @ ${d}`);
       }
     }
+
     expect(over).toEqual([]);
+    expect(vanished).toEqual([]);
   });
 
   it('survives a malformed weapon rather than returning NaN', () => {
@@ -437,11 +471,11 @@ describe('damageAtDistance', () => {
   });
 });
 
-/** The smallest double strictly above `value`, for non-negative finite values. */
-function nextUp(value: number): number {
+/** The largest double strictly below `value`, for positive finite values. */
+function nextDown(value: number): number {
   const buffer = new ArrayBuffer(8);
   new Float64Array(buffer)[0] = value;
   const bits = new BigUint64Array(buffer);
-  bits[0] = (bits[0] as bigint) + 1n;
+  bits[0] = (bits[0] as bigint) - 1n;
   return new Float64Array(buffer)[0] as number;
 }

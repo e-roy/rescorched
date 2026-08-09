@@ -48,6 +48,26 @@ function pathXs(trajectory: Trajectory): number[] {
   return out;
 }
 
+/** Longest gap between consecutive path points — the sweep's tunnelling budget. */
+function longestGap(trajectory: Trajectory): number {
+  let worst = 0;
+  for (let i = 1; i < trajectory.length; i += 1) {
+    const dx = (trajectory.points[i * 2] as number) - (trajectory.points[(i - 1) * 2] as number);
+    const dy =
+      (trajectory.points[i * 2 + 1] as number) - (trajectory.points[(i - 1) * 2 + 1] as number);
+    worst = Math.max(worst, Math.sqrt(dx * dx + dy * dy));
+  }
+  return worst;
+}
+
+/** All sky except one single-column wall at x = 320. */
+function oneColumnWall() {
+  const terrain = emptyTerrain(WIDTH, HEIGHT);
+  terrain.surface.fill(HEIGHT);
+  terrain.surface[320] = 0;
+  return terrain;
+}
+
 /** Bytes this path costs in a broadcast — the thing the path budget exists for. */
 function wireBytes(trajectory: Trajectory): number {
   return JSON.stringify(trajectoryToArray(trajectory)).length;
@@ -137,35 +157,62 @@ describe('flight', () => {
   });
 
   it('does not tunnel through a thin ridge at extreme power', () => {
-    const terrain = emptyTerrain(WIDTH, HEIGHT);
-    terrain.surface.fill(HEIGHT); // all sky …
-    // … except one single-column wall in the middle.
-    terrain.surface[320] = 0;
-
-    const result = simulateFlight({ x: 10, y: 200, angleDeg: 0, power: 100 }, { terrain, wind: 0 });
+    const result = simulateFlight(
+      { x: 10, y: 200, angleDeg: 0, power: 100 },
+      { terrain: oneColumnWall(), wind: 0 },
+    );
 
     expect(result.impact.kind).toBe('terrain');
     expect(result.impact.x).toBeGreaterThanOrEqual(319);
     expect(result.impact.x).toBeLessThanOrEqual(322);
   });
 
-  it('cannot be made to tunnel by an absurd velocity override', () => {
-    // The sweep samples `ceil(distance)` points, capped at `maxSubSteps`. That
-    // cap would be a tunnelling hole if a step could ever cover more than
-    // `maxSubSteps` pixels — so `PHYSICS.maxSpeed` bounds the step at 60 px and
-    // the cap becomes unreachable. This is the test that says so.
-    for (const speed of [1e4, 1e7, 1e12]) {
-      const terrain = emptyTerrain(WIDTH, HEIGHT);
-      terrain.surface.fill(HEIGHT);
-      terrain.surface[320] = 0;
-
+  /**
+   * The sweep samples `ceil(distance)` points, capped at `maxSubSteps`. That cap
+   * would be a tunnelling hole if a step could ever cover more than
+   * `maxSubSteps` pixels — so `PHYSICS.maxSpeed` bounds the step at 60 px and
+   * the cap becomes unreachable.
+   *
+   * The speeds past 1.3407807929942596e154 = sqrt(Number.MAX_VALUE) are the
+   * whole point of the list. That is where `vx*vx + vy*vy` overflows to
+   * Infinity, and a clamp written as `maxSpeed / Math.sqrt(vx*vx + vy*vy)`
+   * scales the velocity by 3600/Infinity = 0 there — it ZEROES the shell
+   * instead of capping it. That failure is safe (nothing tunnels) but it is not
+   * a ceiling, and a test that only checks "did not overshoot the wall" cannot
+   * see it: the shell parks at the muzzle, x = 10, which is comfortably under
+   * 322. Asserting that the shell REACHES the wall, at the ceiling speed, is
+   * what catches it.
+   *
+   * Measured against the pre-fix code, over exactly the speeds below: 1e4
+   * through 1.34e154 all still reach the wall, every one of them in 6 steps of
+   * 60 px, landing at x = 320.82 (1e4, 1.34e154) or x = 321.00 (1e7, 1e12).
+   * Those two columns are the same flight sampled differently, not two
+   * behaviours: the last step's swept distance comes out one ulp above 60 px
+   * for the first pair and at-or-below it for the second, so `ceil` hands the
+   * sweep 61 samples or 60 and the first sample to land in column 320 shifts by
+   * 0.18 px. That is why the assertions bracket the column rather than pin it —
+   * a `toBe` there would be pinning a rounding mode.
+   *
+   * 1.35e154 through MAX_VALUE are the ones that matter: they land at x = 10.00
+   * after 75 steps of 5.34 px, which is the shell dropping straight out of the
+   * barrel under gravity alone. That is the failure this test exists for.
+   */
+  it('clamps rather than zeroes at any finite velocity, up to Number.MAX_VALUE', () => {
+    for (const speed of [1e4, 1e7, 1e12, 1.34e154, 1.35e154, 1e200, 1e308, Number.MAX_VALUE]) {
       const result = simulateFlight(
         { x: 10, y: 200, angleDeg: 0, power: 0 },
-        { terrain, wind: 0, velocity: { vx: speed, vy: 0 } },
+        { terrain: oneColumnWall(), wind: 0, velocity: { vx: speed, vy: 0 } },
       );
 
       expect(result.impact.kind).toBe('terrain');
+      // It flew to the wall …
+      expect(result.impact.x).toBeGreaterThanOrEqual(319);
       expect(result.impact.x).toBeLessThanOrEqual(322);
+      // … and it got there at the ceiling: 3600 px/s at 1/60 s is 60 px a step.
+      // Absolute numbers, not `maxSpeed * dt` — that would restate the code.
+      expect(longestGap(result)).toBeGreaterThan(59.999);
+      expect(longestGap(result)).toBeLessThan(60.001);
+      expect(result.steps).toBe(6);
     }
   });
 
@@ -175,6 +222,15 @@ describe('flight', () => {
       { vx: 1e9, vy: 0 },
       { vx: 0, vy: 1e9 },
       { vx: -1e12, vy: 1e12 },
+      // Past the overflow cliff, and with both components at the maximum so the
+      // clamp has to handle a diagonal it cannot square.
+      { vx: 1e308, vy: -1e308 },
+      { vx: -Number.MAX_VALUE, vy: Number.MAX_VALUE },
+      // The diagonal that only a diagonal-aware test catches: neither component
+      // reaches the 3600 px/s ceiling, but together they make 4243 px/s — a
+      // 70.7 px step, past the 64 samples the sweep has to spend on it. A clamp
+      // that triggers on `max(|vx|, |vy|) > maxSpeed` would wave this through.
+      { vx: 3000, vy: -3000 },
     ]) {
       const result = simulateFlight(
         { x: 320, y: 200, angleDeg: 0, power: 0 },
@@ -183,12 +239,10 @@ describe('flight', () => {
       // Only meaningful while the path is one point per step; a decimated path
       // deliberately skips steps. Short escapes like these never decimate.
       expect(result.length).toBe(result.steps + 1);
-      for (let i = 1; i < result.length; i += 1) {
-        const dx = (result.points[i * 2] as number) - (result.points[(i - 1) * 2] as number);
-        const dy =
-          (result.points[i * 2 + 1] as number) - (result.points[(i - 1) * 2 + 1] as number);
-        expect(Math.sqrt(dx * dx + dy * dy)).toBeLessThanOrEqual(PHYSICS.maxSubSteps);
-      }
+      expect(longestGap(result)).toBeLessThanOrEqual(PHYSICS.maxSubSteps);
+      // The real bound is tighter than the sweep cap, and that gap is the
+      // safety margin: 60 px a step against 64 samples available.
+      expect(longestGap(result)).toBeLessThan(60.001);
     }
   });
 });
@@ -405,7 +459,6 @@ describe('trajectory data', () => {
       }
     }
     expect(stride).toBe(8);
-    expect(Math.log2(stride) % 1).toBe(0); // halving only ever doubles it
 
     // Every point except the appended impact is the sample at step i * stride.
     for (let i = 0; i < long.length - 1; i += 1) {
@@ -415,6 +468,35 @@ describe('trajectory data', () => {
     // The path covers the whole flight, not just its first eighth: the last
     // strided point is within one stride of the final step.
     expect((long.length - 2) * stride).toBeGreaterThanOrEqual(long.steps - stride);
+  });
+
+  /**
+   * `maxPathPoints` must be EVEN, and the emit site says so out loud.
+   *
+   * `length` grows exactly one point per emit, so it reaches the budget exactly,
+   * at step `length * stride`. The halving there doubles the stride, and that
+   * same step has to remain a multiple of the doubled stride or the point
+   * emitted immediately after it lands off-rhythm — which would break the
+   * "point `i` is the sample at step `i * stride`" contract the test above
+   * proves. `length * stride` divides by `2 * stride` iff `length` is even, and
+   * `length` at that moment IS `maxPathPoints`.
+   *
+   * The parity argument is the whole proof, so assert the parity and the
+   * consequence rather than quoting a replay count. An earlier version of this
+   * comment cited a measurement ("every odd budget produces between 8 and 16
+   * off-rhythm steps") that was taken against an emission rule since deleted,
+   * and it survived here long after it stopped being true — which is precisely
+   * the failure mode the surrounding tests exist to prevent.
+   */
+  it('uses an even path budget, which is what keeps a halving on-rhythm', () => {
+    expect(PHYSICS.maxPathPoints % 2).toBe(0);
+
+    // The property the parity buys: at the moment a halving fires, the step the
+    // last kept point sits on must still be a multiple of the doubled stride.
+    // With an even budget that holds for every stride the decimator can reach.
+    for (let stride = 1; stride <= 1024; stride *= 2) {
+      expect((PHYSICS.maxPathPoints * stride) % (2 * stride)).toBe(0);
+    }
   });
 
   it('keeps a long non-vertical arc ordered and evenly spaced', () => {
@@ -452,6 +534,7 @@ describe('trajectory data', () => {
     const generated = generateTerrain({ width: WIDTH, height: HEIGHT }, makeRng(41));
     let longest = 0;
     let heaviest = 0;
+    let worstSteps = 0;
     for (const terrain of [generated, field()]) {
       for (let angle = 0; angle <= 180; angle += 6) {
         for (const power of [0, 33, 100]) {
@@ -466,17 +549,28 @@ describe('trajectory data', () => {
               expect(result.length).toBeGreaterThanOrEqual(2);
               longest = Math.max(longest, result.length);
               heaviest = Math.max(heaviest, wireBytes(result));
+              worstSteps = Math.max(worstSteps, result.steps);
             }
           }
         }
       }
     }
-    // Absolute, for the same reason as above. The worst case in this grid is
-    // 511 points / 19.4 KB; without decimation it is 3601 / 83 KB.
+    // Absolute, for the same reason as above.
     expect(longest).toBeLessThan(600);
     expect(heaviest).toBeLessThan(25000);
-    // And the grid really does reach the budget — otherwise it bounds nothing.
-    expect(longest).toBeGreaterThan(400);
+
+    /*
+     * The saving, asserted rather than quoted.
+     *
+     * A comment claiming "without decimation this would be N points" rots the
+     * moment terrain generation changes the worst shot in the grid — which is
+     * exactly what happened to the number that used to sit here. So derive it:
+     * an undecimated path carries one point per step plus the start, and
+     * `steps` is recorded on every trajectory, so the counterfactual is
+     * measurable in the same run rather than remembered from an old one.
+     */
+    expect(longest).toBeLessThanOrEqual(PHYSICS.maxPathPoints + 1);
+    expect(worstSteps + 1).toBeGreaterThan(longest * 4);
   });
 });
 
@@ -662,17 +756,25 @@ describe('hitting tanks', () => {
   });
 
   /**
-   * The whole 181 x 101 grid, and the three numbers that pin `armFactor` from
-   * both sides. There is no knee in the data to appeal to — self-hits fall off
-   * smoothly as the margin grows — so the test states exactly where the
-   * boundary sits and fails if it moves either way.
+   * The whole 181 x 101 grid, and the numbers that pin `armFactor` from both
+   * sides. There is no knee in the data to appeal to — self-hits fall off
+   * smoothly as the margin grows — so this states exactly where the boundary
+   * sits and fails if it moves either way.
    *
-   * At `armFactor` 1 (no margin at all, the pre-fix behaviour) this grid gives
-   * a self-hit band of angles 49..131, a lowest self-detonating power of 8, and
-   * a shortest self-hit of 12 steps: all three assertions below fail. Raise the
-   * margin instead and the lowest power climbs — 13 at 1.6, 16 at 2, 21 at 3 —
-   * so the `toBe(12)` catches a margin grown large enough to start deleting
-   * legitimate lobs.
+   * The exact self-hit count is the assertion that does the pinning, and it is
+   * asserted exactly for that reason: it is the only quantity here that
+   * separates neighbouring values of `armFactor`. Measured over this grid it is
+   * 346 for armFactor in [1.4998, 1.5002] and different everywhere else —
+   * 348 at 1.4997, 369 from 1.37 to 1.497, 344 at 1.5003, 338 at 1.503. The
+   * shortest self-hit flight, 27 steps, is 26 below 1.4995 and 28 above 1.5002,
+   * so it brackets the same band independently.
+   *
+   * The coarser landmarks are the ones a reader can feel. At `armFactor` 1 (no
+   * margin at all, the pre-fix behaviour) this grid gives 595 self-hits, a band
+   * of angles 49..131, a lowest self-detonating power of 8 and a shortest
+   * self-hit of 12 steps: every assertion below fails. Raise the margin instead
+   * and the lowest power climbs — 13 at 1.503, 16 at 2, 21 at 3 — so the
+   * `toBe(12)` catches a margin grown large enough to delete legitimate lobs.
    */
   it('only ever drops a shell on its owner after a real lob', () => {
     const terrain = flat(300);
@@ -694,17 +796,21 @@ describe('hitting tanks', () => {
       }
     }
 
-    // Landing on your own head is Scorched Earth tradition; it must still happen.
-    expect(selfHits).toBeGreaterThan(100);
+    // Landing on your own head is Scorched Earth tradition; it must still
+    // happen — and exactly this often. This is the line that pins `armFactor`
+    // from below; a bound like `> 100` would pass for anything from 1.37 up.
+    expect(selfHits).toBe(346);
     // Aim more than 15 degrees off vertical and no power setting can bring the
     // shell back onto you on flat ground.
-    expect(lowestAngle).toBeGreaterThanOrEqual(75);
-    expect(highestAngle).toBeLessThanOrEqual(105);
+    expect(lowestAngle).toBe(75);
+    expect(highestAngle).toBe(105);
     // The shortest lob that can do it: power 12 rises ~7.5 px above the muzzle,
     // clear of the hull, then falls back.
     expect(lowestPower).toBe(12);
-    // And every self-hit is a flight, not a graze: a third of a second minimum.
-    expect(shortestFlight).toBeGreaterThanOrEqual(20);
+    // And every self-hit is a flight, not a graze: 27 steps, just under half a
+    // second. Exact for the same reason as the count — 26 below the band, 28
+    // above it.
+    expect(shortestFlight).toBe(27);
   });
 
   it('holds on real terrain, with wind, wherever the tank is standing', () => {
