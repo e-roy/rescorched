@@ -9,33 +9,33 @@ exports[`golden: ballistics > a fixed shot follows a stable path 1`] = `
 }
 `;
 
-exports[`golden: full match replay > produces a stable final state hash 1`] = `"51ec3bca"`;
+exports[`golden: full match replay > produces a stable final state hash 1`] = `"7addb1b6"`;
 
 exports[`golden: full match replay > records stable per-tank outcomes 1`] = `
 [
   {
     "alive": true,
-    "health": 99,
+    "health": 79,
     "id": "p1",
-    "score": 24,
-    "x": 381,
-    "y": 509,
+    "score": 20,
+    "x": 291,
+    "y": 446,
   },
   {
     "alive": true,
-    "health": 3,
+    "health": 55,
     "id": "p2",
-    "score": 1,
-    "x": 582,
-    "y": 637,
+    "score": 0,
+    "x": 530,
+    "y": 615,
   },
   {
     "alive": true,
-    "health": 100,
+    "health": 61,
     "id": "p3",
     "score": 0,
-    "x": 1080,
-    "y": 562,
+    "x": 1117,
+    "y": 637,
   },
 ]
 `;

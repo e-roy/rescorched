@@ -8,6 +8,7 @@
 
 import type { Browser, BrowserContext, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
+import { PROTOCOL_VERSION } from '@scorched/protocol';
 import {
   applyCrater,
   DEFAULT_WORLD,
@@ -271,6 +272,33 @@ export function solveShot(
 }
 
 /**
+ * Find an angle and power that will actually land on something.
+ *
+ * A hardcoded aim is a trap in this suite: 45/75 worked until terrain
+ * generation improved, and then two tests began failing because that lob now
+ * sails off the map and carves nothing. Asking the shared sim which shots
+ * connect keeps these tests about what they claim to be about — that both
+ * clients see the same crater — rather than about map luck.
+ *
+ * Prefers a shot that hits TERRAIN, since a crater is what the callers compare.
+ */
+export function findLandingShot(
+  snapshot: GameSnapshotLike,
+  shooterIndex: number,
+): { angleDeg: number; power: number } | null {
+  let fallback: { angleDeg: number; power: number } | null = null;
+
+  for (let angleDeg = 20; angleDeg <= 160; angleDeg += 5) {
+    for (let power = 40; power <= 95; power += 5) {
+      const predicted = predictShot(snapshot, shooterIndex, angleDeg, power, 'baby_missile');
+      if (predicted.kind === 'terrain') return { angleDeg, power };
+      if (predicted.kind === 'tank' && fallback === null) fallback = { angleDeg, power };
+    }
+  }
+  return fallback;
+}
+
+/**
  * Replay a shot locally with the shared sim and return the terrain it predicts.
  *
  * Because `@scorched/sim` is the very code the Durable Object runs, the
@@ -328,7 +356,7 @@ export async function cheat(
   frame: Record<string, unknown>,
 ): Promise<{ t: string; code?: string; message?: string }> {
   return page.evaluate(
-    async ({ roomCode: room, sessionId: session, frame: payload }) => {
+    async ({ roomCode: room, sessionId: session, frame: payload, version }) => {
       const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const socket = new WebSocket(`${scheme}//${location.host}/api/rooms/${room}/ws`);
 
@@ -341,8 +369,17 @@ export async function cheat(
         let handshaken = false;
 
         socket.addEventListener('open', () => {
+          // Take the version from the protocol package, never a literal: a
+          // hardcoded 1 here turned the whole cheat handshake into a silent
+          // no-op the moment the protocol bumped to 2, and the test then failed
+          // for a reason that had nothing to do with cheating.
           socket.send(
-            JSON.stringify({ t: 'hello', protocol: 1, name: 'Cheater', sessionId: session }),
+            JSON.stringify({
+              t: 'hello',
+              protocol: version,
+              name: 'Cheater',
+              sessionId: session,
+            }),
           );
         });
 
@@ -367,7 +404,7 @@ export async function cheat(
         });
       });
     },
-    { roomCode, sessionId, frame },
+    { roomCode, sessionId, frame, version: PROTOCOL_VERSION },
   );
 }
 

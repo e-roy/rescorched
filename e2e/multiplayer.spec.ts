@@ -15,6 +15,7 @@ import {
   fire,
   joinRoom,
   openPlayer,
+  findLandingShot,
   predictShot,
   readSelf,
   readSnapshot,
@@ -47,11 +48,16 @@ test.describe('two players, one room', () => {
 
     const terrainBefore = terrainFingerprint(before);
 
-    // Whoever is first fires a shot that is guaranteed to hit something.
+    // Whoever is first fires a shot the shared sim says will actually carve
+    // ground. Picking the aim from the sim rather than hardcoding it is what
+    // keeps this test about the crater agreeing, not about the map cooperating.
     const activePage =
       before.tanks[before.activeTank]?.id === (await readSelf(alice.page)) ? alice.page : bob.page;
     await waitForOurTurn(activePage);
-    await setAim(activePage, 45, 75);
+
+    const shot = findLandingShot(before, before.activeTank);
+    expect(shot, 'no angle/power in the sweep lands on terrain').not.toBeNull();
+    await setAim(activePage, shot!.angleDeg, shot!.power);
     await fire(activePage);
 
     const aliceAfter = await waitForTurnAfter(alice.page, before.turnNumber);
@@ -97,15 +103,15 @@ test.describe('two players, one room', () => {
     const page = before.tanks[shooterIndex]?.id === aliceId ? alice.page : bob.page;
     await waitForOurTurn(page);
 
-    const angleDeg = 55;
-    const power = 65;
+    const shot = findLandingShot(before, shooterIndex);
+    expect(shot, 'no angle/power in the sweep lands on terrain').not.toBeNull();
+    const { angleDeg, power } = shot!;
     const predicted = predictShot(before, shooterIndex, angleDeg, power, 'baby_missile');
+    expect(predicted.kind, 'the test shot should actually connect').not.toBe('wall');
 
     await setAim(page, angleDeg, power);
     await fire(page);
     const after = await waitForTurnAfter(page, before.turnNumber);
-
-    expect(predicted.kind, 'the test shot should actually connect').not.toBe('wall');
 
     // Not "roughly the same crater" — the SAME heightmap, every column.
     expect(after.terrain.surface).toEqual(predicted.surface);
