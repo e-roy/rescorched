@@ -1,20 +1,42 @@
 /*
  * Plain CSS, deliberately no framework (TECH_STACK.md).
- * The palette is lifted from the DOS original: EGA-ish saturated primaries on
- * near-black, with the amber/orange of a Baby Missile detonation as the accent.
+ *
+ * Two moods, on purpose, because the original has two:
+ *
+ *  - The TITLE screen is the 1991 box art: a vertical sunset from deep blue
+ *    through purple and magenta into orange, an enormous sun disc behind a pale
+ *    mountain range, the name in bright yellow and the tagline in cyan.
+ *  - Everything IN a match is EGA-ish saturated ink on near-black, with the
+ *    amber of a Baby Missile detonation as the accent, so the chrome never
+ *    competes with the starfield behind it.
  */
 
 :root {
   --bg: #05060a;
-  --panel: #10131c;
+  --panel: #0d1018;
+  --panel-lift: #141926;
   --panel-edge: #2b3145;
+  --panel-edge-hot: #47506e;
   --ink: #e8ecf4;
-  --ink-dim: #98a1b8;
+  --ink-dim: #97a0b7;
+  --ink-faint: #666e85;
   --accent: #ffa41b;
   --accent-hot: #ff5722;
+  --accent-cool: #4de1e8;
   --ok: #4caf50;
+  --warn: #ffc400;
   --danger: #e53935;
   --font-ui: 'Courier New', 'DejaVu Sans Mono', monospace;
+
+  /* The sunset ramp, top to horizon. */
+  --sky-0: #0a1240;
+  --sky-1: #2a1c72;
+  --sky-2: #5c1f86;
+  --sky-3: #9c2478;
+  --sky-4: #d33a5c;
+  --sky-5: #f2683a;
+  --sky-6: #ffa32b;
+  --sky-7: #ffd463;
 }
 
 * {
@@ -33,11 +55,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/*
- * The playfield and the HUD share the window rather than overlapping.
- * An overlaid HUD looks tidy until a tank spawns in a low valley and ends up
- * hidden behind the control bar — which is a genuinely unplayable turn.
- */
 body {
   display: flex;
   flex-direction: column;
@@ -51,158 +68,508 @@ body {
   overflow: hidden;
 }
 
+/*
+ * The thin light-grey frame the original draws around its playfield. Done as a
+ * box-shadow ring rather than a border so it can never change the canvas's
+ * measured size and fight the renderer's own scaling.
+ */
 #game-root canvas {
   display: block;
   image-rendering: pixelated;
   max-width: 100%;
   max-height: 100%;
+  box-shadow: 0 0 0 1px #6d7896;
 }
 
-/* ------------------------------------------------------------------ HUD -- */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/*
+ * Focus. Every interactive control gets the same ring, and it is the accent
+ * colour rather than the UA default so it survives on near-black.
+ */
+:where(button, input, select, a, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent-cool);
+  outline-offset: 2px;
+}
+
+/* ================================================================== HUD == */
 
 .hud {
   flex: 0 0 auto;
-  padding: 8px 14px 10px;
-  background: linear-gradient(180deg, #0a0d15 0%, #05060a 100%);
-  border-top: 1px solid var(--panel-edge);
+  padding: 6px 10px 5px;
+  background: linear-gradient(180deg, #10141f 0%, #080b12 100%);
+  border-bottom: 1px solid var(--panel-edge);
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.7);
   z-index: 10;
+  font-size: 12px;
 }
 
 .hud[hidden] {
   display: none;
 }
 
-.hud__bar {
+.hud__status {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
-  padding: 10px 14px;
-  background: rgba(16, 19, 28, 0.92);
+  gap: 10px;
+  min-height: 34px;
+}
+
+/* -- angle / power dials -- */
+
+.dial {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 6px 2px 8px;
+  background: #0a0e17;
   border: 1px solid var(--panel-edge);
-  border-radius: 6px;
-  pointer-events: auto;
+  border-radius: 3px;
 }
 
-.hud__group {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.hud__group--wide {
-  flex: 1 1 200px;
-  min-width: 180px;
-}
-
-.hud__label {
-  font-size: 11px;
-  letter-spacing: 0.14em;
+.dial__label {
+  margin-right: 4px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--ink-dim);
 }
 
-.hud__value {
-  min-width: 3.5ch;
-  text-align: center;
-  font-size: 18px;
+.dial__value {
+  min-width: 3ch;
+  text-align: right;
+  font-size: 19px;
   font-weight: 700;
+  line-height: 1;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
 
-.hud__step {
-  width: 26px;
-  height: 26px;
-  border: 1px solid var(--panel-edge);
-  background: #1a1f2e;
-  color: var(--ink);
-  font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-  border-radius: 4px;
+.dial__unit {
+  margin-right: 2px;
+  font-size: 12px;
+  color: var(--ink-faint);
 }
 
-.hud__step:hover {
+.dial__step {
+  width: 19px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.dial__step--coarse {
+  color: var(--ink-faint);
+}
+
+.dial__step:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
 
-.hud__select {
-  width: 100%;
-  padding: 6px 8px;
-  background: #1a1f2e;
-  color: var(--ink);
+.dial__step:active {
+  background: var(--accent);
+  color: #140a00;
+}
+
+/* -- whose turn it is -- */
+
+.onturn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  background: #0a0e17;
   border: 1px solid var(--panel-edge);
-  border-radius: 4px;
+  border-radius: 3px;
+  max-width: 210px;
+}
+
+.onturn--you {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(255, 164, 27, 0.25);
+}
+
+.onturn__swatch {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  background: #555;
+}
+
+.onturn__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.onturn__health {
+  margin-left: auto;
+  padding-left: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ok);
+  font-variant-numeric: tabular-nums;
+}
+
+.onturn__health[data-hurt='some'] {
+  color: var(--warn);
+}
+
+.onturn__health[data-hurt='bad'] {
+  color: var(--danger);
+}
+
+/* -- weapon -- */
+
+.weaponpick {
+  flex: 1 1 170px;
+  min-width: 140px;
+  max-width: 260px;
+}
+
+.weaponpick__select {
+  width: 100%;
+  padding: 5px 6px;
+  background: #0a0e17;
+  color: var(--accent-cool);
+  border: 1px solid var(--panel-edge);
+  border-radius: 3px;
   font-family: inherit;
   font-size: 13px;
 }
 
-.hud__fire {
-  margin-left: auto;
-  padding: 10px 26px;
-  font-family: inherit;
-  font-size: 16px;
+/* -- turn clock -- */
+
+.clock {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 52px;
+}
+
+.clock[hidden] {
+  display: none;
+}
+
+.clock__value {
+  font-size: 13px;
   font-weight: 700;
-  letter-spacing: 0.18em;
+  line-height: 1;
+  text-align: center;
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.clock__track {
+  display: block;
+  height: 4px;
+  background: #1c2231;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.clock__fill {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: var(--ok);
+}
+
+.clock[data-urgency='soon'] .clock__value {
+  color: var(--warn);
+}
+
+.clock[data-urgency='soon'] .clock__fill {
+  background: var(--warn);
+}
+
+.clock[data-urgency='now'] .clock__value {
+  color: var(--danger);
+}
+
+.clock[data-urgency='now'] .clock__fill {
+  background: var(--danger);
+}
+
+/* -- wind: the loudest thing on the line -- */
+
+.wind {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-left: auto;
+  padding: 3px 12px 3px 11px;
+  background: #12100c;
+  border: 1px solid #6a5324;
+  border-radius: 3px;
+}
+
+/* A wind worth aiming off for lights the whole block up. */
+.wind[data-calm='0'] {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 18px rgba(255, 164, 27, 0.14);
+}
+
+.wind__label {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.wind[data-calm='1'] .wind__label {
+  color: var(--ink-faint);
+}
+
+.wind__gauge {
+  position: relative;
+  display: block;
+  width: 96px;
+  height: 10px;
+  background: #161c29;
+  border: 1px solid #232a3c;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.wind__zero {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #414b66;
+}
+
+/*
+ * Grows out of the centre, left or right. `--wind-mid` is 50% and never moves;
+ * the script only sets the width and which side the fill is pinned to, so a
+ * dead calm reads as an empty gauge rather than a half-full one.
+ */
+.wind__fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 0;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-hot) 100%);
+}
+
+.wind__fill[data-dir='left'] {
+  left: auto;
+  right: 50%;
+  background: linear-gradient(270deg, var(--accent) 0%, var(--accent-hot) 100%);
+}
+
+.wind__value {
+  min-width: 6ch;
+  font-size: 21px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wind[data-calm='1'] .wind__value {
+  color: var(--ink-faint);
+}
+
+/* -- fire -- */
+
+.firebutton {
+  padding: 8px 22px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
   color: #1a0d00;
-  background: linear-gradient(180deg, var(--accent) 0%, var(--accent-hot) 100%);
-  border: 1px solid #ffcf7a;
-  border-radius: 5px;
+  background: linear-gradient(180deg, #ffc046 0%, var(--accent) 45%, var(--accent-hot) 100%);
+  border: 1px solid #ffd98f;
+  border-radius: 3px;
   cursor: pointer;
 }
 
-.hud__fire:disabled {
-  filter: grayscale(1) brightness(0.55);
+.firebutton:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+/*
+ * Off-turn, FIRE must recede. `grayscale()` alone left a large pale slab that
+ * was the brightest thing on a bar whose whole job is to be scanned — the eye
+ * kept landing on the one control that did nothing.
+ */
+.firebutton:disabled {
+  color: #4a5165;
+  background: #10141f;
+  border-color: #262d40;
   cursor: not-allowed;
+}
+
+/* -- arsenal rail -- */
+
+.hud__arsenal {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: 5px;
+  min-height: 22px;
+}
+
+.ammo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--ink-dim);
+  background: #0a0e17;
+  border: 1px solid var(--panel-edge);
+  border-radius: 2px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ammo:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.ammo__count {
+  font-weight: 700;
+  color: var(--accent-cool);
+  font-variant-numeric: tabular-nums;
+}
+
+.ammo--active {
+  color: #140a00;
+  background: linear-gradient(180deg, var(--accent) 0%, #e8890f 100%);
+  border-color: #ffd98f;
+}
+
+.ammo--active .ammo__count {
+  color: #3a1c00;
+}
+
+.ammo--empty {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.hud__hint {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+/* -- players + turn message -- */
+
+.hud__footline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 5px;
 }
 
 .hud__players {
   display: flex;
-  gap: 10px;
+  gap: 6px;
   flex-wrap: wrap;
-  margin-top: 8px;
 }
 
 .hud__turn {
-  margin-top: 6px;
-  font-size: 13px;
+  flex: 1 1 auto;
+  font-size: 12px;
   color: var(--accent);
-  min-height: 1.2em;
+  min-height: 1.1em;
+  text-align: right;
+}
+
+.hud__link {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  border: 1px solid var(--panel-edge);
+  border-radius: 2px;
+  color: var(--ink-faint);
+}
+
+.hud__link[data-state='open'] {
+  color: var(--ok);
+  border-color: rgba(76, 175, 80, 0.45);
+}
+
+.hud__link[data-state='connecting'],
+.hud__link[data-state='reconnecting'] {
+  color: var(--warn);
+  border-color: rgba(255, 196, 0, 0.5);
+}
+
+.hud__link[data-state='closed'] {
+  color: var(--danger);
+  border-color: rgba(229, 57, 53, 0.5);
 }
 
 .playertag {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px;
-  font-size: 12px;
-  background: rgba(16, 19, 28, 0.9);
+  padding: 2px 7px;
+  font-size: 11px;
+  background: #0a0e17;
   border: 1px solid var(--panel-edge);
-  border-radius: 4px;
+  border-radius: 2px;
 }
 
 .playertag--active {
   border-color: var(--accent);
 }
 
+.playertag--you .playertag__name {
+  color: var(--accent-cool);
+}
+
 .playertag--dead {
   opacity: 0.4;
+}
+
+.playertag--dead .playertag__name {
   text-decoration: line-through;
 }
 
 .playertag__swatch {
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
+  width: 9px;
+  height: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
 }
 
 .playertag__health {
-  width: 46px;
-  height: 6px;
-  background: #2b3145;
-  border-radius: 3px;
+  width: 42px;
+  height: 5px;
+  background: #232a3c;
   overflow: hidden;
 }
 
@@ -212,15 +579,148 @@ body {
   background: var(--ok);
 }
 
-/* -------------------------------------------------------------- overlay -- */
+.playertag__health[data-hurt='some'] span {
+  background: var(--warn);
+}
 
+.playertag__health[data-hurt='bad'] span {
+  background: var(--danger);
+}
+
+.playertag__cash {
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ================================================================= chat == */
+
+/* Above the overlay (z 20), because it is usable while the lobby panel is up. */
+.chat {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  width: min(320px, 38vw);
+  z-index: 25;
+  font-size: 12px;
+}
+
+.chat[hidden] {
+  display: none;
+}
+
+.chat__log {
+  max-height: 26vh;
+  overflow-y: auto;
+  padding: 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-shadow:
+    0 1px 0 #000,
+    0 0 4px #000;
+}
+
+.chat__log:empty {
+  display: none;
+}
+
+.chat__line {
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.chat__who {
+  font-weight: 700;
+}
+
+.chat__line--system {
+  color: var(--ink-dim);
+  font-style: italic;
+}
+
+.chat__form {
+  display: flex;
+  gap: 4px;
+  margin-top: 5px;
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+
+.chat__form:hover,
+.chat__form:focus-within {
+  opacity: 1;
+}
+
+.chat__input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  /* Nearly opaque: the terrain palette is re-rolled every round, so anything
+     translucent here is legible against one map and murky against the next. */
+  background: rgba(6, 8, 14, 0.94);
+  border: 1px solid var(--panel-edge);
+  border-radius: 2px;
+}
+
+.chat__send {
+  padding: 5px 10px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--ink-dim);
+  /* Nearly opaque: the terrain palette is re-rolled every round, so anything
+     translucent here is legible against one map and murky against the next. */
+  background: rgba(6, 8, 14, 0.94);
+  border: 1px solid var(--panel-edge);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.chat__send:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ============================================================== overlay == */
+
+/*
+ * Every non-title panel floats on the same sky the battlefield uses: near-black,
+ * dense with stars. The reference calls the starfield the single most
+ * recognisable thing about this game, and a lobby on a flat grey gradient reads
+ * as a settings dialog for some other product.
+ *
+ * Eight tiled one-pixel radial gradients, each on its own prime-ish tile size so
+ * the repeat never lines up into a visible grid. No image, no dependency.
+ */
 .overlay {
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
   padding: 24px;
-  background: radial-gradient(ellipse at 50% 0%, #131a2e 0%, #05060a 70%);
+  background-color: #05060c;
+  background-image:
+    radial-gradient(ellipse at 50% 0%, rgba(32, 46, 86, 0.5) 0%, rgba(5, 6, 12, 0) 66%),
+    radial-gradient(1.3px 1.3px at 18% 12%, #ffffff, transparent),
+    radial-gradient(1px 1px at 62% 27%, #cfe0ff, transparent),
+    radial-gradient(1.4px 1.4px at 83% 8%, #ffffff, transparent),
+    radial-gradient(1px 1px at 34% 62%, #ffffff, transparent),
+    radial-gradient(1px 1px at 9% 84%, #bcd2ff, transparent),
+    radial-gradient(1.2px 1.2px at 71% 76%, #ffffff, transparent),
+    radial-gradient(1px 1px at 47% 41%, #e6efff, transparent),
+    radial-gradient(1px 1px at 91% 55%, #ffffff, transparent);
+  background-size:
+    100% 100%,
+    173px 191px,
+    211px 157px,
+    241px 233px,
+    137px 179px,
+    197px 149px,
+    163px 211px,
+    229px 167px,
+    151px 199px;
   z-index: 20;
   overflow-y: auto;
 }
@@ -230,41 +730,16 @@ body {
 }
 
 .panel {
-  width: min(420px, 100%);
-  padding: 28px;
+  width: min(430px, 100%);
+  padding: 26px;
   background: var(--panel);
   border: 1px solid var(--panel-edge);
-  border-radius: 10px;
+  border-radius: 8px;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
-}
-
-.panel--wide {
-  width: min(680px, 100%);
 }
 
 .panel[hidden] {
   display: none;
-}
-
-.panel__title {
-  margin: 0 0 4px;
-  font-size: 34px;
-  letter-spacing: 0.1em;
-  line-height: 1.05;
-  color: var(--accent);
-  text-shadow: 0 0 18px rgba(255, 164, 27, 0.35);
-}
-
-.panel__title span {
-  display: block;
-  color: var(--accent-hot);
-}
-
-.panel__tagline {
-  margin: 0 0 22px;
-  font-size: 13px;
-  color: var(--ink-dim);
-  letter-spacing: 0.08em;
 }
 
 .panel__heading {
@@ -275,34 +750,16 @@ body {
 }
 
 .panel__hint {
-  margin: 0 0 16px;
+  margin: 0 0 14px;
   font-size: 12px;
+  line-height: 1.5;
   color: var(--ink-dim);
 }
 
 .panel__actions {
   display: flex;
   gap: 10px;
-  margin-top: 14px;
-}
-
-.panel__divider {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 18px 0 6px;
-  color: var(--ink-dim);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.2em;
-}
-
-.panel__divider::before,
-.panel__divider::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: var(--panel-edge);
+  margin-top: 16px;
 }
 
 .panel__error {
@@ -310,9 +767,9 @@ body {
   padding: 8px 10px;
   font-size: 12px;
   color: #ffd9d6;
-  background: rgba(229, 57, 53, 0.16);
-  border: 1px solid rgba(229, 57, 53, 0.5);
-  border-radius: 4px;
+  background: rgba(229, 57, 53, 0.18);
+  border: 1px solid rgba(229, 57, 53, 0.55);
+  border-radius: 3px;
 }
 
 .panel__error[hidden] {
@@ -320,53 +777,240 @@ body {
 }
 
 .panel__winner {
-  margin: 0 0 16px;
-  font-size: 22px;
+  margin: 0 0 8px;
+  font-size: 24px;
   color: var(--accent);
 }
 
+/* On the result panel the winner is the headline; "Match over" is the label. */
+.panel--result .panel__heading {
+  font-size: 11px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.panel--result .panel__winner {
+  margin: 6px 0 10px;
+  font-size: 34px;
+  line-height: 1.1;
+  text-shadow: 0 0 26px rgba(255, 164, 27, 0.35);
+}
+
+/* ---------------------------------------------------------- title screen */
+
+.panel--title {
+  position: fixed;
+  inset: 0;
+  width: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.sunset {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    180deg,
+    var(--sky-0) 0%,
+    var(--sky-1) 22%,
+    var(--sky-2) 38%,
+    var(--sky-3) 52%,
+    var(--sky-4) 63%,
+    var(--sky-5) 73%,
+    var(--sky-6) 83%,
+    var(--sky-7) 100%
+  );
+}
+
+/*
+ * The sun disc. It sits BEHIND the range and is deliberately enormous — in the
+ * original it is wider than the tallest peak, which is what makes the mountains
+ * read as a silhouette rather than as scenery.
+ */
+.sunset__sun {
+  position: absolute;
+  left: 52%;
+  bottom: 4%;
+  width: min(52vh, 460px);
+  height: min(52vh, 460px);
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 50% 50%,
+    #fffbe0 0%,
+    #ffee7a 34%,
+    #ffe14d 58%,
+    #ffc61f 84%,
+    #ffb300 100%
+  );
+  box-shadow: 0 0 90px 30px rgba(255, 214, 77, 0.35);
+}
+
+.sunset__range {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: 58%;
+  display: block;
+}
+
+.titlebar {
+  position: absolute;
+  top: clamp(14px, 4vh, 46px);
+  left: 0;
+  right: 0;
+  text-align: center;
+  z-index: 2;
+  padding: 0 16px;
+}
+
+.titlebar__name {
+  margin: 0;
+  font-size: clamp(34px, 7vw, 76px);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: #ffe14d;
+  text-shadow:
+    0 0 2px #000,
+    2px 3px 0 #7a3d00,
+    0 0 26px rgba(255, 225, 77, 0.5);
+}
+
+.titlebar__sub {
+  margin: 10px 0 0;
+  font-size: clamp(13px, 1.7vw, 20px);
+  letter-spacing: 0.16em;
+  color: var(--accent-cool);
+  text-shadow: 0 0 2px #000;
+}
+
+.titlebar__badge {
+  margin: 8px 0 0;
+  font-size: clamp(10px, 1.1vw, 13px);
+  letter-spacing: 0.14em;
+  color: #ffffff;
+  opacity: 0.85;
+  text-shadow: 0 0 2px #000;
+}
+
+.titlebar__foot {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 10px;
+  margin: 0;
+  padding: 0 16px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #3a2a4a;
+  z-index: 2;
+}
+
+/*
+ * The console column, standing in for the original's stack of grey Motif
+ * buttons down the left edge.
+ */
+.console {
+  position: absolute;
+  top: 50%;
+  left: clamp(16px, 5vw, 84px);
+  transform: translateY(-46%);
+  width: min(300px, 42vw);
+  padding: 18px;
+  background: linear-gradient(180deg, rgba(28, 31, 44, 0.9) 0%, rgba(12, 14, 24, 0.9) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  border-radius: 5px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.6),
+    0 18px 44px rgba(0, 0, 0, 0.45);
+  z-index: 3;
+}
+
+.console__rule {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 12px;
+  color: var(--ink-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+}
+
+.console__rule::before,
+.console__rule::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.console .btn {
+  width: 100%;
+}
+
+/* -------------------------------------------------------------- controls */
+
 .field {
   display: block;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 
 .field span {
   display: block;
   margin-bottom: 5px;
-  font-size: 11px;
-  letter-spacing: 0.14em;
+  font-size: 10px;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--ink-dim);
 }
 
 .field input {
   width: 100%;
-  padding: 10px 12px;
+  padding: 9px 11px;
   font-family: inherit;
   font-size: 16px;
   color: var(--ink);
-  background: #0a0d15;
+  background: #06080f;
   border: 1px solid var(--panel-edge);
-  border-radius: 5px;
+  border-radius: 3px;
   letter-spacing: 0.08em;
 }
 
 .field input:focus {
-  outline: none;
   border-color: var(--accent);
+}
+
+.field__code {
+  font-size: 24px;
+  font-weight: 700;
+  text-align: center;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  color: var(--accent);
 }
 
 .btn {
   flex: 1;
-  padding: 11px 16px;
+  padding: 10px 14px;
   font-family: inherit;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.1em;
   color: var(--ink);
-  background: #1a1f2e;
-  border: 1px solid var(--panel-edge);
-  border-radius: 5px;
+  background: linear-gradient(180deg, #202638 0%, #161b28 100%);
+  border: 1px solid var(--panel-edge-hot);
+  border-radius: 3px;
   cursor: pointer;
 }
 
@@ -376,19 +1020,92 @@ body {
 }
 
 .btn:disabled {
-  opacity: 0.45;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
 .btn--primary {
   color: #1a0d00;
-  background: linear-gradient(180deg, var(--accent) 0%, #e8890f 100%);
-  border-color: #ffcf7a;
+  background: linear-gradient(180deg, #ffc046 0%, var(--accent) 50%, #e8890f 100%);
+  border-color: #ffd98f;
 }
 
 .btn--primary:hover:not(:disabled) {
   color: #1a0d00;
   filter: brightness(1.1);
+}
+
+.btn--ghost {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  font-size: 11px;
+}
+
+/*
+ * `:hover` is more specific than a plain attribute selector, so without the
+ * second rule the generic hover repaints a pressed toggle's text in the accent
+ * colour — amber on green, which reads as neither state.
+ */
+.btn[aria-pressed='true'],
+.btn[aria-pressed='true']:hover:not(:disabled) {
+  color: #06210a;
+  background: linear-gradient(180deg, #6fdc74 0%, var(--ok) 100%);
+  border-color: #9df0a1;
+}
+
+.btn[aria-pressed='true']:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* ---------------------------------------------------------------- lobby */
+
+.panel--lobby {
+  width: min(470px, 100%);
+}
+
+.lobby__eyebrow {
+  margin: 0 0 8px;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.lobby__codebox {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: #06080f;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  box-shadow: inset 0 0 24px rgba(255, 164, 27, 0.12);
+}
+
+.lobby__code {
+  flex: 1;
+  font-size: 46px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.22em;
+  text-indent: 0.22em;
+  text-align: center;
+  color: var(--accent);
+  text-shadow: 0 0 22px rgba(255, 164, 27, 0.45);
+}
+
+.panel--lobby .panel__hint {
+  margin: 10px 0 14px;
+}
+
+.lobby__spectators {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.lobby__spectators[hidden] {
+  display: none;
 }
 
 .playerlist {
@@ -405,95 +1122,222 @@ body {
   gap: 10px;
   padding: 9px 12px;
   font-size: 14px;
-  background: #0a0d15;
+  background: #06080f;
   border: 1px solid var(--panel-edge);
-  border-radius: 5px;
-}
-
-.playerlist li .swatch {
-  width: 12px;
-  height: 12px;
   border-radius: 3px;
 }
 
-.playerlist li .spacer {
+.playerlist li.is-away {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+.playerlist .swatch {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+.playerlist .spacer {
   flex: 1;
 }
 
-.playerlist li .tag {
-  font-size: 11px;
-  letter-spacing: 0.1em;
+.playerlist .tag {
+  padding: 2px 6px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
   color: var(--ink-dim);
+  border: 1px solid var(--panel-edge);
+  border-radius: 2px;
 }
 
-/* ----------------------------------------------------------------- shop -- */
-
-.shop__money {
-  margin-bottom: 14px;
-  font-size: 15px;
-  color: var(--ink-dim);
-}
-
-.shop__money strong {
+.playerlist .tag--host {
   color: var(--accent);
-  font-size: 20px;
+  border-color: rgba(255, 164, 27, 0.5);
 }
 
-.shop {
+.playerlist .tag--ready {
+  color: var(--ok);
+  border-color: rgba(76, 175, 80, 0.5);
+}
+
+.playerlist .tag--away {
+  color: var(--danger);
+  border-color: rgba(229, 57, 53, 0.5);
+}
+
+/* -------------------------------------------------------------- armoury */
+
+.panel--armoury {
+  width: min(1000px, 100%);
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+}
+
+.armoury__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.armoury__head .panel__hint {
+  max-width: 52ch;
+  margin-bottom: 12px;
+}
+
+.armoury__cash {
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.armoury__cash span {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.armoury__cash strong {
+  font-size: 30px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * A card that ends mid-word at the fold reads as a rendering bug rather than as
+ * "there is more below", so the scroll region fades out at its bottom edge.
+ * `mask-image` rather than an overlaid gradient, so it works whatever colour a
+ * card underneath happens to be.
+ */
+.armoury {
   margin: 0;
-  padding: 0;
+  padding: 2px;
   list-style: none;
   display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 8px;
-  max-height: 46vh;
   overflow-y: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 calc(100% - 34px), transparent 100%);
+  mask-image: linear-gradient(180deg, #000 0%, #000 calc(100% - 34px), transparent 100%);
 }
 
-.shop li {
+.wpn {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    'name  own'
+    'desc  desc'
+    'stats stats'
+    'price buy';
   align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  background: #0a0d15;
+  gap: 3px 10px;
+  padding: 9px 11px;
+  background: #06080f;
   border: 1px solid var(--panel-edge);
-  border-radius: 5px;
+  border-radius: 3px;
 }
 
-.shop__name {
+.wpn--owned {
+  border-color: rgba(77, 225, 232, 0.45);
+  background: #071016;
+}
+
+.wpn--broke {
+  opacity: 0.5;
+}
+
+.wpn--free {
+  border-color: rgba(255, 164, 27, 0.4);
+}
+
+.wpn__name {
+  grid-area: name;
   font-size: 14px;
   font-weight: 700;
+  color: var(--ink);
 }
 
-.shop__desc {
+.wpn__tier {
+  margin-left: 6px;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--ink-faint);
+  vertical-align: 1px;
+}
+
+.wpn__owned {
+  grid-area: own;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent-cool);
+  font-variant-numeric: tabular-nums;
+}
+
+.wpn__owned[data-empty='1'] {
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+.wpn__desc {
+  grid-area: desc;
   font-size: 11px;
+  line-height: 1.45;
   color: var(--ink-dim);
-  margin-top: 2px;
+  min-height: 2.9em;
 }
 
-.shop__price {
+.wpn__stats {
+  grid-area: stats;
+  display: flex;
+  gap: 10px;
+  margin: 3px 0 4px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+}
+
+.wpn__stats b {
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.wpn__price {
+  grid-area: price;
   font-size: 13px;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
 
-.shop__owned {
-  font-size: 12px;
-  color: var(--ink-dim);
-  min-width: 4ch;
-  text-align: right;
+.wpn__price small {
+  display: block;
+  font-size: 10px;
+  color: var(--ink-faint);
 }
 
-.shop__buy {
-  padding: 7px 14px;
+.wpn__buttons {
+  grid-area: buy;
+  display: flex;
+  gap: 5px;
+}
+
+.shop__buy,
+.shop__sell {
+  padding: 6px 12px;
   font-family: inherit;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--ink);
-  background: #1a1f2e;
-  border: 1px solid var(--panel-edge);
-  border-radius: 4px;
+  background: linear-gradient(180deg, #202638 0%, #161b28 100%);
+  border: 1px solid var(--panel-edge-hot);
+  border-radius: 2px;
   cursor: pointer;
 }
 
@@ -502,27 +1346,186 @@ body {
   color: var(--accent);
 }
 
-.shop__buy:disabled {
-  opacity: 0.35;
+.shop__sell:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.shop__buy:disabled,
+.shop__sell:disabled {
+  opacity: 0.3;
   cursor: not-allowed;
 }
 
-/* ---------------------------------------------------------------- toast -- */
+.armoury__foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 14px;
+  flex: 0 0 auto;
+}
+
+.armoury__waiting {
+  flex: 1;
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.armoury__foot .btn {
+  flex: 0 0 190px;
+}
+
+/* ------------------------------------------------------------- standings */
+
+.panel--result {
+  width: min(520px, 100%);
+}
+
+.standings {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.standings li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  font-size: 14px;
+  background: #06080f;
+  border: 1px solid var(--panel-edge);
+  border-radius: 3px;
+}
+
+.standings li.is-first {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 22px rgba(255, 164, 27, 0.14);
+}
+
+.standings__place {
+  width: 2.5ch;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.standings li.is-first .standings__place {
+  color: var(--accent);
+}
+
+.standings .swatch {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+.standings__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.standings__rounds {
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.standings__score {
+  min-width: 8ch;
+  text-align: right;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ================================================== toast / connection === */
 
 .toast {
-  position: absolute;
+  position: fixed;
   left: 50%;
-  top: 24px;
+  top: 16px;
   transform: translateX(-50%);
-  padding: 10px 18px;
+  padding: 9px 16px;
   font-size: 13px;
   color: #ffd9d6;
-  background: rgba(229, 57, 53, 0.92);
-  border-radius: 5px;
-  z-index: 30;
+  background: rgba(229, 57, 53, 0.94);
+  border-radius: 3px;
+  z-index: 40;
   pointer-events: none;
+  max-width: 76vw;
+  text-align: center;
+}
+
+/* Not everything worth saying is a failure — an invite copied is not an error. */
+.toast[data-tone='info'] {
+  color: #06210a;
+  background: rgba(146, 226, 150, 0.96);
 }
 
 .toast[hidden] {
   display: none;
+}
+
+.connbanner {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 7px 14px;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-align: center;
+  color: #241500;
+  background: var(--warn);
+  z-index: 45;
+}
+
+.connbanner[data-state='closed'] {
+  color: #fff;
+  background: var(--danger);
+}
+
+.connbanner[hidden] {
+  display: none;
+}
+
+/* The banner is pinned to the bottom edge, which is where the chat box lives. */
+body:has(#conn-banner:not([hidden])) .chat {
+  bottom: 44px;
+}
+
+/* ==================================================== narrow viewports === */
+
+@media (max-width: 900px) {
+  .hud__status {
+    flex-wrap: wrap;
+  }
+
+  .wind {
+    margin-left: 0;
+  }
+
+  .console {
+    position: static;
+    transform: none;
+    width: min(340px, 100%);
+    margin: 0 auto;
+  }
+
+  .panel--title {
+    display: grid;
+    align-content: center;
+    justify-items: center;
+    padding: 120px 16px 60px;
+    overflow-y: auto;
+  }
+
+  .chat {
+    display: none;
+  }
 }

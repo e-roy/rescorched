@@ -27,6 +27,10 @@
  */
 
 import { clamp } from './math.ts';
+// Type-only, and it has to stay that way: `ai.ts` imports real functions from
+// this file, so a value import here would close a runtime cycle.
+// `verbatimModuleSyntax` erases this line outright.
+import type { BotPersonality } from './ai.ts';
 import {
   checkPlayability,
   cloneTerrain,
@@ -86,6 +90,17 @@ export interface Tank {
   /** weaponId → rounds remaining. Baby Missile is absent and always available. */
   inventory: Record<WeaponId, number>;
   colorIndex: number;
+  /**
+   * Which computer player is driving this seat, or null for a human.
+   *
+   * Nothing in this file reads it. It is here because the seat is the only
+   * place it can live — a bot is a property of the chair, not of the connection
+   * — and because `ai.ts` needs it to decide, and `chooseShot` must be a pure
+   * function of persisted state. `serialize.ts` carries it in the PERSISTED
+   * form only, deliberately not in the snapshot that goes down the wire; see
+   * the note there.
+   */
+  bot: BotPersonality | null;
 }
 
 export interface GameState {
@@ -110,6 +125,8 @@ export interface PlayerSeed {
   id: string;
   name: string;
   colorIndex?: number;
+  /** Seat a computer player here. Omitted or undefined means a human. */
+  bot?: BotPersonality;
 }
 
 export interface GameConfig {
@@ -214,6 +231,7 @@ export function createGame(config: GameConfig, players: readonly PlayerSeed[]): 
     selectedWeapon: BABY_MISSILE,
     inventory: {} as Record<WeaponId, number>,
     colorIndex: player.colorIndex ?? index,
+    bot: player.bot ?? null,
   }));
   seatTanks(tanks, terrain, rng.fork('placement'));
 
@@ -1020,6 +1038,36 @@ function flyShot(
 }
 
 /**
+ * Where a shot from this tank would land, resolved exactly the way `fire()`
+ * will resolve it.
+ *
+ * Exported for `ai.ts`, and it is not a convenience. A bot that predicted its
+ * own shots with its own copy of this setup would be one edit away from aiming
+ * at a slightly different world than the one the server resolves in — a
+ * different muzzle offset, a forgotten `ignore` on its own hull, a hit circle
+ * sized from the wrong constant — and the symptom would be a bot that
+ * mysteriously shoots a few pixels wide. Sharing the function makes that class
+ * of drift impossible: this is the same `flyShot` and the same `muzzlePoint`
+ * the real shot uses.
+ *
+ * Pure and free of side effects — nothing here touches `state`. To model a
+ * different wind (a bot that ignores it), hand in `{ ...state, wind: 0 }`; the
+ * terrain and the tanks are shared by reference, so that copy is cheap.
+ */
+export function predictShot(
+  state: GameState,
+  tankIndex: number,
+  angleDeg: number,
+  power: number,
+): Trajectory {
+  const tank = state.tanks[tankIndex];
+  if (tank === undefined) {
+    throw new IllegalMoveError('no_such_tank', `No tank at index ${tankIndex}`);
+  }
+  return flyShot(state, muzzlePoint(tank), angleDeg, power, tankIndex);
+}
+
+/**
  * Blast rules shared by every detonation: what a point of damage is worth in
  * cash, and what a kill pays. These live here rather than in detonation.ts
  * because they are economy decisions, not physics.
@@ -1328,6 +1376,13 @@ export function hashGameState(state: GameState): string {
     mix(Math.round(tank.power * 100));
     mixText(tank.selectedWeapon);
     mix(tank.colorIndex);
+    // Only when there IS one. Two rooms whose seats hold different computer
+    // players are different games — the next move differs — so the hash has to
+    // be able to see it. Mixing unconditionally would also have moved every
+    // existing all-human hash, including the golden replay snapshot, for a
+    // field that was null in all of them; a snapshot that churns for no change
+    // in behaviour teaches everyone to update it without reading it.
+    if (tank.bot !== null) mixText(tank.bot);
     for (const [weaponId, count] of Object.entries(tank.inventory).sort()) {
       mixText(weaponId);
       mix(count);

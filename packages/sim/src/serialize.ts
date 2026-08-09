@@ -12,6 +12,7 @@
  */
 
 import type { GameState, GamePhase, Tank } from './game.ts';
+import type { BotPersonality } from './ai.ts';
 import { deserializeTerrain, serializeTerrain } from './terrain.ts';
 import type { RngState } from './rng.ts';
 import type { WeaponId } from './weapons.ts';
@@ -84,13 +85,36 @@ function toTankSnapshot(tank: Tank): TankSnapshot {
   };
 }
 
+/**
+ * A persisted seat. Everything in `TankSnapshot`, plus who is driving.
+ *
+ * `bot` lives here and NOT in `TankSnapshot` on purpose. `TankSnapshot` is the
+ * wire shape, and the comment at the top of this file is a promise that it
+ * stays structurally identical to `GameSnapshotSchema` in `@scorched/protocol`
+ * — a Zod object that strips what it does not know, so a field added there
+ * would not reach a client anyway, it would just quietly disappear and make the
+ * two shapes disagree. Persistence has no such constraint and a real need: a
+ * Durable Object that hibernated and forgot which seats were computer players
+ * would resume the match with six silent tanks that never take their turn.
+ * When the lobby needs to SHOW that a seat is a bot, that is a protocol change,
+ * made deliberately, in the protocol package.
+ */
+export interface PersistedTank extends TankSnapshot {
+  bot: BotPersonality | null;
+}
+
 /** Full persistence form — includes the RNG state, so a room resumes exactly. */
 export interface PersistedGame extends GameSnapshot {
+  tanks: PersistedTank[];
   rngState: RngState;
 }
 
 export function toPersisted(state: GameState): PersistedGame {
-  return { ...toSnapshot(state), rngState: { ...state.rngState } };
+  return {
+    ...toSnapshot(state),
+    tanks: state.tanks.map((tank) => ({ ...toTankSnapshot(tank), bot: tank.bot })),
+    rngState: { ...state.rngState },
+  };
 }
 
 export function fromPersisted(data: PersistedGame): GameState {
@@ -100,7 +124,15 @@ export function fromPersisted(data: PersistedGame): GameState {
     totalRounds: data.totalRounds,
     phase: data.phase,
     terrain: deserializeTerrain(data.terrain),
-    tanks: data.tanks.map((tank) => ({ ...tank, inventory: { ...tank.inventory } })),
+    // `bot` is read defensively rather than spread: a row written before the
+    // field existed has no `bot` key at all, and a tank whose `bot` came back
+    // `undefined` would be neither a human (null) nor a bot, which is the kind
+    // of third state that gets discovered in production.
+    tanks: data.tanks.map((tank) => ({
+      ...tank,
+      inventory: { ...tank.inventory },
+      bot: tank.bot ?? null,
+    })),
     activeTank: data.activeTank,
     turnNumber: data.turnNumber,
     wind: data.wind,

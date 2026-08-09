@@ -24,7 +24,10 @@ const game = new Phaser.Game({
   parent: 'game-root',
   width: VIEW_WIDTH,
   height: VIEW_HEIGHT,
-  backgroundColor: '#05060a',
+  // The same near-black as the starfield's own base. A camera shake slides the
+  // whole scene, and whatever colour shows in the gutter it opens at the edge
+  // is a flashing border unless it matches the sky.
+  backgroundColor: '#03030c',
   scale: {
     mode: Phaser.Scale.FIT,
     autoCenter: Phaser.Scale.CENTER_BOTH,

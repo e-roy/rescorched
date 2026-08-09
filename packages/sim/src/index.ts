@@ -17,4 +17,5 @@ export * from './weapons.ts';
 export * from './detonation.ts';
 export * from './game.ts';
 export * from './economy.ts';
+export * from './ai.ts';
 export * from './serialize.ts';

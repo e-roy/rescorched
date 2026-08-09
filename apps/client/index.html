@@ -10,102 +10,304 @@
     />
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
-  <body>
-    <div id="game-root"></div>
+  <body data-screen="title">
+    <!--
+      HUD first in the DOM, and therefore at the TOP of the window.
 
-    <!-- HUD: overlaid on the canvas, plain DOM (no framework — see TECH_STACK.md) -->
+      The 1991 original puts its whole status line above the battlefield, and it
+      is the single most recognisable piece of its chrome. It shares the window
+      with the playfield rather than floating over it, because an overlaid bar
+      hides any tank that spawns in a high valley — which is a genuinely
+      unplayable turn, not a cosmetic complaint.
+    -->
     <div id="hud" class="hud" hidden data-testid="hud">
-      <div class="hud__bar">
-        <div class="hud__group">
-          <span class="hud__label">Angle</span>
-          <button class="hud__step" data-action="angle-down" aria-label="Decrease angle">
-            &minus;
+      <div class="hud__status">
+        <!-- Power before Angle, which is the order the original prints them. -->
+        <div class="dial" data-testid="dial-power">
+          <span class="dial__label">Power</span>
+          <button
+            class="dial__step dial__step--coarse"
+            data-action="power-down"
+            data-coarse="1"
+            aria-label="Power down 10"
+            title="Shift + Down"
+          >
+            &laquo;
           </button>
-          <output class="hud__value" id="hud-angle" data-testid="hud-angle">45</output>
-          <button class="hud__step" data-action="angle-up" aria-label="Increase angle">+</button>
-        </div>
-        <div class="hud__group">
-          <span class="hud__label">Power</span>
-          <button class="hud__step" data-action="power-down" aria-label="Decrease power">
-            &minus;
+          <button
+            class="dial__step"
+            data-action="power-down"
+            aria-label="Power down 1"
+            title="Down"
+          >
+            &lsaquo;
           </button>
-          <output class="hud__value" id="hud-power" data-testid="hud-power">60</output>
-          <button class="hud__step" data-action="power-up" aria-label="Increase power">+</button>
+          <output class="dial__value" id="hud-power" data-testid="hud-power">60</output>
+          <button class="dial__step" data-action="power-up" aria-label="Power up 1" title="Up">
+            &rsaquo;
+          </button>
+          <button
+            class="dial__step dial__step--coarse"
+            data-action="power-up"
+            data-coarse="1"
+            aria-label="Power up 10"
+            title="Shift + Up"
+          >
+            &raquo;
+          </button>
         </div>
-        <div class="hud__group hud__group--wide">
-          <span class="hud__label">Weapon</span>
-          <select class="hud__select" id="hud-weapon" data-testid="hud-weapon"></select>
+
+        <div class="dial" data-testid="dial-angle">
+          <span class="dial__label">Angle</span>
+          <button
+            class="dial__step dial__step--coarse"
+            data-action="angle-down"
+            data-coarse="1"
+            aria-label="Angle down 10"
+            title="Shift + Left"
+          >
+            &laquo;
+          </button>
+          <button
+            class="dial__step"
+            data-action="angle-down"
+            aria-label="Angle down 1"
+            title="Left"
+          >
+            &lsaquo;
+          </button>
+          <output class="dial__value" id="hud-angle" data-testid="hud-angle">45</output>
+          <span class="dial__unit">&deg;</span>
+          <button class="dial__step" data-action="angle-up" aria-label="Angle up 1" title="Right">
+            &rsaquo;
+          </button>
+          <button
+            class="dial__step dial__step--coarse"
+            data-action="angle-up"
+            data-coarse="1"
+            aria-label="Angle up 10"
+            title="Shift + Right"
+          >
+            &raquo;
+          </button>
         </div>
-        <div class="hud__group">
-          <span class="hud__label">Wind</span>
-          <output class="hud__value" id="hud-wind" data-testid="hud-wind">0.0</output>
+
+        <div class="onturn" id="hud-active" data-testid="hud-active">
+          <span class="onturn__swatch" id="hud-active-swatch"></span>
+          <span class="onturn__name" id="hud-active-name">&mdash;</span>
+          <span class="onturn__health" id="hud-active-health">100%</span>
         </div>
-        <button class="hud__fire" id="hud-fire" data-testid="fire-button" disabled>FIRE</button>
+
+        <label class="weaponpick">
+          <span class="visually-hidden">Weapon</span>
+          <select class="weaponpick__select" id="hud-weapon" data-testid="hud-weapon"></select>
+        </label>
+
+        <div class="clock" id="hud-timer" data-testid="hud-timer" hidden>
+          <span class="clock__value" id="hud-timer-value">0:00</span>
+          <span class="clock__track"><span class="clock__fill" id="hud-timer-fill"></span></span>
+        </div>
+
+        <!--
+          Wind, at the right edge, where the original puts it — and deliberately
+          the loudest thing on the line. Every miss in this game is either angle,
+          power, or the wind you did not look at.
+        -->
+        <div class="wind" id="hud-windbox" data-testid="hud-windbox">
+          <span class="wind__label">Wind</span>
+          <span class="wind__gauge">
+            <span class="wind__zero"></span>
+            <span class="wind__fill" id="hud-wind-fill"></span>
+          </span>
+          <output class="wind__value" id="hud-wind" data-testid="hud-wind">&middot; 0.0</output>
+        </div>
+
+        <button class="firebutton" id="hud-fire" data-testid="fire-button" disabled>Fire</button>
       </div>
-      <div class="hud__players" id="hud-players" data-testid="hud-players"></div>
-      <div class="hud__turn" id="hud-turn" data-testid="hud-turn"></div>
+
+      <div class="hud__arsenal" id="hud-arsenal" data-testid="hud-arsenal"></div>
+
+      <div class="hud__footline">
+        <div class="hud__players" id="hud-players" data-testid="hud-players"></div>
+        <div class="hud__turn" id="hud-turn" data-testid="hud-turn"></div>
+        <div class="hud__link" id="hud-conn" data-testid="hud-conn" data-state="open">Live</div>
+      </div>
     </div>
 
-    <!-- Menus: title / create / join / lobby / shop / game over -->
+    <div id="game-root"></div>
+
+    <!-- Chat lives over the canvas so it never steals height from the playfield. -->
+    <div id="chat" class="chat" hidden data-testid="chat">
+      <div
+        class="chat__log"
+        id="chat-log"
+        data-testid="chat-log"
+        role="log"
+        aria-live="polite"
+      ></div>
+      <form class="chat__form" id="chat-form">
+        <input
+          class="chat__input"
+          id="chat-input"
+          data-testid="chat-input"
+          maxlength="200"
+          placeholder="Press T to talk"
+          autocomplete="off"
+          aria-label="Chat message"
+        />
+        <button class="chat__send" id="chat-send" data-testid="chat-send" type="submit">
+          Send
+        </button>
+      </form>
+    </div>
+
+    <!-- Menus: title / lobby / armoury / game over -->
     <div id="overlay" class="overlay" data-testid="overlay">
-      <section class="panel" id="panel-title" data-testid="panel-title">
-        <h1 class="panel__title">SCORCHED<span>EARTH</span></h1>
-        <p class="panel__tagline">The mother of all games.</p>
-        <label class="field">
-          <span>Your name</span>
-          <input id="input-name" data-testid="input-name" maxlength="16" value="Player" />
-        </label>
-        <div class="panel__actions">
+      <section class="panel panel--title" id="panel-title" data-testid="panel-title">
+        <div class="sunset" aria-hidden="true">
+          <div class="sunset__sun"></div>
+          <svg class="sunset__range" viewBox="0 0 1200 320" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="ridge-far" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#dfe4f4" />
+                <stop offset="60%" stop-color="#a294c4" />
+                <stop offset="100%" stop-color="#6d5b96" />
+              </linearGradient>
+              <linearGradient id="ridge-near" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#ffffff" />
+                <stop offset="42%" stop-color="#eef1fa" />
+                <stop offset="100%" stop-color="#a9b2d0" />
+              </linearGradient>
+            </defs>
+            <polygon
+              fill="url(#ridge-far)"
+              points="0,246 58,206 118,232 188,152 248,196 322,124 398,180 470,134 540,190 612,108 690,168 760,142 832,198 902,152 980,208 1060,168 1132,218 1200,192 1200,320 0,320"
+            />
+            <polygon
+              fill="url(#ridge-near)"
+              points="0,300 66,276 140,288 212,240 282,266 344,220 402,250 462,158 522,126 562,62 604,104 646,48 694,118 742,86 792,168 852,212 904,182 962,232 1022,200 1084,246 1142,222 1200,258 1200,320 0,320"
+            />
+            <polygon
+              fill="#ffffff"
+              opacity="0.6"
+              points="646,48 694,118 664,124 630,86 604,104 562,62 588,44 616,74"
+            />
+            <polygon
+              fill="#8d96bb"
+              opacity="0.45"
+              points="646,48 694,118 792,168 852,212 762,206 700,150"
+            />
+          </svg>
+        </div>
+
+        <div class="titlebar">
+          <h1 class="titlebar__name">Scorched Earth</h1>
+          <p class="titlebar__sub">The Mother of All Games</p>
+          <p class="titlebar__badge">&#42;&#42; Open Source Multiplayer Edition &#42;&#42;</p>
+        </div>
+
+        <div class="console" data-testid="title-console">
+          <label class="field">
+            <span>Your name</span>
+            <input
+              id="input-name"
+              data-testid="input-name"
+              maxlength="16"
+              value="Player"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
           <button class="btn btn--primary" id="btn-create" data-testid="btn-create">
             Create room
           </button>
-        </div>
-        <div class="panel__divider"><span>or</span></div>
-        <label class="field">
-          <span>Room code</span>
-          <input id="input-room" data-testid="input-room" maxlength="4" placeholder="ABCD" />
-        </label>
-        <div class="panel__actions">
+
+          <div class="console__rule"><span>or join</span></div>
+
+          <label class="field">
+            <span>Room code</span>
+            <input
+              class="field__code"
+              id="input-room"
+              data-testid="input-room"
+              maxlength="4"
+              placeholder="ABCD"
+              autocomplete="off"
+              spellcheck="false"
+              inputmode="latin"
+            />
+          </label>
           <button class="btn" id="btn-join" data-testid="btn-join">Join room</button>
+
+          <p class="panel__error" id="title-error" data-testid="title-error" hidden></p>
         </div>
-        <p class="panel__error" id="title-error" data-testid="title-error" hidden></p>
+
+        <p class="titlebar__foot">
+          A web remake of the 1991 DOS original by Wendell Hicken. Open source, no accounts, room
+          codes only.
+        </p>
       </section>
 
-      <section class="panel" id="panel-lobby" data-testid="panel-lobby" hidden>
-        <h2 class="panel__heading">
-          Room <span id="lobby-code" data-testid="lobby-code">----</span>
-        </h2>
-        <p class="panel__hint">Share that code. Two players minimum.</p>
+      <section class="panel panel--lobby" id="panel-lobby" data-testid="panel-lobby" hidden>
+        <p class="lobby__eyebrow">Room code &mdash; read it out loud</p>
+        <div class="lobby__codebox">
+          <span class="lobby__code" id="lobby-code" data-testid="lobby-code">----</span>
+          <button class="btn btn--ghost" id="btn-copy" data-testid="btn-copy">Copy invite</button>
+        </div>
+        <p class="panel__hint" id="lobby-hint" data-testid="lobby-hint">
+          Two players minimum. Anyone with the code can walk in.
+        </p>
+
         <ul class="playerlist" id="lobby-players" data-testid="lobby-players"></ul>
+        <p
+          class="lobby__spectators"
+          id="lobby-spectators"
+          data-testid="lobby-spectators"
+          hidden
+        ></p>
+
         <div class="panel__actions">
           <button class="btn btn--primary" id="btn-start" data-testid="btn-start">
             Start match
+          </button>
+          <button class="btn" id="btn-ready" data-testid="btn-ready" aria-pressed="false">
+            Ready
           </button>
           <button class="btn" id="btn-leave" data-testid="btn-leave">Leave</button>
         </div>
         <p class="panel__error" id="lobby-error" data-testid="lobby-error" hidden></p>
       </section>
 
-      <section class="panel panel--wide" id="panel-shop" data-testid="panel-shop" hidden>
-        <h2 class="panel__heading">Armoury</h2>
-        <p class="panel__hint">
-          Round over. Spend it or lose it &mdash; cash carries over, regrets do not.
-        </p>
-        <div class="shop__money">
-          Cash: <strong id="shop-money" data-testid="shop-money">$0</strong>
-        </div>
-        <ul class="shop" id="shop-items" data-testid="shop-items"></ul>
-        <div class="panel__actions">
+      <section class="panel panel--armoury" id="panel-shop" data-testid="panel-shop" hidden>
+        <header class="armoury__head">
+          <div>
+            <h2 class="panel__heading">Armoury</h2>
+            <p class="panel__hint">
+              Round over. Cash carries over, regrets do not &mdash; and the shop only opens between
+              rounds.
+            </p>
+          </div>
+          <div class="armoury__cash">
+            <span>Cash</span>
+            <strong id="shop-money" data-testid="shop-money">$0</strong>
+          </div>
+        </header>
+
+        <ul class="armoury" id="shop-items" data-testid="shop-items"></ul>
+
+        <footer class="armoury__foot">
+          <span class="armoury__waiting" id="shop-waiting" data-testid="shop-waiting"></span>
           <button class="btn btn--primary" id="btn-shop-done" data-testid="btn-shop-done">
             Ready
           </button>
-        </div>
+        </footer>
       </section>
 
-      <section class="panel" id="panel-gameover" data-testid="panel-gameover" hidden>
+      <section class="panel panel--result" id="panel-gameover" data-testid="panel-gameover" hidden>
         <h2 class="panel__heading">Match over</h2>
         <p class="panel__winner" id="gameover-winner" data-testid="gameover-winner"></p>
-        <ul class="playerlist" id="gameover-scores" data-testid="gameover-scores"></ul>
+        <p class="panel__hint" id="gameover-rounds" data-testid="gameover-rounds"></p>
+        <ol class="standings" id="gameover-scores" data-testid="gameover-scores"></ol>
         <div class="panel__actions">
           <button class="btn btn--primary" id="btn-again" data-testid="btn-again">
             Back to title
@@ -114,6 +316,7 @@
       </section>
     </div>
 
+    <div id="conn-banner" class="connbanner" data-testid="conn-banner" hidden></div>
     <div id="toast" class="toast" data-testid="toast" hidden></div>
 
     <script type="module" src="/src/main.ts"></script>
