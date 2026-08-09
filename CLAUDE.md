@@ -103,6 +103,38 @@ pnpm --filter @scorched/sim exec vitest run -u
 and say in the commit message that you did, and why. A snapshot update that
 nobody mentions is indistinguishable from a determinism bug.
 
+## The mistake this repo keeps making
+
+Every review round so far has found the same defect, in a different file each
+time: **a test that restates the constant it is supposed to police.**
+
+```ts
+// Cannot fail. `passes` is bounded by MAX_SLUMP_PASSES by construction.
+expect(result.slumpPasses).toBeLessThanOrEqual(MAX_SLUMP_PASSES);
+
+// Cannot fail. The budget is the thing under test.
+expect(path.length).toBeLessThanOrEqual(PHYSICS.maxPathPoints + 1);
+
+// Cannot fail. It restates the formula it is checking.
+expect(muzzle.y).toBe(tank.y - DEFAULT_WORLD.tankRadius - 2);
+```
+
+Each of those was written in good faith, read as a guarantee, and defended
+nothing. Mutating the constant left the whole suite green.
+
+Two rules that actually work:
+
+1. **Assert the behaviour, not the parameter.** Not "damage equals
+   `SUDDEN_DEATH_STEP * 3`" but "overtime kills a full-health tank within four
+   turns, and no single turn before the last takes more than half a tank".
+2. **Prove it by mutation before you believe it.** Break the thing the test
+   defends, watch the test fail, put it back. A test you have not seen fail is
+   not evidence. When you add a load-bearing test, say in the commit message
+   which mutation you ran and what died.
+
+A golden snapshot is a change detector, not a specification. "Only
+`determinism.test.ts` noticed" means the behaviour is untested.
+
 ## Two traps worth knowing about
 
 **The Durable Object hibernates.** Anything held in an instance field is gone

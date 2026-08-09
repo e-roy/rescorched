@@ -22,6 +22,7 @@ import {
   type Tank,
 } from '../src/game.ts';
 import { emptyTerrain } from '../src/terrain.ts';
+import { makeRng } from '../src/rng.ts';
 import { BABY_MISSILE } from '../src/weapons.ts';
 
 const WIDTH = 1280;
@@ -245,18 +246,88 @@ describe('wind', () => {
     expect(moved).toBeGreaterThan(steps.length * 0.95);
   });
 
-  it('does not camp at the ends of the dial', () => {
-    // This is what the mean reversion buys. A plain random walk against a hard
-    // clamp piles up at the walls, and a wind stuck at -10 for six turns reads
-    // as the game holding a grudge.
-    const { values } = samples;
-    const pinned = values.filter((value) => Math.abs(value) >= DEFAULT_WORLD.maxWind - 0.05).length;
-    expect(pinned / values.length).toBeLessThan(0.02);
+  it('is pulled back towards calm rather than wandering', () => {
+    // This is what `WIND.retention` buys, and it has to be stated as a pull
+    // rather than as "it never reaches the ends". Counting pinned values does
+    // not distinguish the two models at all — the reflection below keeps a
+    // plain random walk off the walls just as well — so a test that only looked
+    // there passed with the mean reversion deleted.
+    //
+    // Nor can it be stated as a decay from a full-scale wind: the reflection
+    // pushes away from the wall on its own, so both models come back from +10
+    // and the measurement says nothing about the pull.
+    //
+    // What the pull actually controls is how far the wind gets from calm when
+    // it starts there. Release it from zero and let it run: mean reversion
+    // holds it in a band around calm, an unpulled walk spreads out over the
+    // whole dial.
+    //
+    // The chains vary only `rngState`, off one map — the wind model never reads
+    // the terrain, so this buys 120 independent chains without paying for 120
+    // more `generateTerrain` calls. It needs to be that many: a dozen chains
+    // moved the mean by half a point between seeds, which is most of the
+    // distance being measured.
+    const base = stalemateGame(2, 'calm');
+    const values: number[] = [];
+    for (let chain = 0; chain < 120; chain += 1) {
+      let state: GameState = { ...base, wind: 0, rngState: makeRng(`calm-${chain}`).save() };
+      for (let i = 0; i < 25 && state.phase === 'aiming'; i += 1) {
+        state = step(state);
+        values.push(state.wind);
+      }
+    }
 
-    // And it is not timid either: it reaches past half scale in both
-    // directions, so the dial is used rather than decorative.
+    const meanAbs = values.reduce((sum, value) => sum + Math.abs(value), 0) / values.length;
+    const strong = values.filter((value) => Math.abs(value) > DEFAULT_WORLD.maxWind / 2).length;
+    const report = `n=${values.length} meanAbs=${meanAbs.toFixed(2)} strong=${strong}`;
+
+    expect(values.length).toBe(120 * 25);
+    // Measured over these 3000 turns: mean |wind| 2.46, with 10.5% of turns
+    // past half scale. Raising `retention` towards a pure random walk takes it
+    // to 3.01 / 19.4% at 0.95, 3.61 / 28.6% at 0.99 and 3.78 / 31.0% at 1.
+    // A wind as likely to be 8 as 1 is a wind nobody can plan around.
+    expect(meanAbs, report).toBeLessThan(2.8);
+    expect(strong / values.length, report).toBeLessThan(0.15);
+    // Bounded from below too, so that "calm" cannot quietly become "no wind at
+    // all": the same run measures 1.39 at retention 0.5 and 1.24 at 0.1, and a
+    // dial that never leaves the middle is a dial worth deleting.
+    expect(meanAbs, report).toBeGreaterThan(1.5);
+  });
+
+  it('uses the whole dial without ever leaving it', () => {
+    const { values } = samples;
+    // Not timid: it reaches past half scale in both directions.
     expect(Math.max(...values)).toBeGreaterThan(DEFAULT_WORLD.maxWind / 2);
     expect(Math.min(...values)).toBeLessThan(-DEFAULT_WORLD.maxWind / 2);
+    // And never pinned to an end. Measured at zero of these samples.
+    expect(values.filter((value) => Math.abs(value) >= DEFAULT_WORLD.maxWind - 0.05).length).toBe(
+      0,
+    );
+  });
+
+  it('bounces off the ends of the dial instead of sticking to them', () => {
+    // The other half of the model, and the only part of it that can be seen
+    // from a wind already at full scale — which is why this test puts one
+    // there rather than waiting for a long run to wander over.
+    //
+    // From wind = +10 the next value is 9 plus a drift of up to 2.5, so about
+    // 30% of draws overshoot the dial. A clamp lands every one of those exactly
+    // on the wall; folding them back does not. Measured over 300 draws: 7 land
+    // on the wall here, 120 with the fold replaced by a clamp. The 7 are the
+    // draws that genuinely round to 10.0, not draws that were pushed there.
+    const base = stalemateGame(2, 'reflect');
+    let onTheWall = 0;
+    const draws = 300;
+    for (let seed = 0; seed < draws; seed += 1) {
+      const after = step({
+        ...base,
+        wind: DEFAULT_WORLD.maxWind,
+        rngState: makeRng(`reflect-${seed}`).save(),
+      });
+      expect(Math.abs(after.wind)).toBeLessThanOrEqual(DEFAULT_WORLD.maxWind);
+      if (Math.abs(after.wind) >= DEFAULT_WORLD.maxWind) onTheWall += 1;
+    }
+    expect(onTheWall / draws, `onTheWall=${onTheWall}/${draws}`).toBeLessThan(0.1);
   });
 
   it('is drawn fresh at the start of every match', () => {

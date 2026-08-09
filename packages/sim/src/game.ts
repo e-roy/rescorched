@@ -394,12 +394,26 @@ const SLOT_JITTER_HI = 0.8;
  * and keep the tank in its own slot, which is the whole point: a tank that gets
  * pushed out of its slot to find footing is no longer evenly spaced.
  *
- * Density earns its keep here. Over the 1000-match sweep below, and with
- * everything else as it now stands, 11 samples per slot left two matches whose
- * final placement still contained a pair that cannot shoot at each other, 17
- * left two, and 25 left none.
+ * What density actually buys, measured over the 1000-match sweep described on
+ * `MAX_SPAWN_ELEVATION_SPREAD` below, is footing and only footing. The share of
+ * the 4600 tanks that end up on ground steeper than `KNIFE_EDGE_DROP`:
+ *
+ *     samples per slot    5     7     9    11    13    17    25    33
+ *     perched            507   473   442   419   410   390   382   376
+ *
+ * It buys nothing else. Every one of those eight densities finished the sweep
+ * with ZERO pairs that cannot shoot at each other and ZERO per-column defects,
+ * and the height excess over the brute-forced floor did not respond to density
+ * at all (median 5-6 px throughout, p95 wandering between 79 and 86 px with no
+ * trend). Reachability is the repair loop's job and levelness is
+ * `levelWindow`'s; a previous version of this comment credited density with
+ * both, and the sweep it cited does not say that.
+ *
+ * 13 is where the curve flattens: 5 -> 13 removes 97 perched tanks, 13 -> 33
+ * removes 34 more. The tail is not worth paying for on every round start of
+ * every match.
  */
-const SLOT_SAMPLES = 25;
+const SLOT_SAMPLES = 13;
 
 /**
  * Repairs attempted before settling for the least bad placement drawn.
@@ -429,30 +443,43 @@ const PLACEMENT_ATTEMPTS = 12;
  * the flattest possible, plus this much".
  *
  * Measured over 1000 real `createGame` matches (5 styles x {2,3,4,6,8} players
- * x 40 seeds, 1280x720), against a brute-forced floor: the smallest spread ANY
- * choice of one column per slot could have reached on that same map, computed
- * over every column rather than the sampled ones.
+ * x 40 seeds, 1280x720, seeds `real-<style>-<count>-<seed>`), against a
+ * brute-forced floor: the smallest spread ANY choice of one column per slot
+ * could have reached on that same map, computed over every column rather than
+ * the sampled ones.
  *
  *     spawn height spread          median   p95   worst
- *     same search, rule disabled     249    418    432
- *     this rule                      123    318    432
+ *     same search, rule disabled     250    419    432
+ *     this rule                      121    319    432
  *     brute-forced floor             103    318    432
- *     this rule minus the floor        6     80    137
+ *     this rule minus the floor        6     84    139
  *
  * The last row is the one that matters, because it is the only one that is
  * about the rule rather than about the terrain: the placement is 6 px off the
- * best possible at the median and never more than 137 px off, which is the
+ * best possible at the median and never more than 139 px off, which is the
  * slack this constant hands out, spent on variety. The 432 px worst case is
  * shared with the floor — an eight-player mountain round where no placement is
- * level — and the median by player count shows why: 44 px at two players
- * against a floor of 0, but 241 px at eight against a floor of 240. With eight
- * slots across the map there is nothing left to choose.
+ * level — and the median by player count shows why:
  *
- * The search is close to free next to the map it runs on: over those same 1000
- * matches `createGame` averages 10.7 ms and peaks at 177 ms, and generating the
- * terrain alone — which happens either way — accounts for 9.9 ms and 160 ms of
- * that. (Both figures move by a few ms between runs on the same machine; the
- * difference between them is the stable number.)
+ *     players            2     3     4     6     8
+ *     this rule         38    88   116   191   243
+ *     floor              0    35    86   190   240
+ *
+ * With eight slots across the map there is nothing left to choose, and the rule
+ * honestly claims nothing there. Two players is where it earns its keep: 38 px
+ * against 107 px for the same search with the rule disabled.
+ *
+ * The search is close to free next to the map it runs on. Over those same 1000
+ * matches `createGame` averages 9.5 ms and generating the terrain alone — which
+ * happens either way — accounts for 9.2 ms of it, leaving placement about a
+ * third of a millisecond.
+ *
+ * Only that difference is worth quoting. The absolute means wander between 8.6
+ * and 9.6 ms across the six sweeps run here, and the peaks are pure noise —
+ * `createGame`'s peak came in BELOW `generateTerrain`'s on two of the six, which
+ * is impossible and is exactly what a single-sample maximum on a machine with
+ * other things to do looks like. The difference of the means held between 0.24
+ * and 0.35 ms on every one of the six.
  *
  * `test/game-placement.test.ts` reruns a slice of this sweep and fails if the
  * excess over the floor grows.
@@ -480,34 +507,46 @@ function slotRanges(width: number, count: number): Slot[] {
 }
 
 /**
- * Columns in this slot a tank could actually stand and fight on.
+ * Columns in this slot a tank could be placed on.
  *
- * The filter is `checkPlayability` itself, asked about the one column — which
- * is deliberate: headroom, footing and "can this tank shoot out of its own
- * hole" are the terrain module's rules, they have been tuned there against
- * measurements this file has not taken, and a second copy of them here would
- * drift. A single-column report runs only the per-column tests; the pairwise
- * line-of-fire sweep needs two spawns and costs nothing here.
+ * Evenly spaced across the slot and nothing more. This used to pre-filter the
+ * samples through `checkPlayability` one column at a time, on the reasoning
+ * that headroom, footing and "can this tank shoot out of its own hole" are the
+ * terrain module's rules and should not be reimplemented here. The reasoning is
+ * right; the filter was dead code anyway.
  *
- * The "knife-edge" case is the `footing` verdict: a column whose ground rises
- * or falls more than `maxFootingDrop` across the tank's own footprint is a
- * cliff face, not a place to park.
+ * `generateTerrain` will not return a map until `checkPlayability` passes on
+ * it, over `SPAWN_SAMPLES` columns spread across the whole `spawnBand` that
+ * these slots live inside. That is a grid rather than every column, so it does
+ * not strictly prove the columns between the grid points are fine — but
+ * `MAX_TERRAIN_SLOPE` keeps a generated map smooth enough that in practice it
+ * does. Instrumented over the 1000-match sweep described on
+ * `MAX_SPAWN_ELEVATION_SPREAD` below, the filter rejected NONE of the columns
+ * it was shown — 115,000 of them at 25 samples per slot, and zero rejections at
+ * every density from 5 to 33 — and deleting it left all 1000 placements
+ * bit-identical (same digest, same 410 perched tanks, same excess quantiles).
+ * It cost `SLOT_SAMPLES * tankCount` `checkPlayability` calls per round start
+ * to enforce nothing.
+ *
+ * Nothing is riding on that measurement holding forever, which is the other
+ * reason it is safe to drop. The terrain module's check still runs on the real
+ * tank columns in `chooseSpawnColumns` below — the same per-column rules, plus
+ * the pairwise line-of-fire sweep a single-column report cannot do — and the
+ * repair loop moves any tank it complains about. A column the generator's grid
+ * happened to miss gets caught there instead of here.
+ * `test/game-placement.test.ts` reruns that check from outside and demands zero
+ * issues — and it is the repair loop that earns that, not this function:
+ * short-circuiting `chooseSpawnColumns` to accept its first draw puts a blocked
+ * pair back into the sweep.
  */
-function slotCandidates(terrain: Terrain, slot: Slot): number[] {
+function slotCandidates(slot: Slot): number[] {
   const columns: number[] = [];
   const span = slot.hi - slot.lo;
   for (let i = 0; i < SLOT_SAMPLES; i += 1) {
     const x = SLOT_SAMPLES < 2 ? slot.lo : Math.round(slot.lo + (span * i) / (SLOT_SAMPLES - 1));
     if (columns[columns.length - 1] !== x) columns.push(x);
   }
-
-  const standable = columns.filter(
-    (x) => checkPlayability(terrain, { spawns: [x], stopEarly: true }).ok,
-  );
-  // A slot with no good column at all still has to hold a tank. Handing back
-  // the raw samples keeps the tank in its slot and lets the whole-placement
-  // check below judge the set; refusing to place would be worse.
-  return standable.length > 0 ? standable : columns;
+  return columns;
 }
 
 /** Height difference between the highest and lowest of these spawns. */
@@ -586,7 +625,7 @@ function levelWindow(terrain: Terrain, candidates: readonly (readonly number[])[
 function chooseSpawnColumns(terrain: Terrain, count: number, rng: Rng): number[] {
   const search = makeRng(rng.nextU32());
   const slots = slotRanges(terrain.width, count);
-  const candidates = slots.map((slot) => slotCandidates(terrain, slot));
+  const candidates = slots.map((slot) => slotCandidates(slot));
 
   const window = levelWindow(terrain, candidates);
   const level = candidates.map((list) => {
@@ -664,10 +703,13 @@ function chooseSpawnColumns(terrain: Terrain, count: number, rng: Rng): number[]
  *      gun, while a pair 300 px apart staring at each other over a wall they
  *      cannot clear is the deadlock this whole search exists to avoid.
  *
- * Over the 1000-match sweep behind `MAX_SPAWN_ELEVATION_SPREAD` this never ran:
- * twelve targeted repairs always found a placement with no issues at all. It is
- * here because "not once in a thousand" is not "never", and the alternative on
- * the map that finally does it is a round that will not start.
+ * Over the 1000-match sweep behind `MAX_SPAWN_ELEVATION_SPREAD` this never ran,
+ * and the sweep proves it rather than assuming it: every draw reaching here has
+ * already failed `checkPlayability`, so whatever `leastBad` returns carries at
+ * least one issue — and rechecking the final placement of all 1000 matches from
+ * outside found zero issues of any kind. Twelve targeted repairs were always
+ * enough. It is here because "not once in a thousand" is not "never", and the
+ * alternative on the map that finally does it is a round that will not start.
  */
 function leastBad(terrain: Terrain, drawn: readonly number[][]): number[] {
   let best = drawn[0] as number[];
@@ -719,6 +761,21 @@ function leastBad(terrain: Terrain, drawn: readonly number[][]): number[] {
  * changes by more than the tank is tall, so the hull is balanced on an edge
  * rather than sitting on a surface. It is a preference, not a veto — a slot
  * with nothing flatter still gets its tank.
+ *
+ * Over the same 1000-match sweep quoted on `MAX_SPAWN_ELEVATION_SPREAD`, of
+ * 4600 placed tanks the number standing on ground steeper than this:
+ *
+ *     preference off, height window on      982  (21.3%)
+ *     preference on,  height window on      410  ( 8.9%)
+ *     preference on,  height window off      14  ( 0.3%)
+ *
+ * The third row is the honest limit on what this rule can do. The height window
+ * usually pinches a slot down to a handful of candidates, and when none of them
+ * is flat the preference has nothing to prefer — so most of the 410 are slots
+ * where levelness and footing genuinely conflicted and levelness won. Removing
+ * the height rule would fix footing almost completely and cost 129 px of median
+ * spread, which is not a trade worth making: a tank on a slope is awkward, a
+ * tank 250 px above everybody else has already won.
  */
 export const KNIFE_EDGE_DROP = DEFAULT_WORLD.tankRadius * 2;
 

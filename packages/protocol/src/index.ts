@@ -189,6 +189,16 @@ export const DurationMsSchema = z
   .int()
   .min(0)
   .max(24 * 60 * 60 * 1000);
+/**
+ * A `ping`/`pong` correlator. The value means nothing to either end beyond "this
+ * pong answers that ping", so 32 bits is a ceiling no legitimate sender reaches
+ * by accident, and Rule 1 at the top of this file — every number a range — gets
+ * to be true. It was `.min(0)` alone: bounded below, unbounded above, so
+ * `{"t":"ping","nonce":9007199254740991}` parsed clean in BOTH directions. A
+ * tiny blast radius, but this file's whole value is that its bounds are real.
+ */
+export const MAX_NONCE = 0xffffffff;
+export const NonceSchema = z.number().int().min(0).max(MAX_NONCE);
 
 /**
  * Free text a player typed. Rejects C0/C1 control characters, lone surrogates
@@ -443,6 +453,8 @@ export const TerrainSnapshotSchema = z
 export type TerrainSnapshot = z.infer<typeof TerrainSnapshotSchema>;
 
 export const GamePhaseSchema = z.enum(['lobby', 'aiming', 'resolving', 'shopping', 'gameover']);
+/** Exported as a type so `sim-boundary.test.ts` can pin it against the sim's own union. */
+export type GamePhase = z.infer<typeof GamePhaseSchema>;
 
 export const GameSnapshotSchema = z.object({
   seed: z.number().int().min(0).max(0xffffffff),
@@ -459,7 +471,57 @@ export const GameSnapshotSchema = z.object({
 });
 export type GameSnapshot = z.infer<typeof GameSnapshotSchema>;
 
-/** Mirrors `GameEvent` in @scorched/sim. Kept structural so sim stays dependency-free. */
+/**
+ * How a shot ended, as far as the client's animation is concerned: it hit dirt,
+ * it hit a tank, it left the board sideways, or it simply ran out of flight.
+ *
+ * These four are the sim's `ImpactKind` union (`packages/sim/src/physics.ts`),
+ * and `sim-boundary.test.ts` pins the two sets together *in both directions* at
+ * compile time. That test is the enforcement; this array is only the copy of it
+ * that lives on our side of the boundary.
+ */
+export const IMPACT_KINDS = ['terrain', 'tank', 'wall', 'expired'] as const;
+export type ImpactKind = (typeof IMPACT_KINDS)[number];
+
+/**
+ * The bound the wire actually applies to `impactKind` — a shape bound, not the
+ * enum. This is the one field here that is deliberately NOT a `z.enum`, and the
+ * reason is worth writing down because the obvious tightening is a trap.
+ *
+ * `GameEventSchema` only ever travels server → client. A closed enum here buys
+ * no protection from a hostile peer, because no client can send one. What it
+ * costs is severe: `encodeServerMessage` validates on the way out, and the room
+ * calls it while building the turn's `events` frame — outside the try in
+ * `broadcast()`. A single cosmetic string the enum did not happen to list would
+ * therefore take the whole turn's frame with it and leave every client waiting
+ * for a turn that never arrives. That is the same shape of mistake as the shared
+ * 16 KB cap recorded above: strictness in the direction where strictness buys
+ * nothing and costs the match.
+ *
+ * The set of kinds is still enforced — at compile time, against the sim's own
+ * union, which is where a divergence should surface. Clients that want to switch
+ * exhaustively narrow with `isKnownImpactKind` and keep a default branch.
+ */
+export const ImpactKindSchema = z
+  .string()
+  .min(1)
+  .max(32)
+  .regex(/^[a-z][a-z0-9_]*$/, 'Impact kinds are lowercase snake_case');
+
+/** Narrow a wire `impactKind` to the four the client knows how to animate. */
+export function isKnownImpactKind(kind: string): kind is ImpactKind {
+  return (IMPACT_KINDS as readonly string[]).includes(kind);
+}
+
+/**
+ * Mirrors `GameEvent` in @scorched/sim. Kept structural so sim stays
+ * dependency-free; `sim-boundary.test.ts` is what stops "structural" drifting
+ * into "unrelated".
+ *
+ * This union is a strict SUPERSET of the sim's: `timeout` is emitted by the
+ * room, not by the sim, because a clock is not a game rule and `packages/sim`
+ * has no clock. Everything else here comes from the sim.
+ */
 export const GameEventSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('shot'),
@@ -470,7 +532,7 @@ export const GameEventSchema = z.discriminatedUnion('type', [
       .array(WorldCoordSchema)
       .max(MAX_TRAJECTORY_VALUES)
       .refine((path) => path.length % 2 === 0, 'Trajectory must be (x, y) pairs'),
-    impactKind: z.enum(['terrain', 'tank', 'wall', 'expired']),
+    impactKind: ImpactKindSchema,
   }),
   z.object({
     type: z.literal('explosion'),
@@ -571,7 +633,7 @@ export const ClientMessageSchema = z.discriminatedUnion('t', [
   z.object({ t: z.literal('sell'), weapon: WeaponIdSchema }),
   z.object({ t: z.literal('shopDone') }),
   z.object({ t: z.literal('chat'), text: ChatTextSchema }),
-  z.object({ t: z.literal('ping'), nonce: z.number().int().min(0) }),
+  z.object({ t: z.literal('ping'), nonce: NonceSchema }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 
@@ -724,7 +786,7 @@ export const ServerMessageSchema = z.discriminatedUnion('t', [
     code: ServerErrorCodeSchema,
     message: z.string().max(300),
   }),
-  z.object({ t: z.literal('pong'), nonce: z.number().int().min(0) }),
+  z.object({ t: z.literal('pong'), nonce: NonceSchema }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;
 
@@ -827,6 +889,36 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
 export function encodeServerMessage(message: ServerMessage): string {
   const validated = ServerMessageSchema.parse(message);
   return JSON.stringify(toWire(validated));
+}
+
+/**
+ * `encodeServerMessage` without the throw.
+ *
+ * The throwing version is the right default: an outbound frame our own server
+ * built and cannot serialise is a bug on our side, and swallowing it hides the
+ * bug. But there is one caller where that trade is wrong. `broadcast()` in the
+ * Durable Object encodes the turn's `events` frame BEFORE the loop that sends
+ * it, and the encode sits outside the try that guards `socket.send`. A throw
+ * there is not a dropped log line: nobody receives the turn, every client sits
+ * waiting for events that never arrive, and the match is over without a message
+ * saying so.
+ *
+ * This variant hands that caller the choice — send what it can, log the frame it
+ * could not build, keep adjudicating. It is offered, not imposed: `apps/server`
+ * belongs to someone else and still calls the throwing form.
+ */
+export function tryEncodeServerMessage(message: ServerMessage): ParseResult<string> {
+  const result = ServerMessageSchema.safeParse(message);
+  if (!result.success) {
+    return { ok: false, code: 'bad_message', error: formatZodError(result.error) };
+  }
+  try {
+    return { ok: true, value: JSON.stringify(toWire(result.data)) };
+  } catch (error) {
+    // `packSurface` throws a RangeError on a heightmap the schema let through
+    // but the codec cannot represent, and JSON.stringify throws on a cycle.
+    return { ok: false, code: 'bad_message', error: String(error) };
+  }
 }
 
 function toWire(message: ServerMessage): unknown {

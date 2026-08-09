@@ -79,10 +79,12 @@ const MAX_SOCKETS = MAX_PLAYERS + MAX_SPECTATORS;
  * normally therefore costs exactly one `setAlarm`, and no wake-up at all.
  *
  * The shop gets longer because reading an arsenal takes longer than picking an
- * angle.
+ * angle. Both are exported so a test can assert which clock a phase got
+ * without restating the numbers — a test that hardcoded 60000 would still pass
+ * if the shop quietly started using the turn clock.
  */
-const TURN_TIMEOUT_MS = 60_000;
-const SHOP_TIMEOUT_MS = 120_000;
+export const TURN_TIMEOUT_MS = 60_000;
+export const SHOP_TIMEOUT_MS = 120_000;
 
 /**
  * How many turns in a row the clock may decide before the room gives up on the
@@ -90,7 +92,7 @@ const SHOP_TIMEOUT_MS = 120_000;
  * wake every minute for the rest of the match — the exact standing cost
  * hibernation exists to remove.
  */
-const MAX_CONSECUTIVE_TIMEOUTS = 3;
+export const MAX_CONSECUTIVE_TIMEOUTS = 3;
 
 /**
  * The replay log is a ring buffer, not an archive: enough history to inspect
@@ -109,12 +111,18 @@ interface SocketAttachment {
   connId: string;
   /** Null until `hello` succeeds. For a spectator, an id with no seat behind it. */
   playerId: string | null;
+  /**
+   * The credential this socket authenticated with: the seat's `secret` for a
+   * player, the spectator's own id for a viewer. Never broadcast and never
+   * derivable from anything that is — see `RoomPlayer.secret`.
+   */
+  secret: string | null;
   name: string;
   spectator: boolean;
 }
 
 /** A socket that has completed `hello`, so it has an identity to act with. */
-type JoinedAttachment = SocketAttachment & { playerId: string };
+type JoinedAttachment = SocketAttachment & { playerId: string; secret: string };
 
 interface RateBucket {
   /** Wall-clock ms the current window opened. */
@@ -123,7 +131,29 @@ interface RateBucket {
 }
 
 interface RoomPlayer {
+  /**
+   * Public. It is in every `lobby` frame, in every tank of every snapshot, and
+   * in every `chat` line, so every client in the room knows it for every
+   * player.
+   */
   id: string;
+  /**
+   * Private. This — not `id` — is what proves ownership of the seat on
+   * reconnect, and it goes to exactly one place: the `sessionId` field of that
+   * player's own `welcome`.
+   *
+   * The two fields exist because the reconnect handshake needs a bearer token
+   * and the game needs a name to put on a tank, and those cannot be the same
+   * string. When `hello` matched on the public id, any client could re-hello
+   * with an opponent's id from the lobby list, be welcomed as them, and fire
+   * their shot or spend their money — with the victim's socket still open and
+   * none the wiser.
+   *
+   * The wire already carried both: `welcome.sessionId` is what a client
+   * replays in `hello`, `welcome.you` is the identity it renders with. Only
+   * the room was collapsing them into one value.
+   */
+  secret: string;
   name: string;
   ready: boolean;
   colorIndex: number;
@@ -254,6 +284,7 @@ export class GameRoom implements DurableObject {
       server.serializeAttachment({
         connId: generateSessionId(),
         playerId: null,
+        secret: null,
         name: '',
         spectator: false,
       } satisfies SocketAttachment);
@@ -505,20 +536,30 @@ export class GameRoom implements DurableObject {
     // second seat. Without this, one connection could quietly claim every slot
     // in the room by saying hello eight times.
     if (attachment.playerId !== null) {
-      if (message.sessionId !== undefined && message.sessionId !== attachment.playerId) {
+      // A socket carrying an identity but no credential cannot be re-synced and
+      // must not be allowed to fall through and claim a fresh seat. Only
+      // reachable for an attachment written by an older build.
+      if (
+        attachment.secret === null ||
+        (message.sessionId ?? attachment.secret) !== attachment.secret
+      ) {
         this.sendError(ws, 'bad_protocol', 'This connection has already joined as someone else');
         return;
       }
-      this.sendWelcome(ws, attachment);
+      this.sendWelcome(ws, attachment as JoinedAttachment);
       this.sendLiveState(ws);
       return;
     }
 
     const players = this.readPlayers();
-    const seat =
-      message.sessionId !== undefined
-        ? players.find((candidate) => candidate.id === message.sessionId)
-        : undefined;
+    // Matched on the seat's SECRET, never on its public id. The public id is on
+    // every lobby frame every client in the room receives, so matching on it
+    // made "play as the person whose turn it is" a two-line client patch.
+    //
+    // An empty claim matches nothing rather than matching a seat whose
+    // credential failed to persist.
+    const claimed = message.sessionId ?? '';
+    const seat = claimed === '' ? undefined : players.find((player) => player.secret === claimed);
 
     if (seat !== undefined && message.role !== 'spectator') {
       // Reconnect: the seat, and with it the tank, the money and the inventory.
@@ -529,7 +570,9 @@ export class GameRoom implements DurableObject {
         seat.name = message.name;
         this.writePlayers(players);
       }
-      const joined = this.attach(ws, attachment, seat.id, seat.name, false);
+      const joined = this.attach(ws, attachment, seat.id, seat.secret, seat.name, false);
+      // Whoever held this seat a moment ago does not hold it any more.
+      this.displaceSeat(seat.id, ws);
       this.promoteHostIfNeeded('promoted');
       this.sendWelcome(ws, joined);
       this.broadcastLobby();
@@ -553,7 +596,11 @@ export class GameRoom implements DurableObject {
         this.sendError(ws, 'room_full', 'This room has no seats and no room left to watch');
         return;
       }
-      const joined = this.attach(ws, attachment, `spec-${attachment.connId}`, message.name, true);
+      // A spectator has no seat to prove ownership of, so its "credential" is
+      // just its own id: replaying it in a later `hello` re-syncs the same
+      // socket and matches no seat anywhere.
+      const spectatorId = `spec-${attachment.connId}`;
+      const joined = this.attach(ws, attachment, spectatorId, spectatorId, message.name, true);
       this.sendWelcome(ws, joined);
       this.sendLiveState(ws);
       this.broadcastSpectators();
@@ -564,6 +611,7 @@ export class GameRoom implements DurableObject {
 
     const player: RoomPlayer = {
       id: generateSessionId(),
+      secret: generateSessionId(),
       name: message.name,
       ready: false,
       colorIndex: nextFreeColor(players),
@@ -571,7 +619,7 @@ export class GameRoom implements DurableObject {
     players.push(player);
     this.writePlayers(players);
 
-    const joined = this.attach(ws, attachment, player.id, player.name, false);
+    const joined = this.attach(ws, attachment, player.id, player.secret, player.name, false);
     this.promoteHostIfNeeded('assigned');
     this.sendWelcome(ws, joined);
     this.broadcastLobby();
@@ -724,8 +772,21 @@ export class GameRoom implements DurableObject {
    * The sim exposes no "skip a turn" primitive, and inventing one here would
    * put a game rule in `apps/server`, which this repo bans. So the room does
    * the one thing it is allowed to do — hand the sim an input on the absent
-   * player's behalf — using that tank's own last-known aim and the free Baby
-   * Missile, so the clock can never spend ammunition somebody paid for.
+   * player's behalf — using the angle and power already stored on that tank,
+   * and always the free Baby Missile, so the clock can never spend ammunition
+   * somebody paid for.
+   *
+   * Be precise about whose aim that is, because it is less than it sounds.
+   * `aim` frames are chatter: the room relays them and keeps nothing, and
+   * `fire()` is the only thing in the sim that writes `angleDeg`/`power` onto a
+   * tank. So the forced shot reuses the aim of that player's last FIRED shot,
+   * and for a player who has not fired since the round was seated it is the
+   * placement default — 45 degrees if they spawned on the left half of the
+   * board, 135 if on the right (`seatTanks` in `packages/sim/src/game.ts`).
+   * Someone who walks away on their very first turn therefore gets a canned
+   * opening shot, which is exactly the common case this clock exists for. That
+   * is accepted deliberately: the alternative is a skip-turn rule invented in
+   * `apps/server`, and rules belong in the sim.
    *
    * The `timeout` event goes out in front of the shot so the client can say
    * "Bob ran out of time" instead of silently animating a shot Bob never took.
@@ -935,6 +996,7 @@ export class GameRoom implements DurableObject {
     const fresh: SocketAttachment = {
       connId: generateSessionId(),
       playerId: null,
+      secret: null,
       name: '',
       spectator: false,
     };
@@ -946,12 +1008,46 @@ export class GameRoom implements DurableObject {
     ws: WebSocket,
     base: SocketAttachment,
     playerId: string,
+    secret: string,
     name: string,
     spectator: boolean,
-  ): SocketAttachment {
-    const next: SocketAttachment = { connId: base.connId, playerId, name, spectator };
+  ): JoinedAttachment {
+    const next: JoinedAttachment = { connId: base.connId, playerId, secret, name, spectator };
     ws.serializeAttachment(next);
     return next;
+  }
+
+  /**
+   * One live socket per seat.
+   *
+   * Someone holding the seat's secret has just proved they own it, so any
+   * earlier socket on that seat is either a stale half-open connection the
+   * runtime has not reaped yet or a second tab. Either way the room should not
+   * be fanning every frame out twice, and it must not have two `webSocketClose`
+   * events racing over one seat.
+   *
+   * The displaced attachment is cleared BEFORE the close, because the close
+   * handler frees a seat when the match has not started — and the seat it would
+   * free is the one the arriving socket is sitting in.
+   */
+  private displaceSeat(playerId: string, keep: WebSocket): void {
+    for (const socket of this.ctx.getWebSockets()) {
+      if (socket === keep) continue;
+      const other = readAttachment(socket);
+      if (other === null || other.spectator || other.playerId !== playerId) continue;
+
+      socket.serializeAttachment({
+        ...other,
+        playerId: null,
+        secret: null,
+      } satisfies SocketAttachment);
+      this.sendError(socket, 'room_closed', 'This seat was taken over by a newer connection');
+      try {
+        socket.close(4000, 'Seat taken over');
+      } catch (error) {
+        console.error('Failed to close a displaced socket', error);
+      }
+    }
   }
 
   private rejectSpectator(ws: WebSocket, attachment: SocketAttachment): boolean {
@@ -1046,13 +1142,19 @@ export class GameRoom implements DurableObject {
     this.send(ws, { t: 'error', code, message: message.slice(0, 300) });
   }
 
-  private sendWelcome(ws: WebSocket, attachment: SocketAttachment): void {
+  /**
+   * `sessionId` is the seat's credential and goes to this socket only;
+   * `you` is the public identity the same client renders with and the same
+   * value every other client in the room already has. Keeping them different
+   * is the whole of the anti-impersonation story — see `RoomPlayer.secret`.
+   */
+  private sendWelcome(ws: WebSocket, attachment: JoinedAttachment): void {
     this.send(ws, {
       t: 'welcome',
       protocol: PROTOCOL_VERSION,
-      sessionId: attachment.playerId ?? '',
+      sessionId: attachment.secret,
       roomCode: this.readMeta().roomCode || 'AAAA',
-      you: attachment.playerId ?? '',
+      you: attachment.playerId,
       role: attachment.spectator ? 'spectator' : 'player',
     });
   }
@@ -1230,6 +1332,7 @@ function readAttachment(ws: WebSocket): SocketAttachment | null {
   return {
     connId: candidate.connId,
     playerId: typeof candidate.playerId === 'string' ? candidate.playerId : null,
+    secret: typeof candidate.secret === 'string' ? candidate.secret : null,
     name: typeof candidate.name === 'string' ? candidate.name : '',
     spectator: candidate.spectator === true,
   };

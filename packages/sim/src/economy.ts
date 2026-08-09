@@ -117,13 +117,23 @@ export const MAX_PURCHASE_QUANTITY = 99;
 /**
  * A sold pack refunds half its purchase price, rounded DOWN.
  *
- * Rounding down is what makes the shop safe to leave open: `floor(price / 2)`
- * is strictly less than `price` for every priced weapon in the table, so no
+ * The HALVING is what makes the shop safe to leave open: `floor(price / 2)` is
+ * strictly less than `price` for every priced weapon in the table, so no
  * buy/sell cycle can end with more money than it started with, at any quantity
- * and in any order. Rounding up or to nearest would break that for an odd
- * price. `test/economy.test.ts` runs the loop over the whole arsenal, and a
- * fast-check property asserts the stronger form: every completed sale strictly
- * reduces money-plus-stock, whatever order the trades arrive in.
+ * and in any order. `test/economy.test.ts` runs that loop over the whole
+ * arsenal, and a fast-check property asserts the stronger form: every completed
+ * sale strictly reduces money-plus-stock, whatever order the trades arrive in.
+ *
+ * The DOWN carries none of that weight, and an earlier version of this comment
+ * claimed it did. It does not: `ceil(p / 2) <= p - 1 < p` for every integer
+ * price of 2 or more, so rounding up would keep the invariant too, and the only
+ * price it fails on is 1, where the cycle breaks even rather than printing
+ * anything. Down is here because the odd unit belongs to the house, which is
+ * the entire argument for it. Every price in `WEAPONS` is even, so floor and
+ * ceil agree across the whole table and no sweep over the arsenal can see the
+ * difference; the direction is pinned instead against synthetic odd prices in
+ * `test/economy.test.ts`, which is the only thing that would notice this being
+ * "simplified" to `Math.round`.
  *
  * Selling is an addition to a browse-and-buy shop, and it is here for exactly
  * one reason: one misclick on a 30000 Death's Head is three rounds of winnings,
@@ -133,7 +143,7 @@ export const MAX_PURCHASE_QUANTITY = 99;
  */
 export const SELL_REFUND_DIVISOR = 2;
 
-/** Cash back for returning one pack. Always strictly less than the price paid. */
+/** Cash back for returning one pack. Strictly less than the price for any price >= 1. */
 export function refundForPack(weapon: WeaponDef): number {
   return Math.floor(weapon.price / SELL_REFUND_DIVISOR);
 }

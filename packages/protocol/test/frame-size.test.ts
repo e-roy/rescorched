@@ -26,6 +26,13 @@
  *   re-takes them and nothing can: they describe a build that no longer exists.
  *   They are there as the reason the code is shaped this way. The sweep below
  *   prints today's equivalent worst frame next to them.
+ *
+ * One job this file also does by accident of construction: it builds its frames
+ * from the real sim with no casts, so it will not compile if the sim's events or
+ * snapshot stop fitting the wire type. It used to launder both through
+ * `as never`, which silenced a genuine TS2322. `sim-boundary.test.ts` is the
+ * deliberate version of that check; this is the incidental one, and both are
+ * worth having because this one exercises the path the room actually takes.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -40,6 +47,7 @@ import {
 
 import {
   encodeServerMessage,
+  IMPACT_KINDS,
   MAX_CLIENT_MESSAGE_BYTES,
   MAX_PACKED_SURFACE_CHARS,
   MAX_SERVER_MESSAGE_BYTES,
@@ -104,12 +112,14 @@ function turnFor(weaponId: string, seed: number, angleDeg: number, power: number
 
   return {
     label: `${weaponId} seed ${seed} ${angleDeg}/${power}`,
-    message: {
-      t: 'events',
-      turnNumber: state.turnNumber,
-      events: result.events as never,
-      snapshot: snapshot as never,
-    },
+    // No casts. `result.events` is the sim's `GameEvent[]` and `snapshot` is the
+    // sim's `GameSnapshot`, and both are assigned straight into the wire type —
+    // so tsc checks the boundary here every time this file compiles. It used to
+    // read `result.events as never` and `snapshot as never`, and the events cast
+    // was hiding a real TS2322 (the sim types `impactKind` as `string`; the wire
+    // schema had narrowed it to an enum). See `sim-boundary.test.ts` for the
+    // deliberate, exhaustive version of this check.
+    message: { t: 'events', turnNumber: state.turnNumber, events: result.events, snapshot },
     events: result.events,
     snapshot,
   };
@@ -163,6 +173,13 @@ describe('server frames survive the wire', () => {
     let worstUnpacked = 0;
     let worstEvents = 0;
     let worstPath = 0;
+    // What this sweep actually reaches, recorded rather than assumed. A critic
+    // had to instrument this by hand to discover that 189 turns of every weapon
+    // in the arsenal produce only two of the four impact kinds and six of the
+    // nine event types; that is worth printing on every run so the next reader
+    // knows which cases only `sim-boundary.test.ts` covers.
+    const kindsSeen = new Set<string>();
+    const typesSeen = new Set<string>();
 
     for (const turn of everyTurn()) {
       const frame = encodeServerMessage(turn.message);
@@ -182,7 +199,11 @@ describe('server frames survive the wire', () => {
       worstUnpacked = Math.max(worstUnpacked, unpackedFrame(turn.message).length);
       worstEvents = Math.max(worstEvents, turn.events.length);
       for (const event of turn.events) {
-        if (event.type === 'shot') worstPath = Math.max(worstPath, event.path.length);
+        typesSeen.add(event.type);
+        if (event.type === 'shot') {
+          worstPath = Math.max(worstPath, event.path.length);
+          kindsSeen.add(event.impactKind);
+        }
       }
       if (frame.length > worst) {
         worst = frame.length;
@@ -207,10 +228,24 @@ describe('server frames survive the wire', () => {
     // constants move whenever the arsenal does — the run below prints them.
     expect(worst).toBeLessThan(worstUnpacked * 0.8);
 
+    // Whatever the sweep did reach has to be a kind the wire schema recognises.
+    // This is a weaker claim than the compile-time one in `sim-boundary.test.ts`
+    // — it can only speak about kinds these 189 turns happen to produce — but it
+    // is the one that would catch a sim emitting a kind its own type says it
+    // cannot. Asserting *which* kinds appear is deliberately not done: that
+    // belongs to the sim's physics and would go red for the wrong reason.
+    for (const kind of kindsSeen) expect(IMPACT_KINDS, kind).toContain(kind);
+    expect(kindsSeen.size).toBeGreaterThan(0);
+
     console.log(
       `[frame-size] worst packed ${worst} chars (${worstLabel}); ` +
         `worst unpacked ${worstUnpacked}; max events ${worstEvents}; max path values ${worstPath}. ` +
         `The historical frame that split the caps was 18,255 unpacked; this run is today's figure, not that one.`,
+    );
+    console.log(
+      `[frame-size] this sweep reached impact kinds [${[...kindsSeen].sort().join(', ')}] ` +
+        `of [${[...IMPACT_KINDS].sort().join(', ')}], and event types ` +
+        `[${[...typesSeen].sort().join(', ')}]. The rest are covered synthetically.`,
     );
   });
 
@@ -243,7 +278,8 @@ describe('server frames survive the wire', () => {
 
   it('is what a fresh snapshot costs, with no shot in it at all', () => {
     const state = createGame({ seed: 3, totalRounds: 3, width: 1280, height: 720 }, PLAYERS);
-    const message: ServerMessage = { t: 'state', snapshot: toSnapshot(state) as never };
+    // Again no cast: the sim's snapshot is assigned directly into the wire type.
+    const message: ServerMessage = { t: 'state', snapshot: toSnapshot(state) };
     const packed = encodeServerMessage(message);
     const unpacked = unpackedFrame(message);
 

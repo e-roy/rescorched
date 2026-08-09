@@ -190,11 +190,11 @@ describe('every tank starts somewhere it can fight from', () => {
     expect(tanks).toBeGreaterThan(1000);
     // A preference, not a veto: a slot with nothing flatter still gets its
     // tank, and both reachability and the height window outrank footing when
-    // they collide. Measured over these 1380 tanks, 122 of them (8.8%) end up
+    // they collide. Measured over these 1380 tanks, 131 of them (9.5%) end up
     // on ground steeper than the rule would like; with the preference removed
-    // entirely it is 295 (21.4%). The bound is the measurement plus room for
+    // entirely it is 302 (21.9%). The bound is the measurement plus room for
     // the terrain module to be retuned underneath it.
-    expect(perched / tanks, `worst=${worst} perched=${perched}/${tanks}`).toBeLessThan(0.12);
+    expect(perched / tanks, `worst=${worst} perched=${perched}/${tanks}`).toBeLessThan(0.13);
     // Nothing is anywhere near the cliff the terrain module refuses — and this
     // one is the generator's doing, not placement's.
     expect(worst).toBeLessThan(PLAYABILITY_DEFAULTS.maxFootingDrop);
@@ -211,14 +211,33 @@ describe('nobody starts the round above everybody else', () => {
       expect(achieved).toBeGreaterThanOrEqual(floor);
       excess.push(achieved - floor);
     }
+    const sorted = [...excess].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)] as number;
+    const p95 = sorted[Math.floor(sorted.length * 0.95)] as number;
+    const worst = sorted[sorted.length - 1] as number;
+    const report = `median=${median} p95=${p95} worst=${worst}`;
 
-    // The design claim, stated as a bound rather than a hope: the rule hands
-    // out `MAX_SPAWN_ELEVATION_SPREAD` of slack so that placement still varies
-    // between matches, and it spends no more than that.
-    expect(Math.max(...excess)).toBeLessThanOrEqual(MAX_SPAWN_ELEVATION_SPREAD);
+    // Excess over the per-map floor, not raw spread, is what these bounds are
+    // stated in — it is the only figure that is about this file rather than
+    // about whatever `terrain.ts` generated, so it survives the terrain module
+    // being retuned underneath it.
+    //
+    // These are LITERALS on purpose. Writing the bound as
+    // `MAX_SPAWN_ELEVATION_SPREAD` instead made the test restate the constant
+    // it was meant to police: raising the slack raised the bound with it, and
+    // the assertion held all the way up to 400 px of slack while the median
+    // excess went from 5 px to 79. Measured over these 300 matches at the
+    // shipped 140 px of slack: median 5, p95 76, worst 123. At 200 px of slack
+    // the same sweep measures median 23, p95 127, worst 187 — so a widening
+    // that would matter to a player trips every one of these.
+    expect(median, report).toBeLessThanOrEqual(20);
+    expect(p95, report).toBeLessThanOrEqual(100);
+    expect(worst, report).toBeLessThanOrEqual(140);
+    // The slack is real slack, though, and the constant is what hands it out.
+    expect(worst).toBeLessThanOrEqual(MAX_SPAWN_ELEVATION_SPREAD);
 
     // And it does not simply take the flattest every time, which would make
-    // every match on the same map identical.
+    // every match on the same map identical. Measured at 191 of 300.
     expect(excess.filter((value) => value > 0).length).toBeGreaterThan(excess.length / 4);
   }, 300_000);
 
@@ -243,9 +262,9 @@ describe('nobody starts the round above everybody else', () => {
     }
     const sorted = [...spreads].sort((a, b) => a - b);
     const median = sorted[Math.floor(sorted.length / 2)] as number;
-    // Measured at 44 px over these 200 two-player matches; the same sweep with
-    // the height rule removed measures 246 px across all player counts and is
-    // the number quoted in `game.ts`. The bound sits well below that and well
+    // Measured at 38 px over these 200 two-player matches, against 107 px for
+    // the identical search with the height window disabled — the pair of
+    // numbers quoted in `game.ts`. The bound sits well below that and well
     // above the measurement.
     expect(median).toBeLessThan(90);
   }, 300_000);

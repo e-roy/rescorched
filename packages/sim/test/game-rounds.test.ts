@@ -230,8 +230,20 @@ describe('the match ends and picks a winner', () => {
     }
   });
 
-  it('crowns the highest score and says so in the event', () => {
-    const start = stalemateGame(2, 'crown', 1);
+  /**
+   * Finish a one-round match with `survivorScore` on the last tank standing and
+   * `rivalScore` on the tank that died, and report who the match crowns.
+   *
+   * Both numbers are damage already dealt — `detonation.ts` grows `score` by one
+   * point per point of damage — so this is a match where one player out-shot
+   * the other and the other outlived them.
+   */
+  function crownedWith(
+    seed: string,
+    survivorScore: number,
+    rivalScore: number,
+  ): { winnerId: string | null; survivorId: string; rivalId: string } {
+    const start = stalemateGame(2, seed, 1);
     const winnerIndex = start.activeTank;
     const state: GameState = {
       ...kill(start, [(winnerIndex + 1) % 2]),
@@ -239,17 +251,81 @@ describe('the match ends and picks a winner', () => {
         ...tank,
         alive: index === winnerIndex,
         health: index === winnerIndex ? 100 : 0,
-        score: index === winnerIndex ? 10 : 500,
+        score: index === winnerIndex ? survivorScore : rivalScore,
+        // Level money, so the standings are decided by the scoreboard this test
+        // is about rather than by the survival bonus that comes with it.
+        money: 0,
       })),
     };
-
     const { state: after, events } = step(state);
-    // The loser led on damage all match; the round win is worth one whole tank,
-    // which is not enough to overturn a 490-point lead. The winner is the
-    // scoreboard, not the last one standing.
-    expect(after.winnerId).toBe((state.tanks[(winnerIndex + 1) % 2] as Tank).id);
-    expect(events).toContainEqual({ type: 'gameOver', winnerId: after.winnerId });
     expect(after.phase).toBe('gameover');
+    expect(events).toContainEqual({ type: 'gameOver', winnerId: after.winnerId });
+    return {
+      winnerId: after.winnerId,
+      survivorId: (start.tanks[winnerIndex] as Tank).id,
+      rivalId: (start.tanks[(winnerIndex + 1) % 2] as Tank).id,
+    };
+  }
+
+  it('crowns the scoreboard, not the last one standing', () => {
+    // A 490-point lead on damage is not something surviving one round can
+    // overturn, and it should not be: the match is won on the scoreboard.
+    const { winnerId, rivalId } = crownedWith('crown', 10, 500);
+    expect(winnerId).toBe(rivalId);
+  });
+
+  it('makes surviving a round worth more than a near-lethal miss', () => {
+    // 99 points is the most damage one tank can take and live: the rival hit
+    // for everything short of a kill, and then died. Surviving has to outweigh
+    // that, or the shot that nearly worked scores better than the round that
+    // was actually won.
+    const { winnerId, survivorId } = crownedWith('near-miss', 0, DEFAULT_WORLD.maxHealth - 1);
+    expect(winnerId).toBe(survivorId);
+  });
+
+  it('does not let a player who loses every round win on accumulated near-misses', () => {
+    // The regression in full, over a real three-round match: one player wins
+    // every round without landing a shot, the other lands a near-lethal hit
+    // every round and dies every round. Winning the match by losing it is the
+    // failure mode `ROUND_WIN_SCORE` exists to prevent, and it is stated here in
+    // rounds and damage rather than by restating the constant.
+    const nearLethal = DEFAULT_WORLD.maxHealth - 1;
+    const rounds = 3;
+    let state = stalemateGame(2, 'never-wins', rounds);
+    const winner = (state.tanks[0] as Tank).id;
+    const loser = (state.tanks[1] as Tank).id;
+
+    for (let round = 1; round <= rounds; round += 1) {
+      // Tank 1 spent the round chipping tank 0 down to one health and no
+      // further. `score` is a plain accumulator that `detonation.ts` grows by a
+      // point per point of damage; adding to it directly is the same ledger
+      // entry a real hit would have made, and it keeps this test about the
+      // round machinery rather than about ballistics.
+      state = {
+        ...kill(state, [1]),
+        activeTank: 0,
+        tanks: state.tanks.map((tank, index) =>
+          index === 1
+            ? { ...tank, alive: false, health: 0, score: tank.score + nearLethal }
+            : { ...tank, alive: true, health: 1 },
+        ),
+      };
+      state = step(state).state;
+      expect(state.round).toBe(round);
+      if (state.phase !== 'shopping') break;
+      for (const id of [...state.pendingShoppers]) state = leaveShop(state, id);
+      state = startNextRound(state).state;
+    }
+
+    expect(state.phase).toBe('gameover');
+    const standings = matchStandings(state);
+    expect((standings[0] as Tank).id).toBe(winner);
+    expect((standings[1] as Tank).id).toBe(loser);
+    expect(state.winnerId).toBe(winner);
+    // The loser really did out-damage the winner, which is what makes this a
+    // test of the round bonus rather than of arithmetic.
+    expect((state.tanks[1] as Tank).score).toBe(rounds * nearLethal);
+    expect((state.tanks[0] as Tank).score).toBeGreaterThan((state.tanks[1] as Tank).score);
   });
 
   it('breaks a dead-level tie the same way whatever order the lobby is in', () => {
@@ -376,6 +452,53 @@ describe('the turn clock', () => {
     expect(state.phase).toBe('gameover');
     expect(state.round).toBe(3);
     expect(state.winnerId).not.toBeNull();
+  });
+
+  it('gives every round its whole budget, even after one that ran to the buzzer', () => {
+    // What `roundStride` is for, and it can only be seen after a round that
+    // actually used its overtime — which is why this drives a stalemate match
+    // rather than killing a tank to end each round early.
+    //
+    // `turnNumber` is monotonic across the whole match, so each round has to be
+    // handed a block of numbers wide enough for the longest round that can
+    // happen: the budget plus every sudden-death turn. Size the stride at just
+    // the budget and round one overruns into round two's block. `startNextRound`
+    // keeps the number moving forwards, so nothing looks broken — but round two
+    // opens with `turnsTakenThisRound` already at 4, four turns of its budget
+    // gone before anybody fires, and the error compounds every round until a
+    // round begins in sudden death.
+    let state = stalemateGame(2, 'full-budget', 3);
+    const opened: number[] = [];
+    let guard = 0;
+
+    while (
+      state.phase !== 'gameover' &&
+      guard < 3 * (roundTurnBudget(2) + SUDDEN_DEATH_TURNS) + 10
+    ) {
+      guard += 1;
+      if (state.phase === 'shopping') {
+        for (const id of [...state.pendingShoppers]) state = leaveShop(state, id);
+        state = startNextRound(state).state;
+        // Every round starts on its own first turn number, with its budget
+        // untouched — not merely on a number larger than the last one.
+        expect(state.turnNumber, `round ${state.round}`).toBe(roundStartTurn(state));
+        expect(turnsTakenThisRound(state), `round ${state.round}`).toBe(1);
+        opened.push(state.turnNumber);
+        continue;
+      }
+      // The rounds really are running long enough for this to mean something.
+      expect(turnsTakenThisRound(state)).toBeLessThanOrEqual(
+        roundTurnBudget(2) + SUDDEN_DEATH_TURNS,
+      );
+      state = step(state).state;
+    }
+
+    expect(state.phase).toBe('gameover');
+    // Two round boundaries in a three-round match, and each block starts a
+    // whole stride after the last.
+    expect(opened).toHaveLength(2);
+    const stride = (opened[1] as number) - (opened[0] as number);
+    expect(stride).toBeGreaterThan(roundTurnBudget(2) + SUDDEN_DEATH_TURNS);
   });
 });
 

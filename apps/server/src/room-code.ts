@@ -41,3 +41,47 @@ export function seedFromRoom(roomCode: string, nonce: number): number {
   }
   return hash >>> 0;
 }
+
+/**
+ * How many codes to try before handing one over anyway.
+ *
+ * There are 24^4 = 331,776 codes, so a collision is rare — but "rare" over a
+ * weekend is "someone got dropped into a stranger's lobby", which is a far
+ * worse bug than one extra Durable Object round trip at room-creation time.
+ * The first candidate is free almost every time, so this usually costs exactly
+ * one probe.
+ */
+export const ROOM_CODE_ATTEMPTS = 5;
+
+/**
+ * Mint a code for a room nobody is sitting in.
+ *
+ * `generate` is a parameter, and exported, for one reason: the probe below is
+ * otherwise untestable. With 331,776 codes, a test that mints a handful and
+ * checks they came back empty passes at 99.998% whether the probe runs or not —
+ * it measures the dice, not the code. Handing in a generator that returns an
+ * occupied code first forces the collision every run, so deleting the probe
+ * turns the test red. See `test/room-code.test.ts`.
+ */
+export async function allocateRoomCode(
+  env: Env,
+  generate: () => string = generateRoomCode,
+): Promise<string> {
+  let candidate = generate();
+  for (let attempt = 0; attempt < ROOM_CODE_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) candidate = generate();
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(candidate));
+    try {
+      const response = await stub.fetch(new Request('https://room/info'));
+      if (!response.ok) continue;
+      const summary = (await response.json()) as { players?: number; inProgress?: boolean };
+      if ((summary.players ?? 0) === 0 && summary.inProgress !== true) return candidate;
+    } catch {
+      // A room that cannot be asked is not a room we should hand out.
+      continue;
+    }
+  }
+  // Every probe was occupied or unreachable. Return the last candidate rather
+  // than fail outright: a shared room is recoverable, "could not create" is not.
+  return candidate;
+}

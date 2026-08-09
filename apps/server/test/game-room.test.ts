@@ -24,13 +24,28 @@ import {
 } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION, parseServerMessage, type ServerMessage } from '@scorched/protocol';
-import type { GameSnapshot, PersistedGame } from '@scorched/sim';
+import {
+  BABY_MISSILE,
+  fire,
+  fromPersisted,
+  type GameSnapshot,
+  type PersistedGame,
+} from '@scorched/sim';
 
 import worker from '../src/index.ts';
-import { MAX_PLAYERS, MAX_SPECTATORS } from '../src/game-room.ts';
+import { allocateRoomCode } from '../src/room-code.ts';
+import { MAX_PLAYERS, MAX_SPECTATORS, SHOP_TIMEOUT_MS, TURN_TIMEOUT_MS } from '../src/game-room.ts';
 
 const BASE = 'http://example.com';
 const MAX_SOCKETS = MAX_PLAYERS + MAX_SPECTATORS;
+/**
+ * How far a deadline read from outside the Durable Object may sit from the one
+ * written inside it. The two `Date.now()` calls are on either side of a real
+ * round trip, so they differ by however long that took — single-digit
+ * milliseconds in practice. Wide enough that the suite is not a stopwatch,
+ * narrow enough that the 60s and 120s clocks can never be confused.
+ */
+const SLACK_MS = 5_000;
 
 interface Client {
   socket: WebSocket;
@@ -142,12 +157,29 @@ async function info(roomCode: string): Promise<{
   };
 }
 
-/** Say hello and wait to be seated. Returns the id the server gave us. */
+/**
+ * A seated connection.
+ *
+ * `id` and `secret` are deliberately separate, because the server keeps them
+ * separate: `id` is public — it is in every `lobby` frame and every tank of
+ * every snapshot, so everybody in the room has everybody's — while `secret` is
+ * the seat's credential and arrives only in that player's own `welcome`. A test
+ * that reconnects must use `secret`; a test that impersonates uses `id` and
+ * must be refused.
+ */
+interface Seat {
+  client: Client;
+  id: string;
+  secret: string;
+  role: string;
+}
+
+/** Say hello and wait to be seated. */
 async function join(
   roomCode: string,
   name: string,
   options: { sessionId?: string; role?: 'player' | 'spectator' } = {},
-): Promise<{ client: Client; id: string; role: string }> {
+): Promise<Seat> {
   const client = await openSocket(roomCode);
   send(client.socket, {
     t: 'hello',
@@ -158,30 +190,56 @@ async function join(
   });
   const welcome = await client.next((m) => m.t === 'welcome');
   if (welcome.t !== 'welcome') throw new Error('unreachable');
-  return { client, id: welcome.you, role: welcome.role ?? 'player' };
+  return {
+    client,
+    id: welcome.you,
+    secret: welcome.sessionId,
+    role: welcome.role ?? 'player',
+  };
+}
+
+/** Seat everyone, then have the first one start the match. */
+async function startMatch(
+  roomCode: string,
+  names: readonly string[],
+): Promise<{ seats: Seat[]; snapshot: GameSnapshot }> {
+  const seats: Seat[] = [];
+  for (const name of names) seats.push(await join(roomCode, name));
+
+  const host = seats[0] as Seat;
+  const last = seats[seats.length - 1] as Seat;
+  send(host.client.socket, { t: 'start' });
+  const started = await last.client.next((m) => m.t === 'state');
+  if (started.t !== 'state') throw new Error('unreachable');
+  for (const seat of seats) await seat.client.next((m) => m.t === 'state');
+  return { seats, snapshot: started.snapshot };
 }
 
 /** Start a two-player match and hand back whichever client shoots first. */
 async function twoPlayerMatch(roomCode: string): Promise<{
-  alice: { client: Client; id: string };
-  bob: { client: Client; id: string };
-  shooter: { client: Client; id: string };
-  waiter: { client: Client; id: string };
+  alice: Seat;
+  bob: Seat;
+  shooter: Seat;
+  waiter: Seat;
   snapshot: GameSnapshot;
 }> {
-  const alice = await join(roomCode, 'Alice');
-  const bob = await join(roomCode, 'Bob');
-
-  send(alice.client.socket, { t: 'start' });
-  const started = await bob.client.next((m) => m.t === 'state');
-  if (started.t !== 'state') throw new Error('unreachable');
-  await alice.client.next((m) => m.t === 'state');
+  const { seats, snapshot } = await startMatch(roomCode, ['Alice', 'Bob']);
+  const alice = seats[0] as Seat;
+  const bob = seats[1] as Seat;
 
   // The sim picks the turn order from the seed. Ask it, never assume.
-  const activeId = started.snapshot.tanks[started.snapshot.activeTank]?.id;
+  const activeId = snapshot.tanks[snapshot.activeTank]?.id;
   const shooter = activeId === alice.id ? alice : bob;
   const waiter = activeId === alice.id ? bob : alice;
-  return { alice, bob, shooter, waiter, snapshot: started.snapshot };
+  return { alice, bob, shooter, waiter, snapshot };
+}
+
+/** Whichever seat the snapshot says is up. */
+function activeSeat(seats: readonly Seat[], snapshot: GameSnapshot): Seat {
+  const activeId = snapshot.tanks[snapshot.activeTank]?.id;
+  const seat = seats.find((candidate) => candidate.id === activeId);
+  if (seat === undefined) throw new Error('no seat holds the active tank');
+  return seat;
 }
 
 /** Poll until the Durable Object itself agrees the socket count settled. */
@@ -237,6 +295,67 @@ async function editPersistedGame(
   });
 }
 
+/** The room's own persisted game, exactly as it will read it back. */
+async function readPersistedGame(roomCode: string): Promise<PersistedGame> {
+  const raw = await runInDurableObject(stub(roomCode), (_instance, state) => {
+    const rows = state.storage.sql
+      .exec<{ v: string }>('SELECT v FROM kv WHERE k = ?', 'game')
+      .toArray();
+    return rows[0]?.v;
+  });
+  if (raw === undefined) throw new Error('no game persisted');
+  return JSON.parse(raw) as PersistedGame;
+}
+
+/**
+ * The small `turn` row — the clock's own bookkeeping.
+ *
+ * Read directly because the timeout streak and the deadline are not on the
+ * wire: `turnTimer` carries a duration, not a policy, so the only way to assert
+ * which clock a phase was given is to look at what the room wrote down.
+ */
+async function readTurnRow(roomCode: string): Promise<{
+  phase: string;
+  turnNumber: number;
+  timeoutStreak: number;
+  deadlineAt: number | null;
+}> {
+  const raw = await runInDurableObject(stub(roomCode), (_instance, state) => {
+    const rows = state.storage.sql
+      .exec<{ v: string }>('SELECT v FROM kv WHERE k = ?', 'turn')
+      .toArray();
+    return rows[0]?.v;
+  });
+  if (raw === undefined) throw new Error('no turn row');
+  return JSON.parse(raw) as {
+    phase: string;
+    turnNumber: number;
+    timeoutStreak: number;
+    deadlineAt: number | null;
+  };
+}
+
+async function countKvRows(roomCode: string, key: string): Promise<number> {
+  return runInDurableObject(stub(roomCode), (_instance, state) => {
+    const rows = state.storage.sql
+      .exec<{ n: number }>('SELECT COUNT(*) AS n FROM kv WHERE k = ?', key)
+      .toArray();
+    return rows[0]?.n ?? 0;
+  });
+}
+
+async function readReplay(
+  roomCode: string,
+): Promise<{ match: number; turn: number; events: string }[]> {
+  return runInDurableObject(stub(roomCode), (_instance, state) =>
+    state.storage.sql
+      .exec<{ match: number; turn: number; events: string }>(
+        'SELECT match, turn, events FROM replay_v2 ORDER BY seq',
+      )
+      .toArray(),
+  );
+}
+
 describe('worker routes', () => {
   it('serves a health check', async () => {
     const response = await worker.fetch(new Request(`${BASE}/api/health`), env);
@@ -251,24 +370,43 @@ describe('worker routes', () => {
     expect(body.roomCode).toMatch(/^[A-Z]{4}$/);
   });
 
-  it('only hands out a room code nobody is sitting in', async () => {
-    // The guarantee is per-code, not statistical: whatever code comes back, the
-    // room behind it is empty. Squatting in one room first makes sure the check
-    // is actually consulting rooms rather than trusting the dice.
+  it('skips a room code somebody is already sitting in', async () => {
+    // The collision is FORCED, not hoped for. The previous version of this test
+    // squatted in one room, minted eight random codes and checked they came
+    // back empty — with 24^4 = 331,776 codes that is a 0.0024% chance of ever
+    // touching the probe, and deleting the probe entirely left the suite green.
+    // Handing `allocateRoomCode` its own generator makes the occupied code come
+    // up first every single run.
     const squatter = await join('KKKA', 'Squatter');
     expect((await info('KKKA')).players).toBe(1);
 
-    for (let i = 0; i < 8; i += 1) {
-      const response = await worker.fetch(
-        new Request(`${BASE}/api/rooms`, { method: 'POST' }),
-        env,
-      );
-      const body = (await response.json()) as { roomCode: string };
-      const summary = await info(body.roomCode);
-      expect(summary.players, `${body.roomCode} was handed out occupied`).toBe(0);
-      expect(summary.inProgress).toBe(false);
-    }
+    const candidates = ['KKKA', 'KKKB'];
+    const minted = await allocateRoomCode(env, () => candidates.shift() ?? 'ZZZZ');
+    expect(minted).toBe('KKKB');
+    expect((await info('KKKB')).players).toBe(0);
 
+    squatter.client.close();
+  });
+
+  it('will not hand out a room with a match running in it', async () => {
+    const running = await twoPlayerMatch('KKKD');
+    expect((await info('KKKD')).inProgress).toBe(true);
+
+    const candidates = ['KKKD', 'KKKE'];
+    const minted = await allocateRoomCode(env, () => candidates.shift() ?? 'ZZZZ');
+    expect(minted).toBe('KKKE');
+
+    running.alice.client.close();
+    running.bob.client.close();
+  });
+
+  it('hands out the last candidate rather than failing when every probe is taken', async () => {
+    // Documented fallback: sharing a room is recoverable, "could not create a
+    // room" is not. Pinned so the fallback is a decision rather than an
+    // accident of loop structure.
+    const squatter = await join('KKKC', 'Squatter');
+    const minted = await allocateRoomCode(env, () => 'KKKC');
+    expect(minted).toBe('KKKC');
     squatter.client.close();
   });
 
@@ -795,6 +933,30 @@ describe('hostile input', () => {
     client.close();
   });
 
+  it('sends no room traffic at all to a socket that never said hello', async () => {
+    const room = 'CCCJ';
+    const lurker = await openSocket(room);
+    const alice = await join(room, 'Alice');
+    const bob = await join(room, 'Bob');
+
+    // Plenty for the lurker to overhear if the room let it: two joins, a chat
+    // line and a lobby update.
+    send(alice.client.socket, { t: 'chat', text: 'anyone there' });
+    await bob.client.next((m) => m.t === 'chat');
+    send(alice.client.socket, { t: 'ready', ready: true });
+    await bob.client.next((m) => m.t === 'lobby' && m.players.some((player) => player.ready));
+
+    // The lurker gets an answer to its own frame and nothing else. An
+    // unidentified socket is not a member of the room.
+    send(lurker.socket, { t: 'ping', nonce: 4 });
+    await lurker.next((m) => m.t === 'error' && m.code === 'bad_protocol');
+    expect(lurker.all().every((m) => m.t === 'error')).toBe(true);
+
+    lurker.close();
+    alice.client.close();
+    bob.client.close();
+  });
+
   it('never lets one socket claim more than one seat', async () => {
     const client = await openSocket('CCCG');
     for (let i = 0; i < 5; i += 1) {
@@ -812,17 +974,146 @@ describe('hostile input', () => {
     const alice = await join('CCCH', 'Alice');
     const bob = await join('CCCH', 'Bob');
 
-    // Bob's socket claims Alice's session id. One socket, one identity.
+    // Bob's socket claims Alice's credential. One socket, one identity.
     send(bob.client.socket, {
       t: 'hello',
       protocol: PROTOCOL_VERSION,
       name: 'Bob',
-      sessionId: alice.id,
+      sessionId: alice.secret,
     });
     const error = await bob.client.next((m) => m.t === 'error');
     expect(error.t === 'error' && error.code).toBe('bad_protocol');
 
     alice.client.close();
+    bob.client.close();
+  });
+});
+
+/**
+ * Seat ownership.
+ *
+ * The room hands each client two identifiers and they do different jobs.
+ * `welcome.you` is public: it is in every `lobby` frame and on every tank of
+ * every snapshot, so every client in the room holds every other player's.
+ * `welcome.sessionId` is the seat's credential and is sent to exactly one
+ * socket. Reconnect matches on the credential.
+ *
+ * These tests exist because it did not. `hello` used to match on the public id,
+ * so any client could re-hello as the player whose turn it was, be welcomed as
+ * them, and fire their shot or spend their money in the shop — with the
+ * victim's own socket still open and nothing on the wire to tell them.
+ */
+describe('seat ownership', () => {
+  it('gives a player a credential that is not their public id', async () => {
+    const seat = await join('SSSA', 'Alice');
+    expect(seat.secret).not.toBe(seat.id);
+    expect(seat.secret.length).toBeGreaterThan(0);
+    seat.client.close();
+  });
+
+  it('refuses a hello that claims a seat with the victim public id', async () => {
+    const room = 'SSSB';
+    const { alice, bob, shooter, waiter, snapshot } = await twoPlayerMatch(room);
+
+    // Mallory knows the victim's public id the same way every client does: the
+    // room broadcast it. Claiming it must not hand over the seat.
+    const mallory = await join(room, 'Mallory', { sessionId: shooter.id });
+    expect(mallory.id).not.toBe(shooter.id);
+    expect(mallory.role).toBe('spectator');
+
+    send(mallory.client.socket, {
+      t: 'fire',
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+    const refused = await mallory.client.next((m) => m.t === 'error');
+    expect(refused.t === 'error' && refused.code).toBe('spectator_only');
+
+    // Nothing moved, and the real owner still has their turn.
+    expect((await readPersistedGame(room)).turnNumber).toBe(snapshot.turnNumber);
+    send(shooter.client.socket, {
+      t: 'fire',
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+    const events = await shooter.client.next((m) => m.t === 'events');
+    expect(events.t === 'events' && events.snapshot.turnNumber).toBe(snapshot.turnNumber + 1);
+
+    alice.client.close();
+    bob.client.close();
+    mallory.client.close();
+    void waiter;
+  });
+
+  it('does not let a lobby impostor take over a seat with its public id', async () => {
+    const room = 'SSSC';
+    const alice = await join(room, 'Alice');
+
+    // Before the match there is a free chair, so the impostor gets one — but a
+    // NEW one. What must never happen is landing in Alice's.
+    const mallory = await join(room, 'Mallory', { sessionId: alice.id });
+    expect(mallory.id).not.toBe(alice.id);
+    expect(mallory.role).toBe('player');
+    expect((await info(room)).players).toBe(2);
+
+    alice.client.close();
+    mallory.client.close();
+  });
+
+  it('never puts one player credential on a frame another player receives', async () => {
+    const room = 'SSSD';
+    const { alice, bob, shooter, snapshot } = await twoPlayerMatch(room);
+
+    send(alice.client.socket, { t: 'chat', text: 'nice terrain' });
+    await bob.client.next((m) => m.t === 'chat');
+    send(shooter.client.socket, {
+      t: 'fire',
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+    await bob.client.next((m) => m.t === 'events');
+
+    // Everything Bob has ever been sent, searched for Alice's credential, and
+    // the other way round. A leak anywhere — lobby, snapshot, chat, host
+    // migration — turns impersonation back into copy and paste.
+    expect(JSON.stringify(bob.client.all())).not.toContain(alice.secret);
+    expect(JSON.stringify(alice.client.all())).not.toContain(bob.secret);
+    // …and the credential is genuinely absent, not merely equal to nothing.
+    expect(JSON.stringify(alice.client.all())).toContain(alice.secret);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('hands the seat to the newest socket with the credential and evicts the old one', async () => {
+    const room = 'SSSE';
+    const alice = await join(room, 'Alice');
+    const bob = await join(room, 'Bob');
+
+    const again = await join(room, 'Alice', { sessionId: alice.secret });
+    expect(again.id).toBe(alice.id);
+
+    // The displaced socket is told why, and the seat is neither duplicated nor
+    // freed by its close: a takeover is not the owner walking out.
+    const notice = await alice.client.next((m) => m.t === 'error' && m.code === 'room_closed');
+    expect(notice.t).toBe('error');
+    await waitForSocketCount(room, 2);
+    expect((await info(room)).players).toBe(2);
+
+    // And the surviving socket is the live one.
+    send(again.client.socket, { t: 'ready', ready: true });
+    const lobby = await bob.client.next(
+      (m) => m.t === 'lobby' && m.players.some((p) => p.id === alice.id && p.ready),
+    );
+    expect(lobby.t).toBe('lobby');
+
+    again.client.close();
     bob.client.close();
   });
 });
@@ -913,7 +1204,7 @@ describe('reconnect', () => {
     alice.client.close();
     await waitForSocketCount(room, 1);
 
-    const back = await join(room, 'Alice', { sessionId: alice.id });
+    const back = await join(room, 'Alice', { sessionId: alice.secret });
     expect(back.id).toBe(alice.id);
     expect(back.role).toBe('player');
 
@@ -939,7 +1230,7 @@ describe('reconnect', () => {
     shooter.client.close();
     await waitForSocketCount(room, 1);
 
-    const back = await join(room, 'Shooter', { sessionId: shooter.id });
+    const back = await join(room, 'Shooter', { sessionId: shooter.secret });
     await back.client.next((m) => m.t === 'state');
 
     send(back.client.socket, {
@@ -1085,12 +1376,62 @@ describe('room capacity and seats', () => {
   it('does not hand a second seat to a duplicate join', async () => {
     const room = 'EEED';
     const alice = await join(room, 'Alice');
-    const twin = await join(room, 'Alice', { sessionId: alice.id });
+    const twin = await join(room, 'Alice', { sessionId: alice.secret });
     expect(twin.id).toBe(alice.id);
     expect((await info(room)).players).toBe(1);
 
     alice.client.close();
     twin.client.close();
+  });
+
+  it('caps the audience once every viewing slot is taken', async () => {
+    const room = 'EEEF';
+    const clients: Client[] = [];
+    const alice = await join(room, 'Alice');
+    clients.push(alice.client);
+
+    for (let i = 0; i < MAX_SPECTATORS; i += 1) {
+      const viewer = await join(room, `V${i}`, { role: 'spectator' });
+      expect(viewer.role).toBe('spectator');
+      clients.push(viewer.client);
+    }
+    expect((await info(room)).spectators).toBe(MAX_SPECTATORS);
+
+    // Spectators cost a copy of every broadcast, so the audience is bounded
+    // even though the socket cap has room left (1 + 16 is under MAX_SOCKETS).
+    const late = await openSocket(room);
+    clients.push(late);
+    send(late.socket, {
+      t: 'hello',
+      protocol: PROTOCOL_VERSION,
+      name: 'Late',
+      role: 'spectator',
+    });
+    const error = await late.next((m) => m.t === 'error');
+    expect(error.t === 'error' && error.code).toBe('room_full');
+    expect((await info(room)).spectators).toBe(MAX_SPECTATORS);
+
+    for (const client of clients) client.close();
+  });
+
+  it('gives every player their own colour', async () => {
+    const room = 'EEEG';
+    const { seats, snapshot } = await startMatch(room, ['Ann', 'Ben', 'Cal']);
+
+    // Eight identically-coloured tanks is a rendering disaster that no amount
+    // of protocol validation would have caught: `colorIndex` is a valid index
+    // whatever it holds.
+    expect(new Set(snapshot.tanks.map((tank) => tank.colorIndex)).size).toBe(3);
+
+    const lobby = (seats[2] as Seat).client
+      .all()
+      .find((m) => m.t === 'lobby' && m.players.length === 3);
+    expect(lobby?.t).toBe('lobby');
+    if (lobby?.t === 'lobby') {
+      expect(new Set(lobby.players.map((player) => player.colorIndex)).size).toBe(3);
+    }
+
+    for (const seat of seats) seat.client.close();
   });
 
   it('ignores an unknown session id and seats the newcomer normally', async () => {
@@ -1201,7 +1542,7 @@ describe('the turn clock', () => {
     const room = 'GGGC';
     const { alice, bob } = await twoPlayerMatch(room);
     const before = await info(room);
-    const aliceId = alice.id;
+    const aliceSecret = alice.secret;
 
     alice.client.close();
     bob.client.close();
@@ -1220,7 +1561,7 @@ describe('the turn clock', () => {
     expect(pending).toBeNull();
 
     // …and the clock restarts for whoever comes back to their seat.
-    const returning = await join(room, 'Alice', { sessionId: aliceId });
+    const returning = await join(room, 'Alice', { sessionId: aliceSecret });
     const rearmed = await runInDurableObject(stub(room), (_instance, state) =>
       state.storage.getAlarm(),
     );
@@ -1244,6 +1585,12 @@ describe('the turn clock', () => {
     expect(summary.inProgress).toBe(false);
     expect(summary.players).toBe(2); // the seats survive; only the match is gone
 
+    // Gone from storage, not merely hidden: a room that kept the abandoned
+    // board around would hand it to the next arrival as live state.
+    expect(await countKvRows(room, 'game')).toBe(0);
+    expect(await countKvRows(room, 'turn')).toBe(0);
+    expect(await countKvRows(room, 'players')).toBe(1);
+
     const notice = await alice.client.next((m) => m.t === 'error' && m.code === 'room_closed');
     expect(notice.t).toBe('error');
 
@@ -1258,6 +1605,155 @@ describe('the turn clock', () => {
       (m) => m.t === 'state' && m.snapshot.round === 1 && m.snapshot.turnNumber <= 2,
     );
     expect(restarted.t).toBe('state');
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it("fires the tank's own stored aim with the free missile, never paid ammunition", async () => {
+    const room = 'PPPA';
+    const { alice, bob, shooter, waiter, snapshot } = await twoPlayerMatch(room);
+
+    // Point the barrel somewhere distinctive and hand the absent player an
+    // arsenal. A clock that used a canned angle, or that reached for the
+    // selected weapon, would now produce a visibly different turn.
+    await editPersistedGame(room, (game) => ({
+      ...game,
+      tanks: game.tanks.map((tank, index) =>
+        index === game.activeTank
+          ? {
+              ...tank,
+              angleDeg: 123,
+              power: 88,
+              selectedWeapon: 'nuke',
+              inventory: { ...tank.inventory, nuke: 3 },
+            }
+          : tank,
+      ),
+    }));
+
+    // Predict the forced shot with the same sim the room runs, from the room's
+    // own persisted state. That is the project's central claim — same state,
+    // same seed, same result — so the trajectory can be asserted exactly rather
+    // than shape-checked.
+    const predicted = fire(fromPersisted(await readPersistedGame(room)), shooter.id, {
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 123,
+      power: 88,
+      weapon: BABY_MISSILE,
+    });
+    const predictedShot = predicted.events.find((event) => event.type === 'shot');
+    if (predictedShot?.type !== 'shot') throw new Error('the sim produced no shot to compare with');
+
+    shooter.client.close();
+    await waitForSocketCount(room, 1);
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+
+    const events = await waiter.client.next((m) => m.t === 'events');
+    expect(events.t).toBe('events');
+    if (events.t === 'events') {
+      const shot = events.events.find((event) => event.type === 'shot');
+      expect(shot?.type).toBe('shot');
+      if (shot?.type === 'shot') {
+        // Always the free weapon: the clock may take a turn, never an inventory.
+        expect(shot.weapon).toBe(BABY_MISSILE);
+        // And the aim is the one on the tank, not one invented here.
+        expect(shot.path).toEqual(predictedShot.path);
+      }
+      const tank = events.snapshot.tanks.find((candidate) => candidate.id === shooter.id);
+      expect(tank?.inventory['nuke']).toBe(3);
+    }
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('gives the match its patience back when somebody actually plays', async () => {
+    const room = 'PPPB';
+    const { alice, bob } = await twoPlayerMatch(room);
+
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const forced = await alice.client.next((m) => m.t === 'events');
+    expect(forced.t).toBe('events');
+    expect((await readTurnRow(room)).timeoutStreak).toBe(1);
+
+    if (forced.t !== 'events') throw new Error('unreachable');
+    const next = forced.snapshot;
+    expect(next.phase, 'this test needs the match still aiming after one timeout').toBe('aiming');
+
+    const up = activeSeat([alice, bob], next);
+    const cursor = up.client.mark();
+    send(up.client.socket, {
+      t: 'fire',
+      turnNumber: next.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+    await up.client.next((m) => m.t === 'events', cursor);
+
+    // A real move is the room's evidence that somebody is still here, so the
+    // three-strikes count that eventually abandons a match starts over.
+    expect((await readTurnRow(room)).timeoutStreak).toBe(0);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('gives the shop a longer clock than a turn, and points the alarm at it', async () => {
+    const room = 'PPPC';
+    const { alice, bob, shooter, snapshot } = await twoPlayerMatch(room);
+
+    // Read after the deadline was written, so this can only be shorter than the
+    // clock it was given, never longer.
+    const aiming = await readTurnRow(room);
+    expect(aiming.phase).toBe('aiming');
+    expect(aiming.deadlineAt).not.toBeNull();
+    const turnLeft = (aiming.deadlineAt as number) - Date.now();
+    expect(turnLeft).toBeLessThanOrEqual(TURN_TIMEOUT_MS);
+    expect(turnLeft).toBeGreaterThan(TURN_TIMEOUT_MS - SLACK_MS);
+
+    // End the round with rounds still to play: that opens the shop.
+    await editPersistedGame(room, (game) => ({
+      ...game,
+      round: 1,
+      tanks: game.tanks.map((tank, index) => ({
+        ...tank,
+        alive: index === game.activeTank,
+        health: index === game.activeTank ? 5000 : 0,
+      })),
+    }));
+
+    const before = Date.now();
+    send(shooter.client.socket, {
+      t: 'fire',
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+    const events = await bob.client.next(
+      (m) => m.t === 'events' && m.snapshot.phase === 'shopping',
+    );
+    expect(events.t).toBe('events');
+
+    const shopping = await readTurnRow(room);
+    expect(shopping.phase).toBe('shopping');
+    // `before` was read ahead of the deadline being written, so this can only
+    // be longer than the clock it was given, never shorter. Reading an arsenal
+    // takes longer than picking an angle: the assertion is against the turn
+    // clock, not a literal, so a shop quietly handed the 60s clock fails here.
+    const remaining = (shopping.deadlineAt as number) - before;
+    expect(remaining).toBeGreaterThan(TURN_TIMEOUT_MS);
+    expect(remaining).toBeGreaterThanOrEqual(SHOP_TIMEOUT_MS);
+    expect(remaining).toBeLessThan(SHOP_TIMEOUT_MS + SLACK_MS);
+
+    // The alarm and the row describe the same deadline, or the countdown the
+    // client draws is for a timeout that will not happen when it says.
+    const alarm = await runInDurableObject(stub(room), (_instance, state) =>
+      state.storage.getAlarm(),
+    );
+    expect(alarm).toBe(shopping.deadlineAt);
 
     alice.client.close();
     bob.client.close();
@@ -1286,6 +1782,181 @@ describe('the turn clock', () => {
 
     alice.client.close();
     bob.client.close();
+  });
+});
+
+/**
+ * The shop.
+ *
+ * Reaching an intermission honestly means playing a whole round of artillery,
+ * which is a sim test, not a Durable Object test — so the room is dropped into
+ * `shopping` directly. What is being tested here is the ROOM's half: that a
+ * purchase reaches storage, that the buyer alone is told about it, and that a
+ * repeated `shopDone` costs the room nothing.
+ *
+ * Every one of those was previously unpinned. Injecting `money += 999` into the
+ * success branch, broadcasting the buyer's frame to the whole room, and
+ * deleting the `pendingShoppers` guard each left the suite green.
+ */
+describe('the shop', () => {
+  const MISSILE_PRICE = 1800;
+  const MISSILE_PACK = 10;
+  /** `SELL_REFUND_DIVISOR` is 2 — half the pack price back. */
+  const MISSILE_REFUND = MISSILE_PRICE / 2;
+
+  async function openShop(room: string): Promise<{
+    alice: Seat;
+    bob: Seat;
+    snapshot: GameSnapshot;
+  }> {
+    const { alice, bob, snapshot } = await twoPlayerMatch(room);
+    await editPersistedGame(room, (game) => ({
+      ...game,
+      phase: 'shopping',
+      pendingShoppers: game.tanks.map((tank) => tank.id),
+    }));
+    return { alice, bob, snapshot };
+  }
+
+  function tankOf(snapshot: GameSnapshot, id: string): GameSnapshot['tanks'][number] {
+    const tank = snapshot.tanks.find((candidate) => candidate.id === id);
+    if (tank === undefined) throw new Error('no tank for that player');
+    return tank;
+  }
+
+  /** Round-trip a socket so anything the room already queued has landed. */
+  async function settle(seat: Seat, nonce: number): Promise<void> {
+    send(seat.client.socket, { t: 'ping', nonce });
+    await seat.client.next((m) => m.t === 'pong' && m.nonce === nonce);
+  }
+
+  it('completes a purchase, debits the wallet, and tells only the buyer', async () => {
+    const room = 'MMMA';
+    const { alice, bob, snapshot } = await openShop(room);
+    const before = tankOf(snapshot, alice.id).money;
+
+    const bobCursor = bob.client.mark();
+    const aliceCursor = alice.client.mark();
+    send(alice.client.socket, { t: 'buy', weapon: 'missile', quantity: 1 });
+
+    const frame = await alice.client.next((m) => m.t === 'state', aliceCursor);
+    expect(frame.t).toBe('state');
+    if (frame.t === 'state') {
+      const tank = tankOf(frame.snapshot, alice.id);
+      expect(tank.money).toBe(before - MISSILE_PRICE);
+      expect(tank.inventory['missile']).toBe(MISSILE_PACK);
+      // Bob's wallet is nobody's business but Bob's, and it did not move.
+      expect(tankOf(frame.snapshot, bob.id).money).toBe(tankOf(snapshot, bob.id).money);
+    }
+
+    // The purchase is in storage, not just in the frame that answered it.
+    const persisted = await readPersistedGame(room);
+    expect(tankOf(persisted, alice.id).money).toBe(before - MISSILE_PRICE);
+
+    // A transaction nobody else can see is not worth a heightmap each: the
+    // buyer's frame is a reply, not a broadcast.
+    await settle(bob, 21);
+    expect(
+      bob.client
+        .all()
+        .slice(bobCursor)
+        .filter((m) => m.t === 'state'),
+    ).toHaveLength(0);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('sells a pack back at the refund rate', async () => {
+    const room = 'MMMB';
+    const { alice, bob, snapshot } = await openShop(room);
+    const before = tankOf(snapshot, alice.id).money;
+
+    let cursor = alice.client.mark();
+    send(alice.client.socket, { t: 'buy', weapon: 'missile', quantity: 2 });
+    await alice.client.next((m) => m.t === 'state', cursor);
+
+    cursor = alice.client.mark();
+    send(alice.client.socket, { t: 'sell', weapon: 'missile' });
+    const sold = await alice.client.next((m) => m.t === 'state', cursor);
+    expect(sold.t).toBe('state');
+    if (sold.t === 'state') {
+      const tank = tankOf(sold.snapshot, alice.id);
+      expect(tank.money).toBe(before - MISSILE_PRICE * 2 + MISSILE_REFUND);
+      expect(tank.inventory['missile']).toBe(MISSILE_PACK);
+    }
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('refuses a purchase nobody can afford and leaves the wallet alone', async () => {
+    const room = 'MMMC';
+    const { alice, bob, snapshot } = await openShop(room);
+    const before = tankOf(snapshot, alice.id).money;
+
+    send(alice.client.socket, { t: 'buy', weapon: 'nuke', quantity: 99 });
+    const error = await alice.client.next((m) => m.t === 'error');
+    expect(error.t === 'error' && error.code).toBe('insufficient_funds');
+    expect(tankOf(await readPersistedGame(room), alice.id).money).toBe(before);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('takes one player out of the shop, ignores the repeat, and rolls over on the last', async () => {
+    const room = 'MMMD';
+    const { alice, bob, snapshot } = await openShop(room);
+
+    // Leaving the shop IS everyone's business — who the room is still waiting
+    // for decides when the next round starts.
+    send(alice.client.socket, { t: 'shopDone' });
+    const waiting = await bob.client.next(
+      (m) => m.t === 'state' && m.snapshot.pendingShoppers.length === 1,
+    );
+    expect(waiting.t === 'state' && waiting.snapshot.pendingShoppers).toEqual([bob.id]);
+
+    // The repeat is idempotent: Alice gets the state back, and it costs the
+    // rest of the room nothing at all.
+    const bobCursor = bob.client.mark();
+    const aliceCursor = alice.client.mark();
+    send(alice.client.socket, { t: 'shopDone' });
+    const echo = await alice.client.next((m) => m.t === 'state', aliceCursor);
+    expect(echo.t === 'state' && echo.snapshot.pendingShoppers).toEqual([bob.id]);
+    await settle(bob, 22);
+    expect(
+      bob.client
+        .all()
+        .slice(bobCursor)
+        .filter((m) => m.t === 'state'),
+    ).toHaveLength(0);
+
+    // And the last one out starts the round for everybody.
+    send(bob.client.socket, { t: 'shopDone' });
+    const rolled = await alice.client.next((m) => m.t === 'events');
+    expect(rolled.t).toBe('events');
+    if (rolled.t === 'events') {
+      expect(rolled.snapshot.phase).toBe('aiming');
+      expect(rolled.snapshot.round).toBe(snapshot.round + 1);
+      expect(rolled.snapshot.pendingShoppers).toEqual([]);
+    }
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('will not sell a seat to a spectator', async () => {
+    const room = 'MMME';
+    const { alice, bob } = await openShop(room);
+    const eve = await join(room, 'Eve', { role: 'spectator' });
+
+    send(eve.client.socket, { t: 'buy', weapon: 'missile', quantity: 1 });
+    const error = await eve.client.next((m) => m.t === 'error');
+    expect(error.t === 'error' && error.code).toBe('spectator_only');
+
+    alice.client.close();
+    bob.client.close();
+    eve.client.close();
   });
 });
 
@@ -1344,19 +2015,22 @@ describe('end of match', () => {
     carol.client.close();
   });
 
-  it('publishes a final scoreboard when the sim declares the match over', async () => {
+  it('publishes a final scoreboard, and counts the rounds each player won', async () => {
     const room = 'HHHC';
     const { alice, bob, shooter, snapshot } = await twoPlayerMatch(room);
 
     // One turn away from the end: it is the final round and the player about to
     // shoot is the last tank standing, so resolving this turn ends the match.
+    // The survivor's health is set far above anything one shot can take off, so
+    // this test is about the scoreboard and never about whether the shooter
+    // happened to blow itself up — `roundsWon` needs a survivor to exist.
     await editPersistedGame(room, (game) => ({
       ...game,
       round: game.totalRounds,
       tanks: game.tanks.map((tank, index) => ({
         ...tank,
         alive: index === game.activeTank,
-        health: index === game.activeTank ? tank.health : 0,
+        health: index === game.activeTank ? 5000 : 0,
       })),
     }));
 
@@ -1374,10 +2048,66 @@ describe('end of match', () => {
       expect(result.standings).toHaveLength(2);
       expect(result.standings[0]?.place).toBe(1);
       expect(result.standings.map((row) => row.playerId).sort()).toEqual([alice.id, bob.id].sort());
+
+      // The last tank standing won the round, and the room counted it. This was
+      // unpinned: with the tally made a no-op, `roundsWon` shipped a permanent
+      // zero and no test noticed.
+      const survivor = result.standings.find((row) => row.playerId === shooter.id);
+      const loser = result.standings.find((row) => row.playerId !== shooter.id);
+      expect(survivor?.roundsWon).toBe(1);
+      expect(loser?.roundsWon).toBe(0);
+      expect(survivor?.place).toBe(1);
+      expect(result.winnerId).toBe(shooter.id);
     }
 
     alice.client.close();
     bob.client.close();
+  });
+
+  it('gives an equal score an equal place', async () => {
+    const room = 'HHHD';
+    const { seats, snapshot } = await startMatch('HHHD', ['Ann', 'Ben', 'Cal']);
+    const shooter = activeSeat(seats, snapshot);
+
+    // Two tanks out on the same score, one survivor. Standard competition
+    // ranking calls that 1, 2, 2 — plain ordinal ranking calls it 1, 2, 3, and
+    // tells the player in third that they lost to somebody they tied with.
+    await editPersistedGame(room, (game) => ({
+      ...game,
+      round: game.totalRounds,
+      tanks: game.tanks.map((tank, index) => ({
+        ...tank,
+        alive: index === game.activeTank,
+        health: index === game.activeTank ? 5000 : 0,
+        score: index === game.activeTank ? tank.score : 0,
+      })),
+    }));
+
+    send(shooter.client.socket, {
+      t: 'fire',
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+
+    const result = await (seats[1] as Seat).client.next((m) => m.t === 'matchResult');
+    expect(result.t).toBe('matchResult');
+    if (result.t === 'matchResult') {
+      const standings = result.standings;
+      expect(standings).toHaveLength(3);
+      // There is a genuine tie in here, or this test proves nothing at all.
+      expect(new Set(standings.map((row) => row.score)).size).toBeLessThan(standings.length);
+      // Competition ranking: your place is the position of the first player on
+      // your score, so equal scores share a place and the next one skips.
+      for (const row of standings) {
+        const firstOnThatScore =
+          standings.findIndex((candidate) => candidate.score === row.score) + 1;
+        expect(row.place, `place for score ${row.score}`).toBe(firstOnThatScore);
+      }
+    }
+
+    for (const seat of seats) seat.client.close();
   });
 });
 
@@ -1411,6 +2141,61 @@ describe('persistence', () => {
     expect(JSON.parse(last?.events ?? '[]')).toEqual(
       expect.arrayContaining([expect.objectContaining({ type: 'shot' })]),
     );
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('keeps every match in its own replay lane so a rematch cannot overwrite one', async () => {
+    const room = 'JJJC';
+    const { alice, bob, shooter, snapshot } = await twoPlayerMatch(room);
+
+    send(shooter.client.socket, {
+      t: 'fire',
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+    await shooter.client.next((m) => m.t === 'events');
+
+    const first = await readReplay(room);
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.every((row) => row.match === 1)).toBe(true);
+
+    // Run it back. A rematch replays the same turn NUMBERS from the start, so
+    // keyed by turn alone the second match overwrites the first row for row —
+    // which is the entire reason `replay_v2` carries a match column and the old
+    // `replay` table was dropped rather than migrated.
+    await editPersistedGame(room, (game) => ({ ...game, phase: 'gameover' }));
+    const cursor = bob.client.mark();
+    send(alice.client.socket, { t: 'start' });
+    const rematch = await bob.client.next(
+      (m) => m.t === 'state' && m.snapshot.phase === 'aiming',
+      cursor,
+    );
+    if (rematch.t !== 'state') throw new Error('unreachable');
+
+    const up = activeSeat([alice, bob], rematch.snapshot);
+    const upCursor = up.client.mark();
+    send(up.client.socket, {
+      t: 'fire',
+      turnNumber: rematch.snapshot.turnNumber,
+      angleDeg: 45,
+      power: 70,
+      weapon: 'baby_missile',
+    });
+    await up.client.next((m) => m.t === 'events', upCursor);
+
+    const rows = await readReplay(room);
+    const second = rows.filter((row) => row.match === 2);
+    expect(second.length).toBeGreaterThan(0);
+    // The collision really happened: one turn number, two matches, both rows
+    // still there.
+    const collidingTurn = (second[0] as { turn: number }).turn;
+    expect(rows.filter((row) => row.turn === collidingTurn).map((row) => row.match)).toEqual([
+      1, 2,
+    ]);
 
     alice.client.close();
     bob.client.close();

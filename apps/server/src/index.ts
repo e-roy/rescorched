@@ -6,42 +6,11 @@
  * Assets (unmetered), or game logic inside the DO.
  */
 
-import { generateRoomCode, isValidRoomCode } from './room-code.ts';
+import { allocateRoomCode, isValidRoomCode } from './room-code.ts';
 
 export { GameRoom } from './game-room.ts';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' } as const;
-
-/**
- * How many codes to try before handing one over anyway.
- *
- * There are 24^4 = 331,776 codes, so a collision is rare — but "rare" over a
- * weekend is "someone got dropped into a stranger's lobby", which is a far
- * worse bug than one extra Durable Object round trip at room-creation time.
- * The first candidate is free almost every time, so this usually costs exactly
- * one probe.
- */
-const ROOM_CODE_ATTEMPTS = 5;
-
-async function allocateRoomCode(env: Env): Promise<string> {
-  let candidate = generateRoomCode();
-  for (let attempt = 0; attempt < ROOM_CODE_ATTEMPTS; attempt += 1) {
-    if (attempt > 0) candidate = generateRoomCode();
-    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(candidate));
-    try {
-      const response = await stub.fetch(new Request('https://room/info'));
-      if (!response.ok) continue;
-      const summary = (await response.json()) as { players?: number; inProgress?: boolean };
-      if ((summary.players ?? 0) === 0 && summary.inProgress !== true) return candidate;
-    } catch {
-      // A room that cannot be asked is not a room we should hand out.
-      continue;
-    }
-  }
-  // Every probe was occupied or unreachable. Return the last candidate rather
-  // than fail outright: a shared room is recoverable, "could not create" is not.
-  return candidate;
-}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

@@ -199,6 +199,166 @@ describe('settling a tank the ground moved under', () => {
   });
 });
 
+/**
+ * The same credit rule, exercised through `fire()` instead of by calling
+ * `settleTanks` directly.
+ *
+ * Everything above this point calls `settleTanks(state, 0)` itself, which means
+ * it tests the function and not the wiring: `fire()` could stop passing the
+ * shooter along — the one line that makes falls and burials pay — and every one
+ * of those tests would still be green. Only the golden hash would notice, and a
+ * golden hash is a change detector, not a specification.
+ *
+ * The trick that makes this measurable is a weapon whose `damage` is zero. A
+ * Ton of Dirt and a Riot Blast move a great deal of ground and hurt nobody
+ * directly, so every point the shooter is credited with here provably arrived
+ * through the settle step. Each test asserts that `damage === 0` rather than
+ * trusting the arsenal to stay that way.
+ */
+describe('moving the ground out from under someone, through the real fire path', () => {
+  /**
+   * Fire `weaponId` from x = 100 at whatever it hits, with the victim parked
+   * where the shell really lands.
+   *
+   * The landing point is found by flying the shot with nobody in the way, so
+   * nothing here depends on a hand-computed range: retune the ballistics and
+   * the fixture follows.
+   */
+  function groundShot(
+    weaponId: string,
+    victimPatch: Partial<Tank> = {},
+  ): {
+    before: GameState;
+    after: GameState;
+    events: GameEvent[];
+    victimIndex: number;
+    groundMoved: number;
+  } {
+    const angleDeg = 45;
+    const power = 70;
+    const base = flatGame(3, `ground-${weaponId}`);
+    const solo = simulateFlight(
+      { x: 100, y: GROUND - DEFAULT_WORLD.tankRadius - 2, angleDeg, power },
+      { terrain: base.terrain, wind: 0 },
+    );
+    expect(solo.impact.kind).toBe('terrain');
+    const landing = Math.round(solo.impact.x);
+
+    // Shooter at 100, victim under the shell, bystander parked at the far edge
+    // so the round cannot end on this shot and nothing settles under it.
+    let state = place(base, 0, { x: 100, y: GROUND, inventory: { [weaponId]: 3 } });
+    state = place(state, 1, { x: landing, y: GROUND, ...victimPatch });
+    state = place(state, 2, { x: 1270, y: GROUND });
+    state = { ...state, activeTank: 0 };
+
+    const { state: after, events } = fire(state, (state.tanks[0] as Tank).id, {
+      turnNumber: state.turnNumber,
+      angleDeg,
+      power,
+      weapon: weaponId,
+    });
+
+    return {
+      before: state,
+      after,
+      events,
+      victimIndex: 1,
+      groundMoved: surfaceAt(after.terrain, landing) - GROUND,
+    };
+  }
+
+  it('credits a burial to the tank that dropped the dirt', () => {
+    // Zero direct damage by definition, so the whole ledger below came from the
+    // dig-out. If `fire()` stopped naming the shooter, this reads zero.
+    expect(requireWeapon('ton_of_dirt').damage).toBe(0);
+
+    const { before, after, events, groundMoved } = groundShot('ton_of_dirt');
+    // Negative: the surface rose, which is dirt stacked over the tank.
+    expect(groundMoved).toBeLessThan(-BURIAL.freeDepth);
+
+    const buried = burialDamage(-groundMoved);
+    expect(buried).toBeGreaterThan(0);
+
+    const victim = after.tanks[1] as Tank;
+    expect(victim.y).toBe(surfaceAt(after.terrain, victim.x));
+    expect(victim.health).toBe(DEFAULT_WORLD.maxHealth - buried);
+    expect(damageOf(events, 1)).toBe(buried);
+
+    const shooterBefore = before.tanks[0] as Tank;
+    const shooter = after.tanks[0] as Tank;
+    expect(shooter.score).toBe(shooterBefore.score + buried);
+    expect(shooter.money).toBe(shooterBefore.money + buried * DEFAULT_WORLD.damageBounty);
+  });
+
+  it('credits a fall to the tank that dug the ground away', () => {
+    expect(requireWeapon('riot_blast').damage).toBe(0);
+
+    const { before, after, events, groundMoved } = groundShot('riot_blast');
+    // Positive: y grows downwards, so the surface dropped away.
+    expect(groundMoved).toBeGreaterThan(FALL.safeDrop);
+
+    const fell = fallDamage(groundMoved);
+    expect(fell).toBeGreaterThan(0);
+
+    const victim = after.tanks[1] as Tank;
+    expect(victim.y).toBe(surfaceAt(after.terrain, victim.x));
+    expect(victim.health).toBe(DEFAULT_WORLD.maxHealth - fell);
+    expect(damageOf(events, 1)).toBe(fell);
+
+    const shooterBefore = before.tanks[0] as Tank;
+    const shooter = after.tanks[0] as Tank;
+    expect(shooter.score).toBe(shooterBefore.score + fell);
+    expect(shooter.money).toBe(shooterBefore.money + fell * DEFAULT_WORLD.damageBounty);
+  });
+
+  it('pays the kill bounty when the ground finishes a wounded tank', () => {
+    // The whole point of the change: dropping somebody down a hole you dug is a
+    // kill you earned. A weapon that does no damage at all can still get one.
+    const { before, after, events } = groundShot('riot_blast', { health: 3 });
+
+    const victim = after.tanks[1] as Tank;
+    expect(victim.alive).toBe(false);
+    expect(events).toContainEqual({ type: 'death', tankIndex: 1, byTankIndex: 0 });
+
+    const shooterBefore = before.tanks[0] as Tank;
+    const shooter = after.tanks[0] as Tank;
+    expect(shooter.score).toBe(shooterBefore.score + 3);
+    expect(shooter.money).toBe(
+      shooterBefore.money + 3 * DEFAULT_WORLD.damageBounty + DEFAULT_WORLD.killBounty,
+    );
+    // The bystander is still standing, so the round is live and no survival
+    // bonus has been added to the ledger this assertion is reading.
+    expect(after.phase).toBe('aiming');
+  });
+
+  it('still charges a tank that digs its own hole, and pays nobody for it', () => {
+    // The mirror image, and the reason the credit is `byTankIndex` rather than
+    // "the active tank": `applyDamage` drops the bounty when victim and shooter
+    // are the same tank.
+    const base = flatGame(3, 'self-dig');
+    let state = place(base, 0, { x: 400, y: GROUND, inventory: { riot_blast: 3 } });
+    state = place(state, 1, { x: 100, y: GROUND });
+    state = place(state, 2, { x: 1270, y: GROUND });
+    state = { ...state, activeTank: 0 };
+    const moneyBefore = (state.tanks[0] as Tank).money;
+
+    // Straight up at a crawl: it comes down on its own feet.
+    const { state: after } = fire(state, (state.tanks[0] as Tank).id, {
+      turnNumber: state.turnNumber,
+      angleDeg: 90,
+      power: 1,
+      weapon: 'riot_blast',
+    });
+
+    const digger = after.tanks[0] as Tank;
+    expect(surfaceAt(after.terrain, digger.x)).toBeGreaterThan(GROUND + FALL.safeDrop);
+    expect(digger.y).toBe(surfaceAt(after.terrain, digger.x));
+    expect(digger.health).toBeLessThan(DEFAULT_WORLD.maxHealth);
+    expect(digger.money).toBe(moneyBefore);
+    expect(digger.score).toBe(0);
+  });
+});
+
 describe('one blast, several kills', () => {
   /**
    * Set up a shot that is guaranteed to go off between two tanks.

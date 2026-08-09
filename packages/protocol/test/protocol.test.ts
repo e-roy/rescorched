@@ -4,14 +4,17 @@ import {
   encodeClientMessage,
   encodeServerMessage,
   GameEventSchema,
+  IMPACT_KINDS,
   MAX_CLIENT_MESSAGE_BYTES,
   MAX_MESSAGE_BYTES,
+  MAX_NONCE,
   MAX_SERVER_MESSAGE_BYTES,
   packSurface,
   parseClientMessage,
   parseServerMessage,
   PROTOCOL_VERSION,
   ServerMessageSchema,
+  tryEncodeServerMessage,
   type ClientMessage,
   type ServerMessage,
   type WireGameEvent,
@@ -53,13 +56,16 @@ const SNAPSHOT = {
  * whole event union too.
  */
 const EVENTS: WireGameEvent[] = [
-  {
-    type: 'shot',
+  // One shot per impact kind, built from the constant rather than typed out, so
+  // the `events` frame round-trip below carries all four and a fifth kind cannot
+  // be added without appearing here.
+  ...IMPACT_KINDS.map((impactKind) => ({
+    type: 'shot' as const,
     tankIndex: 0,
     weapon: 'baby_missile',
     path: [1, 2, 3, 4],
-    impactKind: 'terrain',
-  },
+    impactKind,
+  })),
   { type: 'explosion', x: 10, y: 20, radius: 18, weapon: 'baby_missile' },
   { type: 'dirt', x: 10, y: 20, radius: 40 },
   { type: 'damage', tankIndex: 0, amount: 12, healthAfter: 88 },
@@ -168,6 +174,13 @@ describe('round trips', () => {
     const declared = new Set(GameEventSchema.options.map((option) => option.shape.type.value));
     const tested = new Set(EVENTS.map((event) => event.type));
     expect([...declared].sort()).toEqual([...tested].sort());
+  });
+
+  it('covers every known impact kind', () => {
+    const tested = new Set(
+      EVENTS.flatMap((event) => (event.type === 'shot' ? [event.impactKind] : [])),
+    );
+    expect([...IMPACT_KINDS].sort()).toEqual([...tested].sort());
   });
 
   it('round-trips optional fields as absent, not as undefined keys', () => {
@@ -379,6 +392,8 @@ describe('hostile and malformed input', () => {
     ['chat too long', `{"t":"chat","text":"${'x'.repeat(201)}"}`],
     ['negative ping nonce', '{"t":"ping","nonce":-1}'],
     ['ping nonce is a float', '{"t":"ping","nonce":1.5}'],
+    ['ping nonce past 32 bits', '{"t":"ping","nonce":4294967296}'],
+    ['ping nonce at MAX_SAFE_INTEGER', '{"t":"ping","nonce":9007199254740991}'],
     ['ready is a string', '{"t":"ready","ready":"yes"}'],
     [
       'NaN smuggled as a string',
@@ -553,11 +568,14 @@ describe('hostile and malformed input', () => {
       parseServerMessage(withEvents([{ type: 'death', tankIndex: 99, byTankIndex: null }])).ok,
     ).toBe(false);
 
-    // An impact kind the physics engine cannot produce.
+    // An impact kind that is not shaped like one. The full case list — including
+    // why a well-formed but unrecognised kind is deliberately ACCEPTED — is in
+    // sim-boundary.test.ts, next to the compile-time pin that keeps the known
+    // set equal to the sim's.
     expect(
       parseServerMessage(
         withEvents([
-          { type: 'shot', tankIndex: 0, weapon: 'missile', path: [], impactKind: 'wormhole' },
+          { type: 'shot', tankIndex: 0, weapon: 'missile', path: [], impactKind: 'WORMHOLE' },
         ]),
       ).ok,
     ).toBe(false);
@@ -602,6 +620,80 @@ describe('hostile and malformed input', () => {
     if (!parsed.ok) {
       expect(parsed.error.length).toBeGreaterThan(3);
       expect(parsed.error).toMatch(/angleDeg/);
+    }
+  });
+});
+
+/**
+ * The file's own Rule 1 is "every number a range", and `nonce` was the one that
+ * had only half of one: `z.number().int().min(0)` is bounded below and unbounded
+ * above, so `{"t":"ping","nonce":9007199254740991}` parsed clean in BOTH
+ * directions. A ping nonce is a correlator with no meaning beyond "this pong
+ * answers that ping", so 32 bits is a ceiling nothing legitimate can reach.
+ */
+describe('the ping/pong nonce is bounded at both ends', () => {
+  it('accepts the range a real sender uses, up to the cap', () => {
+    for (const nonce of [0, 1, 65_535, MAX_NONCE]) {
+      expect(parseClientMessage(JSON.stringify({ t: 'ping', nonce })).ok, `${nonce}`).toBe(true);
+      expect(parseServerMessage(JSON.stringify({ t: 'pong', nonce })).ok, `${nonce}`).toBe(true);
+    }
+  });
+
+  it('refuses anything past it, in both directions', () => {
+    for (const nonce of [
+      MAX_NONCE + 1,
+      Number.MAX_SAFE_INTEGER,
+      1e300,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      // JSON.stringify writes NaN and Infinity as `null`, which is also refused;
+      // the numeric-overflow route is covered separately below.
+      const raw = (t: string): string => JSON.stringify({ t, nonce });
+      expect(parseClientMessage(raw('ping')).ok, `ping ${nonce}`).toBe(false);
+      expect(parseServerMessage(raw('pong')).ok, `pong ${nonce}`).toBe(false);
+    }
+
+    // An Infinity that reaches the parser as a real Infinity, spliced into the
+    // text because JSON has no literal for it.
+    expect(parseClientMessage('{"t":"ping","nonce":1e400}').ok).toBe(false);
+    expect(parseServerMessage('{"t":"pong","nonce":1e400}').ok).toBe(false);
+  });
+
+  it('will not encode one past the cap either', () => {
+    expect(() => encodeClientMessage({ t: 'ping', nonce: MAX_NONCE + 1 })).toThrow();
+    expect(() => encodeServerMessage({ t: 'pong', nonce: MAX_NONCE + 1 })).toThrow();
+  });
+});
+
+/**
+ * `broadcast()` in the Durable Object encodes the turn's frame before the send
+ * loop and OUTSIDE the try that guards `socket.send`. A throw there is not a
+ * dropped log line — nobody receives the turn and every client sits waiting for
+ * events that never arrive. `tryEncodeServerMessage` is the version that hands
+ * that caller the choice. `apps/server` belongs to another area and still calls
+ * the throwing form; this is the tested door, not a change made on its behalf.
+ */
+describe('tryEncodeServerMessage', () => {
+  it('produces exactly what the throwing encoder produces, when both work', () => {
+    for (const message of SERVER_MESSAGES) {
+      const safe = tryEncodeServerMessage(message);
+      expect(safe.ok, safe.ok ? '' : safe.error).toBe(true);
+      if (safe.ok) expect(safe.value).toBe(encodeServerMessage(message));
+    }
+  });
+
+  it('returns a reason instead of throwing on a frame the schema refuses', () => {
+    const bad = { t: 'error', code: 'nope', message: 'x' } as unknown as ServerMessage;
+    expect(() => encodeServerMessage(bad)).toThrow();
+
+    const safe = tryEncodeServerMessage(bad);
+    expect(safe.ok).toBe(false);
+    if (!safe.ok) {
+      expect(safe.code).toBe('bad_message');
+      expect(safe.error.length).toBeGreaterThan(0);
     }
   });
 });

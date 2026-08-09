@@ -528,6 +528,29 @@ describe('selling', () => {
     }
   });
 
+  /**
+   * The sweep above cannot see the rounding DIRECTION and it is worth being
+   * explicit about why: every price in `WEAPONS` is even, so floor, ceil and
+   * round agree on all of them, and `Math.floor(weapon.price / 2)` on the right
+   * hand side would mirror a mutated `refundForPack` anyway. This test uses
+   * prices that are not in the table and expectations written by hand.
+   *
+   * The prices are odd on purpose. `refundForPack` returning `ceil` would make
+   * the first row 1 instead of 0 and the third 601 instead of 600; so would
+   * `Math.round`, which takes a half up.
+   */
+  it('rounds an odd price down, not up and not to nearest', () => {
+    const oddPrices: [price: number, refund: number][] = [
+      [1, 0],
+      [3, 1],
+      [1201, 600],
+      [29999, 14999],
+    ];
+    for (const [price, refund] of oddPrices) {
+      expect(refundForPack({ ...CHEAP, price })).toBe(refund);
+    }
+  });
+
   it('returns the pack and credits the refund', () => {
     const start = shoppingState();
     const bought = buy(start, 'p1', MID.id, 2).state;

@@ -488,6 +488,89 @@ describe('the seam between the turn machine and the shop', () => {
   });
 });
 
+/**
+ * What the hash itself is required to see.
+ *
+ * The illegal-move block above compares a `fingerprint` — the hash AND the full
+ * persisted JSON — which is the right assertion to make there and the wrong one
+ * to rely on here: with the JSON in the string, a hash that ignored half the
+ * state would still make every one of those cases pass. So the fields
+ * `hashGameState` exists to notice are pinned here, on the hash alone.
+ *
+ * This matters because the hash is the whole of the determinism check. A golden
+ * snapshot is a comparison of two hashes; anything the hash cannot see is
+ * something two clients can silently disagree about.
+ */
+describe('the state hash sees the state', () => {
+  const base = newGame('hash');
+  const hashOf = (patch: Partial<GameState>): string => hashGameState({ ...base, ...patch });
+
+  it('distinguishes phases that are the same length', () => {
+    // `phase` used to contribute only its length, and "shopping" and "gameover"
+    // are both eight characters — so the one transition where a rejected move
+    // could plausibly have been let through was the one the hash could not see.
+    expect(hashOf({ phase: 'shopping' })).not.toBe(hashOf({ phase: 'gameover' }));
+    expect(hashOf({ phase: 'aiming' })).not.toBe(hashOf({ phase: 'lobby' }));
+    expect(hashOf({ phase: 'resolving' })).not.toBe(hashOf({ phase: 'gameover' }));
+  });
+
+  it('distinguishes who won, including nobody', () => {
+    expect(hashOf({ winnerId: null })).not.toBe(hashOf({ winnerId: 'p1' }));
+    expect(hashOf({ winnerId: 'p1' })).not.toBe(hashOf({ winnerId: 'p2' }));
+  });
+
+  it('distinguishes who is still in the shop, and in what order', () => {
+    expect(hashOf({ pendingShoppers: [] })).not.toBe(hashOf({ pendingShoppers: ['p1'] }));
+    expect(hashOf({ pendingShoppers: ['p1'] })).not.toBe(hashOf({ pendingShoppers: ['p2'] }));
+    expect(hashOf({ pendingShoppers: ['p1', 'p2'] })).not.toBe(
+      hashOf({ pendingShoppers: ['p2', 'p1'] }),
+    );
+  });
+
+  it('distinguishes every other field a rejected move could have moved', () => {
+    const tweak = (patch: Partial<Tank>): string =>
+      hashOf({ tanks: base.tanks.map((tank, i) => (i === 0 ? { ...tank, ...patch } : tank)) });
+    const original = hashGameState(base);
+
+    expect(hashOf({ round: base.round + 1 })).not.toBe(original);
+    expect(hashOf({ totalRounds: base.totalRounds + 1 })).not.toBe(original);
+    expect(hashOf({ turnNumber: base.turnNumber + 1 })).not.toBe(original);
+    expect(hashOf({ activeTank: 1 })).not.toBe(original);
+    expect(hashOf({ wind: base.wind + 0.1 })).not.toBe(original);
+    expect(hashOf({ rngState: { ...base.rngState, a: base.rngState.a + 1 } })).not.toBe(original);
+
+    expect(tweak({ x: (base.tanks[0] as Tank).x + 1 })).not.toBe(original);
+    expect(tweak({ y: (base.tanks[0] as Tank).y + 1 })).not.toBe(original);
+    expect(tweak({ health: 99 })).not.toBe(original);
+    expect(tweak({ money: 1 })).not.toBe(original);
+    expect(tweak({ score: 1 })).not.toBe(original);
+    expect(tweak({ alive: false })).not.toBe(original);
+    expect(tweak({ angleDeg: 46 })).not.toBe(original);
+    expect(tweak({ power: 61 })).not.toBe(original);
+    expect(tweak({ selectedWeapon: 'missile' })).not.toBe(original);
+    expect(tweak({ colorIndex: 7 })).not.toBe(original);
+    // A spent round is the thing a rejected shot must not be able to leak.
+    expect(tweak({ inventory: { missile: 1 } })).not.toBe(original);
+    expect(tweak({ inventory: { missile: 2 } })).not.toBe(tweak({ inventory: { missile: 1 } }));
+  });
+
+  it('ignores the player name, which is a label and not simulation state', () => {
+    const renamed = hashOf({
+      tanks: base.tanks.map((tank) => ({ ...tank, name: `${tank.name} the Terrible` })),
+    });
+    expect(renamed).toBe(hashGameState(base));
+  });
+
+  it('does not depend on the order the inventory was bought in', () => {
+    // `cloneState` spreads the object and JSON round-trips preserve insertion
+    // order, so two rooms that bought the same shells in a different order must
+    // still agree. The hash sorts the entries; without that they would not.
+    const withOrder = (inventory: Record<string, number>): string =>
+      hashOf({ tanks: base.tanks.map((tank, i) => (i === 0 ? { ...tank, inventory } : tank)) });
+    expect(withOrder({ missile: 2, nuke: 1 })).toBe(withOrder({ nuke: 1, missile: 2 }));
+  });
+});
+
 describe('serialisation', () => {
   it('round-trips a full game through JSON without drift', () => {
     const state = newGame();
