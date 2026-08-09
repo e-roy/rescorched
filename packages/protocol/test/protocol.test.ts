@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BOT_PERSONALITIES,
   ClientMessageSchema,
   encodeClientMessage,
   encodeServerMessage,
@@ -8,6 +9,7 @@ import {
   MAX_CLIENT_MESSAGE_BYTES,
   MAX_MESSAGE_BYTES,
   MAX_NONCE,
+  MAX_PLAYERS_PER_ROOM,
   MAX_SERVER_MESSAGE_BYTES,
   packSurface,
   parseClientMessage,
@@ -82,6 +84,9 @@ const CLIENT_MESSAGES: ClientMessage[] = [
   { t: 'hello', protocol: PROTOCOL_VERSION, name: 'Watcher', role: 'spectator' },
   { t: 'ready', ready: true },
   { t: 'start' },
+  { t: 'addBot' },
+  { t: 'addBot', personality: 'annihilator' },
+  { t: 'removeBot', playerId: 'bot-1' },
   { t: 'aim', angleDeg: 45, power: 60, weapon: 'baby_missile' },
   { t: 'fire', turnNumber: 3, angleDeg: 90, power: 100, weapon: 'nuke' },
   { t: 'buy', weapon: 'missile', quantity: 2 },
@@ -105,7 +110,21 @@ const SERVER_MESSAGES: ServerMessage[] = [
     t: 'lobby',
     roomCode: 'ABCD',
     hostId: 's1',
-    players: [{ id: 's1', name: 'Alice', ready: true, connected: true, colorIndex: 0 }],
+    players: [
+      { id: 's1', name: 'Alice', ready: true, connected: true, colorIndex: 0 },
+      // A seated computer player, and a human stated the other way round: the
+      // field is optional so an older client still parses the frame, and both
+      // spellings of "not a bot" have to survive the round trip.
+      {
+        id: 'b1',
+        name: 'Annihilator',
+        ready: true,
+        connected: true,
+        colorIndex: 1,
+        bot: 'annihilator',
+      },
+      { id: 's2', name: 'Bob', ready: false, connected: true, colorIndex: 2, bot: null },
+    ],
   },
   { t: 'state', snapshot: SNAPSHOT },
   { t: 'events', turnNumber: 1, snapshot: SNAPSHOT, events: EVENTS },
@@ -395,6 +414,23 @@ describe('hostile and malformed input', () => {
     ['ping nonce past 32 bits', '{"t":"ping","nonce":4294967296}'],
     ['ping nonce at MAX_SAFE_INTEGER', '{"t":"ping","nonce":9007199254740991}'],
     ['ready is a string', '{"t":"ready","ready":"yes"}'],
+    // Seating a computer player. `personality` names a brain the sim has to be
+    // able to drive, so it is the one place a lobby string reaches the AI, and
+    // the enum is the gate. `sim-boundary.test.ts` pins the list itself against
+    // the sim's; these are the shapes that must not get past the parser.
+    ['unknown personality', '{"t":"addBot","personality":"grandmaster"}'],
+    ['personality with different case', '{"t":"addBot","personality":"Annihilator"}'],
+    ['personality is empty', '{"t":"addBot","personality":""}'],
+    ['personality is a number', '{"t":"addBot","personality":3}'],
+    ['personality is null', '{"t":"addBot","personality":null}'],
+    ['personality is an array of real ones', '{"t":"addBot","personality":["moron"]}'],
+    ['personality is __proto__', '{"t":"addBot","personality":"__proto__"}'],
+    ['removeBot with no target', '{"t":"removeBot"}'],
+    ['removeBot with an empty target', '{"t":"removeBot","playerId":""}'],
+    ['removeBot with a whitespace target', '{"t":"removeBot","playerId":"a b"}'],
+    ['removeBot with a null target', '{"t":"removeBot","playerId":null}'],
+    ['removeBot with a numeric target', '{"t":"removeBot","playerId":42}'],
+    ['removeBot with an over-long target', `{"t":"removeBot","playerId":"${'a'.repeat(65)}"}`],
     [
       'NaN smuggled as a string',
       '{"t":"fire","turnNumber":1,"angleDeg":"NaN","power":5,"weapon":"m"}',
@@ -736,5 +772,132 @@ describe('encoding guards', () => {
       const parsed = parseClientMessage(JSON.stringify({ t: 'chat', text }));
       expect(parsed.ok, `${text}: ${parsed.ok ? '' : parsed.error}`).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Computer players on the wire
+//
+// The row-per-shape table above covers the parser refusals. What is left is the
+// three things about these two messages that are decisions rather than syntax:
+// how many bots a frame can ask for, whether a personality can arrive by a door
+// other than `addBot`, and what `bot` being optional actually buys.
+// ---------------------------------------------------------------------------
+
+describe('computer players on the wire', () => {
+  /** A lobby frame with `count` seats in it. */
+  function lobbyOf(count: number): unknown {
+    return {
+      t: 'lobby',
+      roomCode: 'ABCD',
+      hostId: 's0',
+      players: Array.from({ length: count }, (_, index) => ({
+        id: `s${index}`,
+        name: `P${index}`,
+        ready: true,
+        connected: true,
+        colorIndex: index % 64,
+        bot: index === 0 ? null : 'moron',
+      })),
+    };
+  }
+
+  it('will not describe a lobby with more seats than a room can have', () => {
+    /*
+     * The count that matters is the one on the WIRE, and a bot is the cheap way
+     * to reach it: seating a person needs a person, while `addBot` is a
+     * four-byte frame. A room that let one of them run would hand every client
+     * an array to allocate and render, so the ceiling is asserted as a step —
+     * the largest legal lobby parses, one more does not — rather than by
+     * repeating the bound.
+     */
+    const largest = MAX_PLAYERS_PER_ROOM;
+    expect(parseServerMessage(JSON.stringify(lobbyOf(largest))).ok).toBe(true);
+    expect(parseServerMessage(JSON.stringify(lobbyOf(largest + 1))).ok).toBe(false);
+    // Nor an absurd one, which is the shape a hostile or broken server sends.
+    expect(parseServerMessage(JSON.stringify(lobbyOf(5000))).ok).toBe(false);
+  });
+
+  it('carries every personality on the roster in both directions', () => {
+    /*
+     * Both directions matter and they are different problems. `addBot` is the
+     * one a lobby SENDS, so a personality missing from the enum is a button the
+     * server refuses; `LobbyPlayer.bot` is the one it RECEIVES, so a
+     * personality missing there is a seat the UI cannot label — "Bob
+     * (Annihilator)" with no way to know it is an Annihilator.
+     */
+    for (const personality of BOT_PERSONALITIES) {
+      const request = parseClientMessage(JSON.stringify({ t: 'addBot', personality }));
+      expect(request.ok, personality).toBe(true);
+      if (request.ok && request.value.t === 'addBot') {
+        expect(request.value.personality).toBe(personality);
+      }
+
+      const lobby = parseServerMessage(
+        encodeServerMessage({
+          t: 'lobby',
+          roomCode: 'ABCD',
+          hostId: 's0',
+          players: [
+            {
+              id: 's0',
+              name: 'Bot',
+              ready: true,
+              connected: true,
+              colorIndex: 0,
+              bot: personality,
+            },
+          ],
+        }),
+      );
+      expect(lobby.ok, personality).toBe(true);
+      if (lobby.ok && lobby.value.t === 'lobby') {
+        expect(lobby.value.players[0]?.bot).toBe(personality);
+      }
+    }
+  });
+
+  it('refuses a lobby seat whose personality is not one the sim has', () => {
+    const frame = lobbyOf(2) as { players: { bot: unknown }[] };
+    (frame.players[1] as { bot: unknown }).bot = 'grandmaster';
+    expect(parseServerMessage(JSON.stringify(frame)).ok).toBe(false);
+  });
+
+  it('keeps "not a bot" expressible two ways, which is what optional buys', () => {
+    /*
+     * `bot` is optional so a client built before computer players existed still
+     * parses a lobby frame from a server that has them — and that only holds if
+     * BOTH spellings survive: absent (an old server, or a frame built without
+     * the field) and explicitly null (this server, saying "a person sits here").
+     * An absent field must also stay absent through the round trip rather than
+     * becoming an `undefined` key, because `JSON.stringify` drops one and the
+     * other is a key a strict consumer can trip over.
+     */
+    const absent = { id: 's1', name: 'Alice', ready: true, connected: true, colorIndex: 0 };
+    const explicit = { ...absent, id: 's2', bot: null };
+
+    const encoded = encodeServerMessage({
+      t: 'lobby',
+      roomCode: 'ABCD',
+      hostId: 's1',
+      players: [absent, explicit],
+    });
+    expect(encoded).not.toMatch(/"bot":undefined/);
+
+    const parsed = parseServerMessage(encoded);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok && parsed.value.t === 'lobby') {
+      expect(Object.hasOwn(parsed.value.players[0] as object, 'bot')).toBe(false);
+      expect(parsed.value.players[1]?.bot).toBeNull();
+    }
+  });
+
+  it('does not let a client assert which seats are machines', () => {
+    // `bot` is a SERVER-frame field. There is no client message carrying it, so
+    // the only way a seat becomes a bot is `addBot`, which the room adjudicates.
+    // A client that decorates its own frames with it changes nothing.
+    const parsed = parseClientMessage('{"t":"ready","ready":true,"bot":"annihilator"}');
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(Object.hasOwn(parsed.value, 'bot')).toBe(false);
   });
 });

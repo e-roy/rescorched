@@ -27,6 +27,26 @@ import { z } from 'zod';
  * their version in the handshake (`hello` / `welcome`) and a mismatch is
  * reported as `bad_protocol` rather than as a generic schema failure — see
  * `describeVersionMismatch`.
+ *
+ * Computer players did NOT bump it, and the reason is worth writing down so the
+ * next additive change does not have to re-derive it. The test for a bump is
+ * "can an older peer still read what this build sends", not "is there anything
+ * new here":
+ *
+ *  - `addBot` / `removeBot` are new members of the CLIENT union. Nothing
+ *    receives a client frame except our own server, and an older server would
+ *    refuse them — but an older server is also an older client, which has no
+ *    way to send one, because these frames exist only behind a button that
+ *    shipped in the same build. Nothing an old peer receives changed.
+ *  - `LobbyPlayer.bot` is a new OPTIONAL field on a server frame. Zod ignores
+ *    keys a schema does not mention, so a pre-bot client parses a lobby frame
+ *    containing it exactly as before and simply does not draw the badge.
+ *
+ * Bumping anyway would not be free: the mismatch is reported as "reload to
+ * update" and every open tab gets thrown out of its room to gain nothing. What
+ * WOULD require a bump is a field an older peer needs and cannot get, or a
+ * change to the meaning of one it already reads. `protocol.test.ts` pins the
+ * additive half of this by round-tripping a lobby frame with and without `bot`.
  */
 export const PROTOCOL_VERSION = 2;
 
@@ -590,6 +610,32 @@ export type WireGameEvent = z.infer<typeof GameEventSchema>;
 export const PlayerRoleSchema = z.enum(['player', 'spectator']);
 export type PlayerRole = z.infer<typeof PlayerRoleSchema>;
 
+/**
+ * The computer players a lobby can seat.
+ *
+ * These are the sim's `BOT_PERSONALITIES` (`packages/sim/src/ai.ts`), copied
+ * rather than imported for the same reason `IMPACT_KINDS` is: the sim must stay
+ * dependency-free in both directions, so the two lists live on either side of
+ * the boundary and `sim-boundary.test.ts` pins them together at compile time
+ * AND by value. A personality the sim does not know would be a room that seats
+ * a bot which then cannot decide anything.
+ *
+ * Closed enum here rather than a loose string, and unlike `ImpactKindSchema`
+ * that is the right call: this one travels client -> server, where strictness
+ * buys real protection. `addBot` names it, so an unknown value must be refused
+ * at the parser rather than turned into a seat.
+ */
+export const BOT_PERSONALITIES = [
+  'moron',
+  'shooter',
+  'tosser',
+  'poolshark',
+  'cyborg',
+  'annihilator',
+] as const;
+export const BotPersonalitySchema = z.enum(BOT_PERSONALITIES);
+export type BotPersonality = z.infer<typeof BotPersonalitySchema>;
+
 // ---------------------------------------------------------------------------
 // Client → Server
 //
@@ -612,6 +658,21 @@ export const ClientMessageSchema = z.discriminatedUnion('t', [
   }),
   z.object({ t: z.literal('ready'), ready: z.boolean() }),
   z.object({ t: z.literal('start') }),
+  /**
+   * Fill a seat with a computer player. Host only, lobby only — the server
+   * enforces both; this is the request, not the permission.
+   *
+   * `personality` is optional so a client can offer "add a bot" without
+   * offering a difficulty picker. The server picks the default when it is left
+   * out, because "which bot is the sensible default" is a game decision and the
+   * wire has no opinion.
+   */
+  z.object({
+    t: z.literal('addBot'),
+    personality: BotPersonalitySchema.optional(),
+  }),
+  /** Free a seat a computer player is sitting in. Host only, lobby only. */
+  z.object({ t: z.literal('removeBot'), playerId: PlayerIdSchema }),
   z.object({
     t: z.literal('aim'),
     angleDeg: AngleSchema,
@@ -647,6 +708,18 @@ export const LobbyPlayerSchema = z.object({
   ready: z.boolean(),
   connected: z.boolean(),
   colorIndex: ColorIndexSchema,
+  /**
+   * Which computer player holds this seat, or absent/null for a person.
+   *
+   * Optional rather than required so a client built before bots existed still
+   * parses a lobby frame from a server that has them — the field simply is not
+   * there for it. Note this is the LOBBY, not the snapshot: `TankSnapshot`
+   * deliberately still has no `bot` field, because `packages/sim`'s
+   * `GameSnapshot` promises to stay structurally identical to
+   * `GameSnapshotSchema` and the personality is persistence, not wire state.
+   * See the note on `PersistedTank` in `packages/sim/src/serialize.ts`.
+   */
+  bot: BotPersonalitySchema.nullable().optional(),
 });
 export type LobbyPlayer = z.infer<typeof LobbyPlayerSchema>;
 

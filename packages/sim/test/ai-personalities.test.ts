@@ -57,6 +57,7 @@ import {
   BOT_PERSONALITIES,
   choosePurchases,
   chooseShot,
+  chooseShotDetailed,
   chooseTarget,
   chooseWeapon,
   type BotPersonality,
@@ -108,7 +109,7 @@ function sweep(personality: BotPersonality): Sample[] {
   for (const state of GAMES) {
     for (const shooter of [0, 1]) {
       const target = 1 - shooter;
-      const decision = chooseShot(state, shooter, undefined, personality);
+      const decision = chooseShot(state, shooter, { personality });
       const trajectory = predictShot(state, shooter, decision.angleDeg, decision.power);
       const tank = state.tanks[target] as Tank;
 
@@ -207,9 +208,28 @@ describe('the difficulty ladder is real and in the right order', () => {
     // terrain generator being retuned underneath it. Measured: the Moron lands
     // 3.0% of its opening shots against the Annihilator's 92.0%, a factor of 31.
     expect(hitRate('moron'), table()).toBeLessThan(hitRate('annihilator') / 10);
-    // And the Annihilator is genuinely near-perfect rather than merely best of
-    // a bad bunch: it puts more than half its opening shots on target.
-    expect(hitRate('annihilator'), table()).toBeGreaterThan(0.5);
+
+    /*
+     * And an absolute anchor under the top of the ladder, close to the measured
+     * 92.0% and 6.5 px rather than a token distance below it.
+     *
+     * This used to read `toBeGreaterThan(0.5)`, on the reasoning that a tight
+     * number would go red whenever the terrain generator was retuned. The
+     * reasoning is right about a hit rate on random maps and wrong about this
+     * one: the sweep is 200 decisions over 100 FIXED seeds through a
+     * deterministic sim, so it cannot flake — it can only notice. And it did
+     * not notice, which is the point. A reviewer deleted the whole refinement
+     * pass (92.0% -> 87.5%) and then turned Newton off (-> 87.0%) and this
+     * assertion sat there being satisfied by both.
+     *
+     * `test/ai-search.test.ts` is what names WHICH stage broke; this is the
+     * backstop for a degradation nobody thought to ablate. Four points of slack
+     * on the hit rate and a third again on the miss: enough that retuning the
+     * terrain or the physics can move things without a red build, tight enough
+     * that losing a stage of the search cannot.
+     */
+    expect(hitRate('annihilator'), table()).toBeGreaterThan(0.88);
+    expect(meanMiss('annihilator'), table()).toBeLessThan(9);
   }, 300_000);
 
   it("has the Moron's aim carry no information about the target at all", () => {
@@ -300,8 +320,8 @@ describe('the Tosser lobs, and that is the whole of its character', () => {
   it('lobs on every single shot rather than on average', () => {
     // "Always" is the claim, so it is asserted over the whole sweep and not
     // over a summary statistic. The flattest shot the Tosser took anywhere in
-    // 200 opening shots is 56.0 degrees; the Shooter's median is 37.9 and its
-    // flattest is 15.5.
+    // 200 opening shots is 56.1 degrees; the Shooter's median is 37.9 and its
+    // flattest is 15.6.
     const flattest = Math.min(...sweep('tosser').map((s) => s.loft));
     expect(flattest, table()).toBeGreaterThan(medianOf('shooter', (s) => s.loft));
     expect(flattest, table()).toBeGreaterThan(
@@ -314,6 +334,246 @@ describe('the Tosser lobs, and that is the whole of its character', () => {
     // up the flat trajectory and gets the ridge in exchange, and it lands its
     // opening shot about as often as the Shooter does (35.5% against 30.5%).
     expect(hitRate('tosser'), table()).toBeGreaterThan(hitRate('moron') + MIN_HIT_GAP);
+  }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
+// Wind
+// ---------------------------------------------------------------------------
+
+/** 60 maps used only for the wind sweep, so the wind can be set by hand. */
+const WIND_MAPS: GameState[] = [];
+for (const style of TERRAIN_STYLES) {
+  for (let seed = 0; seed < 12; seed += 1) {
+    WIND_MAPS.push(
+      createGame(
+        { seed: `wind-${style}-${seed}`, terrainStyle: style, width: WIDTH, height: HEIGHT },
+        [
+          { id: 'a', name: 'A' },
+          { id: 'b', name: 'B' },
+        ],
+      ),
+    );
+  }
+}
+
+/**
+ * Mean pixels the shot ends up displaced IN THE DIRECTION THE WIND BLOWS.
+ *
+ * Signed and folded, so a bot that is simply inaccurate scores zero: symmetric
+ * scatter cancels, and only a systematic push one way survives the average. The
+ * fold by `sign(wind)` also makes it independent of which way the bot is
+ * firing, so left-hand and right-hand seats can be pooled.
+ */
+function downwindDrift(personality: BotPersonality, winds: number[]): number {
+  const drift: number[] = [];
+  for (const wind of winds) {
+    for (const base of WIND_MAPS) {
+      const state: GameState = { ...base, wind };
+      for (const shooter of [0, 1]) {
+        const decision = chooseShot(state, shooter, { personality });
+        const trajectory = predictShot(state, shooter, decision.angleDeg, decision.power);
+        const target = state.tanks[1 - shooter] as Tank;
+        drift.push((trajectory.impact.x - target.x) * Math.sign(wind));
+      }
+    }
+  }
+  return drift.reduce((a, b) => a + b, 0) / drift.length;
+}
+
+describe('the Shooter is blind to the wind, and that is what beats it', () => {
+  /*
+   * `readsWind: false` is the SHOOTER's defining trait and the reason it sits
+   * two rungs below the Cyborg, but the hit-rate ladder cannot show it: plenty
+   * of things would depress a hit rate. The signature of aiming with the wrong
+   * wind model specifically is that the error has a DIRECTION — every shot is
+   * pushed the way the wind is blowing, by an amount that grows with the wind.
+   * An inaccurate bot scatters; a wind-blind one leans.
+   *
+   * Measured mean downwind displacement over 60 maps x both seats x six winds
+   * (240 shots per wind), every tank firing the free Baby Missile:
+   *
+   *     personality    |wind| 3   |wind| 6   |wind| 9   overall
+   *     SHOOTER            27 px      53 px      79 px    53 px
+   *     TOSSER              2 px       8 px       7 px     6 px
+   *     POOLSHARK           5 px      10 px      13 px    10 px
+   *     CYBORG              1 px       5 px      -0 px     2 px
+   *     ANNIHILATOR        -0 px       0 px       2 px     1 px
+   */
+  it('is pushed downwind, and further the harder it blows', () => {
+    const shooter = downwindDrift('shooter', [-9, -6, -3, 3, 6, 9]);
+    const babyMissileRadius = requireWeapon('baby_missile').radius;
+    // Displaced by more than a blast radius is the whole point: it is exactly
+    // the amount that turns a hit into a miss.
+    expect(shooter, `shooter drift ${shooter.toFixed(1)} px`).toBeGreaterThan(babyMissileRadius);
+
+    const gentle = downwindDrift('shooter', [-3, 3]);
+    const gale = downwindDrift('shooter', [-9, 9]);
+    // It scales with the wind. A fixed aiming bias would not.
+    expect(gale, `gentle ${gentle.toFixed(1)} px, gale ${gale.toFixed(1)} px`).toBeGreaterThan(
+      2 * gentle,
+    );
+  }, 300_000);
+
+  it('does not happen to the bots that read the wind', () => {
+    const winds = [-9, -6, -3, 3, 6, 9];
+    const shooter = downwindDrift('shooter', winds);
+    const readers = (['cyborg', 'annihilator'] as BotPersonality[]).map((p) => ({
+      p,
+      drift: downwindDrift(p, winds),
+    }));
+    const summary =
+      `shooter ${shooter.toFixed(1)} px; ` +
+      readers.map((r) => `${r.p} ${r.drift.toFixed(1)} px`).join(', ');
+
+    for (const reader of readers) {
+      // Not merely smaller — an order of magnitude smaller, and below the blast
+      // radius that would make it matter.
+      expect(reader.drift, summary).toBeLessThan(requireWeapon('baby_missile').radius);
+      expect(shooter, summary).toBeGreaterThan(5 * reader.drift);
+    }
+  }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
+// Self-preservation
+// ---------------------------------------------------------------------------
+
+/**
+ * Close-quarters pairs: the same map, seat and wind, differing ONLY in whether
+ * the tank is holding a Baby Nuke (55 px blast) or the free Baby Missile (18).
+ *
+ * Baby Nuke rather than a Nuke because the control has to be able to fire it:
+ * the Tosser's tier cap reaches tier 2 and stops, so a Nuke would leave it
+ * shooting Baby Missiles in both arms and the comparison would be vacuous.
+ */
+const WARHEAD_PAIRS: { big: GameState; small: GameState }[] = [];
+for (const style of TERRAIN_STYLES) {
+  for (let seed = 0; seed < 12; seed += 1) {
+    const base = createGame(
+      { seed: `warhead-${style}-${seed}`, terrainStyle: style, width: WIDTH, height: HEIGHT },
+      [
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+      ],
+    );
+    const middle = ((base.tanks[0] as Tank).x + (base.tanks[1] as Tank).x) / 2;
+    for (const gap of [30, 50, 70, 100]) {
+      for (const wind of [-6, 0, 6]) {
+        const place = (inventory: Record<string, number>): GameState => ({
+          ...base,
+          wind,
+          tanks: base.tanks.map((tank, index) => ({
+            ...tank,
+            x: Math.round(index === 0 ? middle - gap / 2 : middle + gap / 2),
+            inventory,
+          })),
+        });
+        WARHEAD_PAIRS.push({ big: place({ baby_nuke: 9 }), small: place({}) });
+      }
+    }
+  }
+}
+
+/** How often the chosen shot lands inside the shooter's own blast radius. */
+function selfClipRate(personality: BotPersonality, pick: 'big' | 'small'): number {
+  let clipped = 0;
+  for (const pair of WARHEAD_PAIRS) {
+    const state = pair[pick];
+    const decision = chooseShot(state, 0, { personality });
+    const trajectory = predictShot(state, 0, decision.angleDeg, decision.power);
+    const me = state.tanks[0] as Tank;
+    const toSelf = hypot2(
+      trajectory.impact.x - me.x,
+      trajectory.impact.y - (me.y - DEFAULT_WORLD.tankRadius - 2),
+    );
+    if (toSelf < requireWeapon(decision.weapon).radius) clipped += 1;
+  }
+  return clipped / WARHEAD_PAIRS.length;
+}
+
+/** Share of the pairs where the two arms produce a different aim. */
+function aimMovesWithWarhead(personality: BotPersonality): number {
+  let differs = 0;
+  for (const pair of WARHEAD_PAIRS) {
+    const big = chooseShot(pair.big, 0, { personality });
+    const small = chooseShot(pair.small, 0, { personality });
+    if (big.angleDeg !== small.angleDeg || big.power !== small.power) differs += 1;
+  }
+  return differs / WARHEAD_PAIRS.length;
+}
+
+function meanFlights(personality: BotPersonality, pick: 'big' | 'small'): number {
+  let total = 0;
+  for (const pair of WARHEAD_PAIRS) {
+    total += chooseShotDetailed(pair[pick], 0, { personality }).flights;
+  }
+  return total / WARHEAD_PAIRS.length;
+}
+
+describe('the self-preserving bots weigh their own blast', () => {
+  /*
+   * `avoidsSelfHarm` is the one personality knob whose effect cannot be read
+   * off a hit rate, because the bots that have it are also the accurate ones:
+   * at point-blank range the Cyborg lands on its own hull MORE often than the
+   * Shooter does, simply because it is the one that can hit a neighbour 30 px
+   * away. Comparing personalities therefore measures accuracy, not caution.
+   *
+   * What isolates it is holding the geometry fixed and changing only the size
+   * of the warhead. A bot that does not model its own blast cannot even see the
+   * difference — the trajectory does not depend on the weapon — so its decision
+   * is byte-identical. A bot that does model it re-aims.
+   *
+   * Measured over 720 pairs (60 maps x 4 separations from 30 to 100 px x 3
+   * winds), Baby Nuke against Baby Missile:
+   *
+   *     personality   aim differs   flights big/small   self-clip big/small
+   *     TOSSER               0.0%       5.8 / 5.8          50.0% / 30.4%
+   *     CYBORG              21.5%      15.8 / 10.7         42.2% / 30.6%
+   *     ANNIHILATOR         21.5%      15.8 / 10.7         43.3% / 30.4%
+   */
+  it('is a fair fight: the indifferent bot really is holding the bigger blast', () => {
+    // Without this the control below would prove nothing — a Tosser that had
+    // quietly fallen back to the free round would also "not re-aim". Its
+    // self-clip rate jumping from 30% to 50% is the evidence that it is walking
+    // around with a 55 px blast and simply does not care.
+    const big = selfClipRate('tosser', 'big');
+    const small = selfClipRate('tosser', 'small');
+    // Through `chooseShot`'s personality override rather than `chooseWeapon`,
+    // which reads the seat — and these seats are unoccupied by design so that
+    // every personality can be run over the identical states.
+    for (const pair of WARHEAD_PAIRS) {
+      expect(chooseShot(pair.big, 0, { personality: 'tosser' }).weapon).toBe('baby_nuke');
+      expect(chooseShot(pair.small, 0, { personality: 'tosser' }).weapon).toBe('baby_missile');
+    }
+    expect(big, `tosser self-clip big ${big.toFixed(3)} small ${small.toFixed(3)}`).toBeGreaterThan(
+      small + 0.1,
+    );
+  }, 300_000);
+
+  it('leaves a bot that ignores the risk aiming identically whatever it holds', () => {
+    // The control. Byte-identical over every one of the 720 pairs, because the
+    // blast radius reaches the Tosser's scoring nowhere at all.
+    const moved = aimMovesWithWarhead('tosser');
+    expect(moved, `tosser aim moved on ${(100 * moved).toFixed(1)}% of pairs`).toBe(0);
+    expect(meanFlights('tosser', 'big')).toBe(meanFlights('tosser', 'small'));
+  }, 300_000);
+
+  it('has the Cyborg and the Annihilator re-aim when the warhead gets big', () => {
+    for (const personality of ['cyborg', 'annihilator'] as BotPersonality[]) {
+      const moved = aimMovesWithWarhead(personality);
+      const big = meanFlights(personality, 'big');
+      const small = meanFlights(personality, 'small');
+      const summary =
+        `${personality}: aim moved on ${(100 * moved).toFixed(1)}% of pairs, ` +
+        `flights ${big.toFixed(1)} big vs ${small.toFixed(1)} small`;
+
+      // A fifth of the time, holding the bigger round changes the shot.
+      expect(moved, summary).toBeGreaterThan(0.1);
+      // And it costs real search: the bot declines to stop on a hit that would
+      // also land on itself, and goes looking for one that would not.
+      expect(big, summary).toBeGreaterThan(1.25 * small);
+    }
   }, 300_000);
 });
 
@@ -458,6 +718,56 @@ describe('a bot with a full armoury picks the right gun', () => {
     expect(damage('annihilator')).toBeGreaterThanOrEqual(DEFAULT_WORLD.maxHealth);
   });
 
+  it('fires the best gun it actually owns instead of falling back to the free one', () => {
+    /*
+     * The expectation is DERIVED, not written down: ask each personality what
+     * it reaches for with one of everything in stock — whatever that is, it is
+     * inside that personality's tier cap by construction — then take everything
+     * else away and demand it still fires it.
+     *
+     * What this catches is a weapon chooser that picks by tier and damage
+     * without checking the magazine. It would still name a legal weapon, and
+     * the last gate in `legalize` would still hand `fire()` something the tank
+     * owns — the free Baby Missile — so nothing would look broken. The
+     * Annihilator would just quietly stop using the Nuke it went shopping for.
+     */
+    const onlyOwns = (personality: BotPersonality, weaponId: string): GameState => {
+      const base = armed(personality, 100);
+      return {
+        ...base,
+        tanks: base.tanks.map((tank, index) =>
+          index === 0 ? { ...tank, inventory: { [weaponId]: 3 } } : tank,
+        ),
+      };
+    };
+
+    for (const personality of BOT_PERSONALITIES) {
+      const wanted = chooseWeapon(armed(personality, 100), 0);
+      const stripped = onlyOwns(personality, wanted);
+      expect(chooseWeapon(stripped, 0), personality).toBe(wanted);
+      expect(chooseShot(stripped, 0).weapon, personality).toBe(wanted);
+    }
+  });
+
+  it('uses a Missile it owns even when its tier cap would allow far bigger', () => {
+    // The same defect stated the other way round, and the sharper version: the
+    // Cyborg and the Annihilator would rather have a Nuke, cannot have one, and
+    // must therefore fire the Missile in the rack rather than the free round.
+    // The Moron is the control — a tier cap of 0 keeps it on the Baby Missile
+    // whatever is in the rack, which is a rule about the Moron and not a bug.
+    for (const personality of BOT_PERSONALITIES) {
+      const base = armed(personality, 100);
+      const state: GameState = {
+        ...base,
+        tanks: base.tanks.map((tank, index) =>
+          index === 0 ? { ...tank, inventory: { missile: 3 } } : tank,
+        ),
+      };
+      const chosen = chooseShot(state, 0).weapon;
+      expect(chosen, personality).toBe(personality === 'moron' ? 'baby_missile' : 'missile');
+    }
+  });
+
   it('has the Annihilator refuse to spend a Nuke on a tank a free round would kill', () => {
     // The in-play half of "spends its money well". Against a target on 20
     // health the Annihilator drops to the free Baby Missile, which still kills
@@ -499,5 +809,45 @@ describe('a bot with a full armoury picks the right gun', () => {
     expect(chooseTarget(wounded('annihilator'), 0)).toBe(2);
     // And it is not merely a different target on paper: the shot itself differs.
     expect(chooseShot(wounded('cyborg'), 0)).not.toEqual(chooseShot(wounded('annihilator'), 0));
+  });
+
+  it('picks the same target from an override as from the seat', () => {
+    /*
+     * The override is how every sweep in this file runs a personality, so an
+     * override that stops short of any part of the decision means the sweeps
+     * are measuring a hybrid.
+     *
+     * It did. `decide` resolved the brain from the override and then asked
+     * `chooseTarget` to resolve it again from `tank.bot`, so the identical
+     * Annihilator brain shot at seat 2 from an Annihilator chair and at seat 1
+     * from a Cyborg chair or an empty one — while its weapon choice and its aim
+     * honoured the override. Nothing published was wrong, because every sweep
+     * here is either two-tank or uniform-health, where `picksTheKill`
+     * degenerates to "nearest". But it meant `picksTheKill` was never once
+     * exercised by the performance sweep, and the documented measurement API
+     * quietly did something other than what it said.
+     */
+    const board = (seatBot: BotPersonality | null): GameState => {
+      const base = createGame({ seed: 'finish-them', width: WIDTH, height: HEIGHT }, [
+        seatBot === null ? { id: 'a', name: 'A' } : { id: 'a', name: 'A', bot: seatBot },
+        { id: 'b', name: 'B' },
+        { id: 'c', name: 'C' },
+      ]);
+      return {
+        ...base,
+        tanks: base.tanks.map((tank, index) => ({ ...tank, health: index === 2 ? 4 : 100 })),
+      };
+    };
+
+    // The seat says one thing, the override says another. The override wins,
+    // and it wins in every part of the decision.
+    for (const seat of [null, 'cyborg', 'moron'] as (BotPersonality | null)[]) {
+      const state = board(seat);
+      expect(chooseTarget(state, 0, 'annihilator'), `seat ${seat}`).toBe(2);
+      expect(chooseShotDetailed(state, 0, { personality: 'annihilator' }).targetIndex).toBe(2);
+      expect(chooseShot(state, 0, { personality: 'annihilator' })).toEqual(
+        chooseShot(board('annihilator'), 0),
+      );
+    }
   });
 });

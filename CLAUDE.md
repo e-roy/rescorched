@@ -45,6 +45,7 @@ Inside `packages/sim`, files are split by _reason to change_:
 - `detonation.ts` — what a weapon does on impact, and the only place that writes
   `tank.health`.
 - `game.ts` — whose turn it is, when a round ends, who won.
+- `ai.ts` — the computer players: what a bot fires, and what it buys.
 - `economy.ts` — the shop.
 - `serialize.ts` — the single crossing point to plain JSON.
 

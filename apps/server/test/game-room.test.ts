@@ -26,8 +26,11 @@ import { describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION, parseServerMessage, type ServerMessage } from '@scorched/protocol';
 import {
   BABY_MISSILE,
+  chooseShot,
   fire,
   fromPersisted,
+  roundTurnBudget,
+  SUDDEN_DEATH_TURNS,
   type GameSnapshot,
   type PersistedGame,
 } from '@scorched/sim';
@@ -2245,5 +2248,977 @@ describe('persistence', () => {
 
     alice.client.close();
     bob.client.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Computer players
+//
+// The reason this section exists: `packages/sim` grew a whole AI, with a
+// personality table and a measured difficulty ladder, and NOTHING referenced it
+// outside its own tests. A bot seat could not be created, nothing called
+// `chooseShot` when a turn came round, nothing took a bot through the shop —
+// so "a solo human plus one bot is a playable match" was not merely untested,
+// it was unconstructible. These tests are the feature, not the polish.
+// ---------------------------------------------------------------------------
+
+/** Seat one person plus one computer player and start the match. */
+async function soloVersusBot(
+  roomCode: string,
+  personality?: string,
+): Promise<{ alice: Seat; botId: string; snapshot: GameSnapshot }> {
+  const alice = await join(roomCode, 'Alice');
+  send(
+    alice.client.socket,
+    personality === undefined ? { t: 'addBot' } : { t: 'addBot', personality },
+  );
+
+  const lobby = await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+  if (lobby.t !== 'lobby') throw new Error('unreachable');
+  const seat = lobby.players.find((player) => player.bot != null);
+  if (seat === undefined) throw new Error('no computer player was seated');
+
+  send(alice.client.socket, { t: 'start' });
+  const started = await alice.client.next((m) => m.t === 'state');
+  if (started.t !== 'state') throw new Error('unreachable');
+  return { alice, botId: seat.id, snapshot: started.snapshot };
+}
+
+/** The shot the sim says this seat takes, derived from what the room persisted. */
+async function predictedBotShot(
+  roomCode: string,
+): Promise<{ angleDeg: number; power: number; weapon: string; tankIndex: number }> {
+  const game = fromPersisted(await readPersistedGame(roomCode));
+  return { ...chooseShot(game, game.activeTank), tankIndex: game.activeTank };
+}
+
+/** Hand the turn on by firing a throwaway shot. Returns the state it left. */
+async function passTurn(seat: Seat, snapshot: GameSnapshot): Promise<GameSnapshot> {
+  const cursor = seat.client.mark();
+  send(seat.client.socket, {
+    t: 'fire',
+    turnNumber: snapshot.turnNumber,
+    angleDeg: 45,
+    power: 55,
+    weapon: 'baby_missile',
+  });
+  const frame = await seat.client.next((m) => m.t === 'events', cursor);
+  if (frame.t !== 'events') throw new Error('unreachable');
+  return frame.snapshot;
+}
+
+/**
+ * A match in which every seat is a computer player, watched by a spectator and
+ * played by nobody.
+ *
+ * The last step is white-box and deliberately so. There is no wire message for
+ * "hand my chair to a machine" and there should not be — a room is opened by a
+ * person and `addBot` fills the other chairs. What the ROOM has to survive is
+ * the resulting STATE: a board on which nothing is waiting for a socket. That
+ * state is one field away from a lobby anybody can build, and reaching it
+ * honestly would mean playing a human seat to death and then keeping it dead
+ * across a round boundary, which `startNextRound` correctly refuses to do.
+ *
+ * `personalities[0]` is the brain the opening seat is handed; the rest arrive
+ * through `addBot` like any other. The host's socket is closed on the way out,
+ * so what comes back is a room with an audience and no players in it at all.
+ */
+async function allBotMatch(
+  roomCode: string,
+  personalities: readonly [string, ...string[]],
+): Promise<{ viewer: Seat; botCount: number }> {
+  const alice = await join(roomCode, 'Alice');
+  const [hostBrain, ...added] = personalities;
+
+  for (let index = 0; index < added.length; index += 1) {
+    send(alice.client.socket, { t: 'addBot', personality: added[index] });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === index + 2);
+  }
+  send(alice.client.socket, { t: 'start' });
+  await alice.client.next((m) => m.t === 'state');
+
+  await editPersistedGame(roomCode, (game) => ({
+    ...game,
+    tanks: game.tanks.map((tank) =>
+      tank.bot === null
+        ? { ...tank, bot: hostBrain as PersistedGame['tanks'][number]['bot'] }
+        : tank,
+    ),
+  }));
+
+  const viewer = await join(roomCode, 'Viewer', { role: 'spectator' });
+  alice.client.close();
+  await waitForSocketCount(roomCode, 1);
+  return { viewer, botCount: personalities.length };
+}
+
+/**
+ * The room's own seat table.
+ *
+ * A refusal is only a refusal if the seat is still there afterwards: a `lobby`
+ * frame that never arrives proves nothing, and `info` counts seats without
+ * saying which of them are machines.
+ */
+async function readSeats(roomCode: string): Promise<{ id: string; bot: string | null }[]> {
+  const raw = await runInDurableObject(stub(roomCode), (_instance, state) => {
+    const rows = state.storage.sql
+      .exec<{ v: string }>('SELECT v FROM kv WHERE k = ?', 'players')
+      .toArray();
+    return rows[0]?.v ?? '[]';
+  });
+  return (JSON.parse(raw) as { id: string; bot?: string | null }[]).map((player) => ({
+    id: player.id,
+    bot: player.bot ?? null,
+  }));
+}
+
+/** Who the room believes is host. Null until a seated player is connected. */
+async function readHostId(roomCode: string): Promise<string | null> {
+  const raw = await runInDurableObject(stub(roomCode), (_instance, state) => {
+    const rows = state.storage.sql
+      .exec<{ v: string }>('SELECT v FROM kv WHERE k = ?', 'meta')
+      .toArray();
+    return rows[0]?.v;
+  });
+  return raw === undefined ? null : ((JSON.parse(raw) as { hostId: string | null }).hostId ?? null);
+}
+
+/** Rewrite the room's small clock row — the only way to move a deadline. */
+async function editTurnRow(
+  roomCode: string,
+  edit: (turn: Record<string, unknown>) => Record<string, unknown>,
+): Promise<void> {
+  await runInDurableObject(stub(roomCode), (_instance, state) => {
+    const rows = state.storage.sql
+      .exec<{ v: string }>('SELECT v FROM kv WHERE k = ?', 'turn')
+      .toArray();
+    const raw = rows[0]?.v;
+    if (raw === undefined) throw new Error('no turn row to edit');
+    state.storage.sql.exec(
+      'INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v',
+      'turn',
+      JSON.stringify(edit(JSON.parse(raw) as Record<string, unknown>)),
+    );
+  });
+}
+
+describe('computer players', () => {
+  it('lets one person start a match, which is the whole point of them', async () => {
+    const room = 'BOTA';
+    const { alice, botId, snapshot } = await soloVersusBot(room);
+
+    expect(snapshot.tanks).toHaveLength(2);
+    expect(snapshot.tanks.map((tank) => tank.id)).toContain(botId);
+    // The bot is a seat like any other as far as the room is concerned.
+    const room_info = await info(room);
+    expect(room_info.players).toBe(2);
+    expect(room_info.inProgress).toBe(true);
+
+    // …and the personality reached the sim, which is the part that matters: a
+    // seat labelled "Shooter" that the sim believes is a human never takes a
+    // turn, and the lobby would look right the whole time.
+    const persisted = await readPersistedGame(room);
+    expect(persisted.tanks.find((tank) => tank.id === botId)?.bot).toBe('shooter');
+    expect(persisted.tanks.find((tank) => tank.id === alice.id)?.bot).toBe(null);
+
+    alice.client.close();
+  });
+
+  it('honours the personality the lobby asked for', async () => {
+    const room = 'BOTB';
+    const { alice, botId } = await soloVersusBot(room, 'annihilator');
+    const persisted = await readPersistedGame(room);
+    expect(persisted.tanks.find((tank) => tank.id === botId)?.bot).toBe('annihilator');
+    alice.client.close();
+  });
+
+  it('takes its turn, and fires exactly what the sim decided', async () => {
+    const room = 'BOTC';
+    const { alice, botId, snapshot } = await soloVersusBot(room, 'cyborg');
+
+    // Whoever the sim put first, get the turn to the bot.
+    if (snapshot.tanks[snapshot.activeTank]?.id !== botId) await passTurn(alice, snapshot);
+
+    const before = await readPersistedGame(room);
+    expect(before.tanks[before.activeTank]?.id).toBe(botId);
+    // Derived from the room's own storage by the same pure function the room is
+    // about to call. If the room aimed by any other means, this is where it
+    // shows up.
+    const expected = await predictedBotShot(room);
+
+    const cursor = alice.client.mark();
+    expect(await runDurableObjectAlarm(stub(room)), 'the bot should have an alarm').toBe(true);
+    const frame = await alice.client.next((m) => m.t === 'events', cursor);
+    if (frame.t !== 'events') throw new Error('unreachable');
+
+    const shot = frame.events.find((event) => event.type === 'shot');
+    expect(shot?.type === 'shot' ? shot.tankIndex : null).toBe(expected.tankIndex);
+    expect(shot?.type === 'shot' ? shot.weapon : null).toBe(expected.weapon);
+
+    // `fire()` writes the aim it resolved back onto the tank, so the snapshot
+    // carries the exact numbers — to the last bit, not to a tolerance.
+    const tank = frame.snapshot.tanks[expected.tankIndex];
+    expect(tank?.angleDeg).toBe(expected.angleDeg);
+    expect(tank?.power).toBe(expected.power);
+    // And the match moved on: the turn came back to the human.
+    expect(frame.snapshot.turnNumber).toBe(before.turnNumber + 1);
+    expect(frame.snapshot.tanks[frame.snapshot.activeTank]?.id).toBe(alice.id);
+
+    alice.client.close();
+  });
+
+  it('schedules a bot turn long before the clock that would take it away', async () => {
+    /*
+     * A bot does not need thinking time, so the alarm on its turn is pacing —
+     * long enough for a human to see whose turn it is and for the client to
+     * finish animating the last shot, and nothing like the 60 seconds a person
+     * gets. The pair of assertions is the point: on the bot's turn the alarm is
+     * far earlier than the deadline, and on the human's turn it IS the deadline.
+     *
+     * Stated as a relationship rather than as the constant, because a test that
+     * repeated `BOT_TURN_DELAY_MS` would pass whatever the room scheduled.
+     */
+    const room = 'BOTP';
+    const { alice, botId, snapshot } = await soloVersusBot(room, 'shooter');
+    if (snapshot.tanks[snapshot.activeTank]?.id !== botId) await passTurn(alice, snapshot);
+
+    const persisted = await readPersistedGame(room);
+    expect(persisted.tanks[persisted.activeTank]?.id, 'the bot should be up').toBe(botId);
+
+    const botAlarm = await runInDurableObject(stub(room), (_instance, state) =>
+      state.storage.getAlarm(),
+    );
+    const botTurn = await readTurnRow(room);
+    expect(botAlarm).not.toBeNull();
+    expect(botTurn.deadlineAt).not.toBeNull();
+    // Not merely earlier — most of a turn clock earlier.
+    expect((botTurn.deadlineAt as number) - (botAlarm as number)).toBeGreaterThan(
+      TURN_TIMEOUT_MS / 2,
+    );
+
+    // Now hand the turn back to the human and look again: the alarm is the
+    // turn clock itself, exactly as it was before bots existed.
+    await runDurableObjectAlarm(stub(room));
+    await alice.client.next((m) => m.t === 'events');
+    const humanAlarm = await runInDurableObject(stub(room), (_instance, state) =>
+      state.storage.getAlarm(),
+    );
+    const humanTurn = await readTurnRow(room);
+    expect(humanAlarm).toBe(humanTurn.deadlineAt);
+
+    alice.client.close();
+  });
+
+  it('takes the same turn after the object has been evicted mid-turn', async () => {
+    /*
+     * The hibernation case, and the reason `chooseShot` is a pure function of
+     * persisted state rather than something the room works out and remembers.
+     *
+     * A bot's turn is a gap between invocations by construction: the room
+     * commits the previous turn, arms the alarm, and can be evicted while the
+     * delay runs. What wakes up remembers nothing. So the decision is taken
+     * from SQLite, and the shot has to be the one predicted from the state as
+     * it stood BEFORE the eviction.
+     */
+    const room = 'BOTD';
+    const { alice, botId, snapshot } = await soloVersusBot(room, 'annihilator');
+
+    if (snapshot.tanks[snapshot.activeTank]?.id !== botId) await passTurn(alice, snapshot);
+
+    const expected = await predictedBotShot(room);
+    const before = await readPersistedGame(room);
+
+    // Nothing in memory survives this.
+    await evictDurableObject(stub(room));
+
+    const cursor = alice.client.mark();
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const frame = await alice.client.next((m) => m.t === 'events', cursor);
+    if (frame.t !== 'events') throw new Error('unreachable');
+
+    const tank = frame.snapshot.tanks[expected.tankIndex];
+    expect(tank?.angleDeg).toBe(expected.angleDeg);
+    expect(tank?.power).toBe(expected.power);
+    expect(frame.snapshot.turnNumber).toBe(before.turnNumber + 1);
+
+    alice.client.close();
+  });
+
+  it('shops between rounds without anybody driving it', async () => {
+    const room = 'BOTE';
+    const { alice, botId } = await soloVersusBot(room, 'annihilator');
+
+    /*
+     * Put the match one shot away from the end of the round: the human's tank
+     * is out, so whatever the bot fires, `fire()` finds one tank standing and
+     * closes the round. That is the honest way to reach the shop from here —
+     * the alternative is scripting a kill, which makes this a test about aiming.
+     */
+    await editPersistedGame(room, (game) => {
+      const botIndex = game.tanks.findIndex((tank) => tank.id === botId);
+      return {
+        ...game,
+        phase: 'aiming',
+        activeTank: botIndex,
+        tanks: game.tanks.map((tank) =>
+          tank.id === botId ? tank : { ...tank, alive: false, health: 0 },
+        ),
+      };
+    });
+
+    const beforeMoney = (await readPersistedGame(room)).tanks.find((tank) => tank.id === botId)
+      ?.money as number;
+
+    const cursor = alice.client.mark();
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    await alice.client.next((m) => m.t === 'events', cursor);
+
+    const after = await readPersistedGame(room);
+    const bot = after.tanks.find((tank) => tank.id === botId);
+    expect(after.phase).toBe('shopping');
+    // It bought something, and it paid for it.
+    expect(Object.keys(bot?.inventory ?? {}).length).toBeGreaterThan(0);
+    expect(bot?.money as number).toBeLessThan(beforeMoney);
+    // And it is out of the shop, so the room is waiting for the human alone
+    // rather than for a seat that is never going to press a button.
+    expect(after.pendingShoppers).not.toContain(botId);
+    expect(after.pendingShoppers).toContain(alice.id);
+
+    alice.client.close();
+  });
+
+  it('keeps playing the round out once the last human is out of it', async () => {
+    // A dead human and two bots: nobody is left to send a frame, and the match
+    // still has to finish. It does, on the alarm, one turn at a time.
+    const room = 'BOTF';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot', personality: 'cyborg' });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+    send(alice.client.socket, { t: 'addBot', personality: 'tosser' });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === 3);
+    send(alice.client.socket, { t: 'start' });
+    await alice.client.next((m) => m.t === 'state');
+
+    await editPersistedGame(room, (game) => {
+      const first = game.tanks.find((tank) => tank.bot != null);
+      if (first === undefined) throw new Error('no bots seated');
+      return {
+        ...game,
+        phase: 'aiming',
+        activeTank: game.tanks.indexOf(first),
+        tanks: game.tanks.map((tank) =>
+          tank.id === alice.id ? { ...tank, alive: false, health: 0 } : tank,
+        ),
+      };
+    });
+
+    const start = (await readPersistedGame(room)).turnNumber;
+    for (let turn = 0; turn < 3; turn += 1) {
+      const cursor = alice.client.mark();
+      if (!(await runDurableObjectAlarm(stub(room)))) break;
+      await alice.client.next((m) => m.t === 'events' || m.t === 'error', cursor);
+      if ((await readPersistedGame(room)).phase !== 'aiming') break;
+    }
+
+    const after = await readPersistedGame(room);
+    // Turns were played — or the round ended early because one of them landed
+    // a hit, which is also the match progressing without a human in it.
+    expect(after.turnNumber > start || after.phase !== 'aiming').toBe(true);
+
+    alice.client.close();
+  });
+
+  it('refuses a computer player to anyone who is not the host', async () => {
+    const room = 'BOTG';
+    const alice = await join(room, 'Alice');
+    const bob = await join(room, 'Bob');
+
+    send(bob.client.socket, { t: 'addBot' });
+    const error = await bob.client.next((m) => m.t === 'error');
+    expect(error.t === 'error' && error.code).toBe('not_host');
+    expect((await info(room)).players).toBe(2);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('refuses a computer player once the match has started', async () => {
+    const room = 'BOTH';
+    const { alice } = await soloVersusBot(room);
+    const cursor = alice.client.mark();
+    send(alice.client.socket, { t: 'addBot' });
+    const error = await alice.client.next((m) => m.t === 'error', cursor);
+    expect(error.t === 'error' && error.code).toBe('wrong_phase');
+    alice.client.close();
+  });
+
+  it('refuses a computer player when every seat is taken', async () => {
+    const room = 'BOTI';
+    const alice = await join(room, 'Alice');
+    for (let seat = 1; seat < MAX_PLAYERS; seat += 1) {
+      send(alice.client.socket, { t: 'addBot' });
+      await alice.client.next((m) => m.t === 'lobby' && m.players.length === seat + 1);
+    }
+    expect((await info(room)).players).toBe(MAX_PLAYERS);
+
+    const cursor = alice.client.mark();
+    send(alice.client.socket, { t: 'addBot' });
+    const error = await alice.client.next((m) => m.t === 'error', cursor);
+    expect(error.t === 'error' && error.code).toBe('room_full');
+
+    alice.client.close();
+  });
+
+  it('gives every computer player a name and a colour of its own', async () => {
+    const room = 'BOTJ';
+    const alice = await join(room, 'Alice');
+    for (let seat = 1; seat <= 3; seat += 1) {
+      send(alice.client.socket, { t: 'addBot', personality: 'moron' });
+      await alice.client.next((m) => m.t === 'lobby' && m.players.length === seat + 1);
+    }
+    const lobby = await alice.client.next((m) => m.t === 'lobby' && m.players.length === 4);
+    if (lobby.t !== 'lobby') throw new Error('unreachable');
+
+    // Three Morons, three different names — a scoreboard with three identical
+    // rows is unreadable, and the wire caps a name at 16 characters so the
+    // numbering has to fit.
+    const names = lobby.players.map((player) => player.name);
+    expect(new Set(names).size).toBe(names.length);
+    const colors = lobby.players.map((player) => player.colorIndex);
+    expect(new Set(colors).size).toBe(colors.length);
+    // The lobby says which seats are machines, which is what a UI needs to
+    // draw them differently.
+    expect(lobby.players.filter((player) => player.bot === 'moron')).toHaveLength(3);
+    expect(lobby.players.find((player) => player.id === alice.id)?.bot ?? null).toBe(null);
+
+    alice.client.close();
+  });
+
+  it('takes a computer player back out of the lobby', async () => {
+    const room = 'BOTK';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot' });
+    const lobby = await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+    if (lobby.t !== 'lobby') throw new Error('unreachable');
+    const botId = lobby.players.find((player) => player.bot != null)?.id as string;
+
+    send(alice.client.socket, { t: 'removeBot', playerId: botId });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === 1);
+    expect((await info(room)).players).toBe(1);
+
+    alice.client.close();
+  });
+
+  it('will not let removeBot be used to throw a person out', async () => {
+    const room = 'BOTL';
+    const alice = await join(room, 'Alice');
+    const bob = await join(room, 'Bob');
+
+    const cursor = alice.client.mark();
+    send(alice.client.socket, { t: 'removeBot', playerId: bob.id });
+    const error = await alice.client.next((m) => m.t === 'error', cursor);
+    expect(error.t === 'error' && error.code).toBe('unknown_player');
+    expect((await info(room)).players).toBe(2);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('refuses a personality that does not exist, at the parser', async () => {
+    const room = 'BOTM';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot', personality: 'grandmaster' });
+    const error = await alice.client.next((m) => m.t === 'error');
+    expect(error.t === 'error' && error.code).toBe('bad_message');
+    expect((await info(room)).players).toBe(1);
+    alice.client.close();
+  });
+
+  it('clears the computer players out when the last person leaves the lobby', async () => {
+    const room = 'BOTN';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot' });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+
+    alice.client.close();
+    await waitForSocketCount(room, 0);
+    // Not "one seat left holding a Shooter": an empty room for whoever walks in
+    // next.
+    expect((await info(room)).players).toBe(0);
+  });
+
+  it('never puts a computer player credential on the wire', async () => {
+    // A bot seat carries a secret like any other seat, and it goes nowhere —
+    // seeing it is the only thing that would let a client claim the seat. So
+    // the whole conversation is searched for it.
+    const room = 'BOTO';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot' });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+
+    const secrets = await runInDurableObject(stub(room), (_instance, state) => {
+      const rows = state.storage.sql
+        .exec<{ v: string }>('SELECT v FROM kv WHERE k = ?', 'players')
+        .toArray();
+      const players = JSON.parse(rows[0]?.v ?? '[]') as { secret: string; bot: string | null }[];
+      return players.filter((player) => player.bot !== null).map((player) => player.secret);
+    });
+    expect(secrets).toHaveLength(1);
+
+    const traffic = JSON.stringify(alice.client.all());
+    for (const secret of secrets) expect(traffic).not.toContain(secret);
+
+    alice.client.close();
+  });
+
+  it('fires with nobody sending anything, and every client sees the same frame', async () => {
+    /*
+     * The determinism claim, tested where it is actually load-bearing.
+     *
+     * Every client renders by replaying the authoritative event stream, so two
+     * clients that receive different bytes for the same turn will draw
+     * different craters and eventually disagree about who died. A bot's turn is
+     * the interesting case because nobody TYPED it: the frame is built from a
+     * decision the room made on its own, and if that decision were computed
+     * per-socket, or re-derived once per send, this is where it would show.
+     *
+     * So the whole frame is compared, not the shot — the events AND the
+     * authoritative snapshot inside them, heightmap column for heightmap
+     * column, after both ends have parsed it.
+     */
+    const room = 'BOTQ';
+    const alice = await join(room, 'Alice');
+    const bob = await join(room, 'Bob');
+    send(alice.client.socket, { t: 'addBot', personality: 'cyborg' });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === 3);
+    send(alice.client.socket, { t: 'start' });
+    const started = await bob.client.next((m) => m.t === 'state');
+    if (started.t !== 'state') throw new Error('unreachable');
+    await alice.client.next((m) => m.t === 'state');
+
+    // Whoever the seed put first, walk the turn round to the machine.
+    const humans = [alice, bob];
+    let snapshot = started.snapshot;
+    while (humans.some((seat) => seat.id === snapshot.tanks[snapshot.activeTank]?.id)) {
+      snapshot = await passTurn(activeSeat(humans, snapshot), snapshot);
+    }
+
+    // Nothing is sent from here on. The only thing that happens is the clock.
+    // Both clients are asked for the frame BY TURN NUMBER rather than by a
+    // cursor: the two sockets are real and deliver independently, so "the next
+    // frame Bob happens to have" is not necessarily the same turn as Alice's.
+    const botTurn = snapshot.turnNumber;
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+
+    const seen = await alice.client.next((m) => m.t === 'events' && m.turnNumber === botTurn);
+    const alsoSeen = await bob.client.next((m) => m.t === 'events' && m.turnNumber === botTurn);
+    expect(seen).toEqual(alsoSeen);
+
+    if (seen.t !== 'events') throw new Error('unreachable');
+    const shot = seen.events.find((event) => event.type === 'shot');
+    expect(shot, 'the bot should have fired').toBeDefined();
+    // …and it really was the machine's turn that got played.
+    expect(shot?.type === 'shot' ? shot.tankIndex : null).toBe(snapshot.activeTank);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('refuses to take a computer player out once the match has started', async () => {
+    // The mirror of the `addBot` refusal, and the more dangerous one: the seat
+    // already holds a tank, an inventory and a wallet, and the sim indexes
+    // tanks by position. Removing one mid-match would not free a chair, it
+    // would renumber the board underneath every client's replay.
+    const room = 'BOTR';
+    const { alice, botId } = await soloVersusBot(room);
+
+    const cursor = alice.client.mark();
+    send(alice.client.socket, { t: 'removeBot', playerId: botId });
+    const error = await alice.client.next((m) => m.t === 'error', cursor);
+    expect(error.t === 'error' && error.code).toBe('wrong_phase');
+
+    expect((await readPersistedGame(room)).tanks.map((tank) => tank.id)).toContain(botId);
+    expect((await info(room)).players).toBe(2);
+
+    alice.client.close();
+  });
+
+  it('never lets the turn clock take a computer player’s turn away', async () => {
+    /*
+     * "A bot must never be starved by the turn timer."
+     *
+     * The turn row still carries the ordinary 60 second deadline on a bot's
+     * turn — the bot is simply scheduled to fire long before it — so the
+     * failure mode is not hypothetical: get the ordering wrong in `alarm()`
+     * and a wake-up that arrives after the deadline fires a canned Baby
+     * Missile on the bot's behalf and calls it a timeout. Here the deadline is
+     * wound into the past first, so the alarm lands at exactly the moment a
+     * human in that seat would have lost the turn.
+     */
+    const room = 'BOTS';
+    const { alice, botId, snapshot } = await soloVersusBot(room, 'annihilator');
+    if (snapshot.tanks[snapshot.activeTank]?.id !== botId) await passTurn(alice, snapshot);
+
+    const expected = await predictedBotShot(room);
+    await editTurnRow(room, (turn) => ({ ...turn, deadlineAt: Date.now() - 1 }));
+
+    const cursor = alice.client.mark();
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const frame = await alice.client.next((m) => m.t === 'events', cursor);
+    if (frame.t !== 'events') throw new Error('unreachable');
+
+    // No timeout was declared, and the shot is the one the AI chose rather than
+    // the stored-aim Baby Missile the clock fires for an absent human.
+    expect(frame.events.some((event) => event.type === 'timeout')).toBe(false);
+    const tank = frame.snapshot.tanks[expected.tankIndex];
+    expect(tank?.angleDeg).toBe(expected.angleDeg);
+    expect(tank?.power).toBe(expected.power);
+    // …and the room is not one turn closer to giving up on the match.
+    expect((await readTurnRow(room)).timeoutStreak).toBe(0);
+
+    alice.client.close();
+  });
+
+  it('plays a match of nothing but bots through to a winner, and then stops', async () => {
+    /*
+     * The end state of this feature: a board with no human seat on it at all,
+     * nobody connected who could take a turn, and a match that finishes
+     * anyway — then stops, rather than waking the room for the rest of time.
+     *
+     * "Nobody connected who could take a turn" is the honest version of
+     * "without a human connected". A spectator is watching, because a match
+     * playing to a genuinely empty room is duration nobody asked for and the
+     * room deliberately refuses it — the test below this one pins that half.
+     *
+     * The loop is bounded by the sim's OWN guarantee rather than by a number
+     * picked here: a round lasts `roundTurnBudget` turns before sudden death
+     * and at most `SUDDEN_DEATH_TURNS` after it, so a whole match cannot need
+     * more alarms than that times the rounds. Exceeding it is the "runs
+     * forever" failure, and it fails as a timeout in this loop rather than as
+     * a hung suite.
+     */
+    const room = 'BOTV';
+    const { viewer } = await allBotMatch(room, ['annihilator', 'annihilator']);
+
+    const opening = await readPersistedGame(room);
+    const ceiling =
+      opening.totalRounds * (roundTurnBudget(opening.tanks.length) + SUDDEN_DEATH_TURNS);
+
+    let alarms = 0;
+    let phase = opening.phase;
+    while (phase !== 'gameover' && alarms <= ceiling) {
+      if (!(await runDurableObjectAlarm(stub(room)))) break;
+      alarms += 1;
+      phase = (await readPersistedGame(room)).phase;
+    }
+
+    const finished = await readPersistedGame(room);
+    expect(finished.phase, `still ${finished.phase} after ${alarms} alarms`).toBe('gameover');
+    expect(alarms).toBeLessThanOrEqual(ceiling);
+    // A winner, and it is one of the machines that played.
+    expect(finished.tanks.map((tank) => tank.id)).toContain(finished.winnerId);
+    // The whole match, not one round: it ran the distance it was created for.
+    expect(finished.round).toBe(finished.totalRounds);
+
+    // …and now it stops. No alarm left, nothing to wake for.
+    expect(
+      await runInDurableObject(stub(room), (_instance, state) => state.storage.getAlarm()),
+    ).toBeNull();
+    expect(await runDurableObjectAlarm(stub(room))).toBe(false);
+
+    // The audience was told how it ended, having sent nothing since `hello`.
+    const result = await viewer.client.next((m) => m.t === 'matchResult');
+    expect(result.t === 'matchResult' ? result.winnerId : null).toBe(finished.winnerId);
+    // …and it saw every turn, one frame each: no turn was resolved silently
+    // and none was sent twice.
+    expect(viewer.client.all().filter((message) => message.t === 'events').length).toBe(alarms);
+
+    viewer.client.close();
+  }, 60_000);
+
+  it('leaves an all-bot match asleep until there is somebody to watch it', async () => {
+    /*
+     * The other half of "does not run forever", and the one that costs money if
+     * it is wrong. A Durable Object with a live alarm is a Durable Object that
+     * wakes up; a room of computer players duelling in front of nobody would
+     * wake every second and a half until one of them won, for an audience of
+     * nobody. So with zero connections the alarm fires once, does nothing, and
+     * is not replaced.
+     *
+     * It has to be resumable by whoever turns up, and here that is not the same
+     * thing as "whoever comes back to their seat": in a match whose every seat
+     * is a machine there is no seat to come back to. A spectator is the only
+     * arrival there can be, so a spectator has to be enough.
+     */
+    const room = 'BOTW';
+    const { viewer } = await allBotMatch(room, ['cyborg', 'cyborg']);
+    viewer.client.close();
+    await waitForSocketCount(room, 0);
+
+    const before = await readPersistedGame(room);
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const idle = await readPersistedGame(room);
+    expect(idle.turnNumber).toBe(before.turnNumber);
+    expect(
+      await runInDurableObject(stub(room), (_instance, state) => state.storage.getAlarm()),
+    ).toBeNull();
+
+    // Somebody arrives to watch. That is enough for the match to pick up again,
+    // because the seat that is up needs no socket of its own.
+    const audience = await join(room, 'Audience', { role: 'spectator' });
+    expect(
+      await runInDurableObject(stub(room), (_instance, state) => state.storage.getAlarm()),
+    ).not.toBeNull();
+
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const frame = await audience.client.next((m) => m.t === 'events');
+    if (frame.t !== 'events') throw new Error('unreachable');
+    expect(frame.snapshot.turnNumber).toBe(before.turnNumber + 1);
+
+    audience.client.close();
+  });
+
+  it('does not restart a person’s clock for somebody who is only watching', async () => {
+    /*
+     * The narrow half of the rule above, and the reason the spectator's clock
+     * restart is qualified rather than unconditional.
+     *
+     * A spectator arriving makes a MACHINE's turn playable, because a machine
+     * needs no socket. It makes a PERSON's turn no more playable than it was —
+     * so waking the room would only take that person's turn away on the say-so
+     * of somebody who cannot play it, and would put the standing cost of an
+     * abandoned room back exactly where hibernation removed it.
+     */
+    const room = 'BOTZ';
+    const { alice, bob } = await twoPlayerMatch(room);
+    alice.client.close();
+    bob.client.close();
+    await waitForSocketCount(room, 0);
+
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    expect(
+      await runInDurableObject(stub(room), (_instance, state) => state.storage.getAlarm()),
+    ).toBeNull();
+
+    const audience = await join(room, 'Audience', { role: 'spectator' });
+    expect(
+      await runInDurableObject(stub(room), (_instance, state) => state.storage.getAlarm()),
+      'an audience cannot take an absent player’s turn, so it must not restart their clock',
+    ).toBeNull();
+
+    audience.client.close();
+  });
+
+  it('never keeps a lobby waiting on a computer player', async () => {
+    /*
+     * A seat with no socket behind it has to be shown as one nobody is waiting
+     * for, and both halves of that are things the room asserts rather than
+     * things that fall out.
+     *
+     * `ready` is stored: a bot that seats itself un-ready is a lobby with a
+     * Start button that looks premature and a machine that will never press
+     * anything. `connected` is derived: a bot has no connection, so the honest
+     * lookup returns false and the lobby draws it greyed out like a player who
+     * has walked away — a lie about a seat that is about to take its turn.
+     *
+     * There was a version of this file with neither asserted. Both are single
+     * lines in the room and neither had anything to lose.
+     */
+    const room = 'BOTX';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot', personality: 'annihilator' });
+    send(alice.client.socket, { t: 'addBot', personality: 'moron' });
+
+    const lobby = await alice.client.next((m) => m.t === 'lobby' && m.players.length === 3);
+    if (lobby.t !== 'lobby') throw new Error('unreachable');
+
+    const bots = lobby.players.filter((player) => player.bot != null);
+    expect(bots).toHaveLength(2);
+    for (const bot of bots) {
+      expect(bot.ready, `${bot.name} should never be the reason a lobby waits`).toBe(true);
+      expect(bot.connected, `${bot.name} has no socket to be disconnected from`).toBe(true);
+    }
+    // The person is untouched by any of that: a human is ready when they say so.
+    expect(lobby.players.find((player) => player.id === alice.id)?.ready).toBe(false);
+
+    alice.client.close();
+  });
+
+  it('does not hand a computer player a name a person is already using', async () => {
+    // Names are what the lobby and the scoreboard are read by, so a bot that
+    // takes a person's name makes both ambiguous — and "Shooter" is exactly the
+    // name somebody types on purpose.
+    const room = 'BOTY';
+    const alice = await join(room, 'Shooter');
+    send(alice.client.socket, { t: 'addBot', personality: 'shooter' });
+
+    const lobby = await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+    if (lobby.t !== 'lobby') throw new Error('unreachable');
+    const bot = lobby.players.find((player) => player.bot != null);
+    expect(bot?.name).not.toBe('Shooter');
+    expect(new Set(lobby.players.map((player) => player.name)).size).toBe(2);
+    // The frame parsed, so the name it chose is a legal one — the numbering has
+    // to stay inside `PlayerNameSchema`'s 16 characters, not merely be unique.
+
+    alice.client.close();
+  });
+
+  it('does not mistake the shop for a computer player’s turn when a bot ends the round', async () => {
+    /*
+     * The round-ending bot shot, which is the one moment "whose turn is it"
+     * and "which seat is active" stop meaning the same thing.
+     *
+     * `endRound` does not move `activeTank` — it has no reason to; the next
+     * round reseats everyone. So the instant a computer player fires the shot
+     * that wins a round, the room is in `shopping` with a MACHINE still sitting
+     * in the active slot. Every question the room asks about whether a bot is
+     * up therefore has to ask the PHASE as well as the seat, and it is asked
+     * twice on this path: once when the clock is armed, once when it fires.
+     *
+     * Answer it on the seat alone and the room arms the short pause it puts in
+     * front of a bot's shot instead of the shop clock, wakes a second later,
+     * asks `fire()` to shoot during `shopping`, catches the refusal and
+     * abandons the match. What the player sees is being thrown out of a match
+     * they have just won a round of, with nothing on screen having gone wrong.
+     *
+     * Reached the same way as the shopping test above: the human is already
+     * out, so whatever the bot fires ends the round. Nothing here scripts a
+     * kill — the bot aims for itself, as always.
+     */
+    const room = 'BOTT';
+    const { alice, botId } = await soloVersusBot(room, 'annihilator');
+
+    await editPersistedGame(room, (game) => {
+      const botIndex = game.tanks.findIndex((tank) => tank.id === botId);
+      return {
+        ...game,
+        phase: 'aiming',
+        activeTank: botIndex,
+        tanks: game.tanks.map((tank) =>
+          tank.id === botId ? tank : { ...tank, alive: false, health: 0 },
+        ),
+      };
+    });
+
+    const cursor = alice.client.mark();
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const won = await alice.client.next((m) => m.t === 'events', cursor);
+    if (won.t !== 'events') throw new Error('unreachable');
+    expect(won.events.some((event) => event.type === 'roundEnd')).toBe(true);
+
+    // The setup this test is about: shopping, with a machine still active.
+    const shopping = await readPersistedGame(room);
+    expect(shopping.phase).toBe('shopping');
+    expect(shopping.tanks[shopping.activeTank]?.id, 'the winning shot leaves a bot active').toBe(
+      botId,
+    );
+    expect(shopping.pendingShoppers, 'the room is waiting for the person').toContain(alice.id);
+
+    /*
+     * First consequence: which clock the room armed. In a phase no machine is
+     * playing, the alarm IS the deadline — the same relationship the human's
+     * turn has, and the one a bot's turn deliberately breaks. Stated against
+     * the row the room wrote rather than against `SHOP_TIMEOUT_MS`, so it
+     * cannot pass by restating a constant.
+     */
+    const armed = await runInDurableObject(stub(room), (_instance, state) =>
+      state.storage.getAlarm(),
+    );
+    const row = await readTurnRow(room);
+    expect(row.phase).toBe('shopping');
+    expect(armed, 'the shop gets the shop clock, not the pause before a bot shot').toBe(
+      row.deadlineAt,
+    );
+
+    /*
+     * Second consequence, and the one the player would actually meet: when
+     * that alarm arrives it must not try to fire. Whatever it decides to do —
+     * here it closes a shop nobody left and rolls the next round — the match
+     * is still there afterwards.
+     */
+    const second = alice.client.mark();
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const reply = await alice.client.next((m) => m.t === 'events' || m.t === 'error', second);
+    expect(
+      reply.t === 'error' ? `the room sent: ${JSON.stringify(reply)}` : 'the match carried on',
+    ).toBe('the match carried on');
+    expect((await info(room)).inProgress, 'the match must not have been abandoned').toBe(true);
+    expect((await readPersistedGame(room)).tanks.map((tank) => tank.id)).toContain(alice.id);
+
+    alice.client.close();
+  });
+
+  it('refuses to let a guest take the host’s computer players out of the lobby', async () => {
+    /*
+     * The mirror of the `addBot` host check, and untested until now.
+     *
+     * A lobby's line-up belongs to whoever is setting the match up. Without
+     * this, anybody who wanders into the room can strip it — and because a bot
+     * is removed by id, they can strip it one seat at a time while the host
+     * watches the list shrink.
+     */
+    const room = 'BOTU';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot', personality: 'moron' });
+    const lobby = await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+    if (lobby.t !== 'lobby') throw new Error('unreachable');
+    const botId = lobby.players.find((player) => player.bot != null)?.id as string;
+
+    const bob = await join(room, 'Bob');
+    await bob.client.next((m) => m.t === 'lobby' && m.players.length === 3);
+    expect(await readHostId(room), 'Alice was here first, so the room is hers').toBe(alice.id);
+
+    const cursor = bob.client.mark();
+    send(bob.client.socket, { t: 'removeBot', playerId: botId });
+    // Either answer settles it: the refusal, or the lobby losing a seat.
+    const reply = await bob.client.next(
+      (m) => m.t === 'error' || (m.t === 'lobby' && m.players.length === 2),
+      cursor,
+    );
+    expect(reply.t === 'error' && reply.code).toBe('not_host');
+    expect((await readSeats(room)).map((seat) => seat.id)).toContain(botId);
+
+    // …and the request itself was fine. The same frame from the host works, so
+    // what was refused was the authority, not the message.
+    send(alice.client.socket, { t: 'removeBot', playerId: botId });
+    await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+    expect((await readSeats(room)).map((seat) => seat.id)).not.toContain(botId);
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('refuses a computer player to somebody who is only watching an empty room', async () => {
+    /*
+     * The host check is written as "if there IS a host, it has to be you",
+     * because a room has no host until a seated player connects and the first
+     * person in must be able to press things. A viewer who arrives before
+     * anybody sits down therefore walks straight past it, and the only thing
+     * left between them and a line-up of their own choosing in somebody else's
+     * room is the spectator check.
+     *
+     * Both handlers are tried, because both have that same open door behind
+     * them.
+     */
+    const room = 'BOZA';
+    const viewer = await join(room, 'Viewer', { role: 'spectator' });
+    expect(viewer.role).toBe('spectator');
+    expect(await readHostId(room), 'nobody is seated, so nobody is host').toBeNull();
+
+    const cursor = viewer.client.mark();
+    send(viewer.client.socket, { t: 'addBot', personality: 'annihilator' });
+    const refused = await viewer.client.next((m) => m.t === 'error' || m.t === 'lobby', cursor);
+    expect(refused.t === 'error' && refused.code).toBe('spectator_only');
+    // The seat table is what matters: an audience must not be able to build a
+    // line-up for the players who have not arrived yet.
+    expect(await readSeats(room)).toEqual([]);
+    expect((await info(room)).players).toBe(0);
+
+    const second = viewer.client.mark();
+    send(viewer.client.socket, { t: 'removeBot', playerId: 'not-a-seat' });
+    const alsoRefused = await viewer.client.next((m) => m.t === 'error', second);
+    expect(alsoRefused.t === 'error' && alsoRefused.code).toBe('spectator_only');
+
+    viewer.client.close();
   });
 });

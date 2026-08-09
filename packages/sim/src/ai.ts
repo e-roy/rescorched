@@ -47,9 +47,17 @@
  * ## Cost
  *
  * This runs inside a Durable Object on somebody's turn, so the search is
- * bounded by `SEARCH.maxFlights` and the bound is enforced by a counter rather
- * than by arithmetic on the ladder lengths. `test/ai-performance.test.ts`
- * measures the worst case in milliseconds and in flights.
+ * bounded by `SearchPlan.maxFlights` and the bound is enforced by a counter
+ * rather than by arithmetic on the ladder lengths.
+ * `test/ai-performance.test.ts` measures the worst case in milliseconds and in
+ * flights.
+ *
+ * ## Who calls this
+ *
+ * `apps/server/src/game-room.ts`, in two places: when a turn lands on a seat
+ * whose `bot` is set, and when the shop opens. Both go through the same
+ * `fire()` and `buy()` a human's frame would, because a bot is a player without
+ * a socket and not a second set of rules.
  */
 
 import { clamp, detCosDeg, detSinDeg, hypot2 } from './math.ts';
@@ -61,6 +69,7 @@ import {
   BABY_MISSILE,
   getWeapon,
   pricePerShot,
+  requireWeapon,
   WEAPONS,
   type WeaponDef,
   type WeaponId,
@@ -114,7 +123,7 @@ export interface BotDecision {
 /** `chooseShot` plus the workings, for tests and for a future debug overlay. */
 export interface BotDecisionReport {
   decision: BotDecision;
-  /** `simulateFlight` calls the search actually spent. Bounded by `SEARCH.maxFlights`. */
+  /** `simulateFlight` calls the search actually spent. Bounded by `SearchPlan.maxFlights`. */
   flights: number;
   /** Index of the tank it was shooting at, or null if nothing was left to shoot. */
   targetIndex: number | null;
@@ -134,7 +143,7 @@ type AimStyle =
   /** Re-fly last turn's aim, measure the miss, walk the correction in. */
   | 'bracket';
 
-interface BotProfile {
+export interface BotProfile {
   readonly aim: AimStyle;
   /**
    * Elevation band the aim may use, in degrees above horizontal. Mirrored onto
@@ -331,8 +340,15 @@ const PROFILES: Readonly<Record<BotPersonality, BotProfile>> = {
   },
 };
 
-export function botProfileExists(personality: BotPersonality): boolean {
-  return PROFILES[personality] !== undefined;
+/**
+ * The knobs behind a personality, read-only.
+ *
+ * Exported so a test can ask what a bot's elevation band actually is instead of
+ * writing the number down a second time — a test that restated `58..84` would
+ * pass whatever the Tosser did. Nothing in the sim calls this.
+ */
+export function botProfile(personality: BotPersonality): BotProfile {
+  return PROFILES[personality];
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +369,7 @@ const MIN_SOLVED_POWER = 14;
 const MORON_POWER = { lo: 8, hi: 100 } as const;
 
 /**
- * The search.
+ * How hard a solving bot looks — a value, not code.
  *
  * Shape: a coarse ladder of elevations across the personality's band, each one
  * refined in power by Newton's method against the real `simulateFlight`; then
@@ -362,23 +378,56 @@ const MORON_POWER = { lo: 8, hi: 100 } as const;
  * last iterate — so a ladder rung that lands a direct hit on the way past is
  * never thrown away in favour of an arithmetic fixed point.
  *
- * `maxFlights` is enforced by a counter, checked before each rung. That matters
- * more than it sounds: it means widening a personality's elevation band, or
- * adding a rung, cannot silently make a turn take longer. The worst case
- * measured over the sweep in `test/ai-performance.test.ts` is quoted there.
+ * It is a PARAMETER rather than a private constant, and that is the load-bearing
+ * design decision in this file. Every stage below reads as a convincing
+ * paragraph of prose; prose is not evidence. The only way to know a stage does
+ * anything is to run the same corpus with it and without it, so
+ * `test/ai-search.test.ts` ablates one stage at a time through this parameter
+ * and asserts the full plan out-shoots each ablation. Deleting a stage from
+ * `DEFAULT_SEARCH_PLAN` therefore makes the plan identical to its own ablation
+ * and the comparison fails — which is exactly what did NOT happen before this
+ * was a parameter: a reviewer deleted the whole refinement pass, watched 59 of
+ * 59 tests stay green, and measured the Annihilator drop four and a half points
+ * of hit rate on the way past.
+ *
+ * The rule that follows: a stage nobody can produce a measured difference for
+ * gets deleted, not commented.
  */
-const SEARCH = {
+export interface SearchPlan {
   /** Degrees between rungs of the coarse ladder. */
-  coarseStep: 10,
-  /** Newton corrections per coarse rung. */
-  coarseProbes: 4,
-  /** Elevation offsets revisited around the coarse winner, in degrees. */
-  refineOffsets: [-6, -3, 3, 6] as readonly number[],
+  readonly coarseStep: number;
+  /** Newton corrections per coarse rung. One means "no Newton, just the seed". */
+  readonly coarseProbes: number;
+  /** Elevation offsets revisited around the coarse winner, in degrees. Empty disables refinement. */
+  readonly refineOffsets: readonly number[];
   /** Newton corrections per refinement rung, seeded from the winner's power. */
-  refineProbes: 3,
+  readonly refineProbes: number;
   /**
-   * Hard ceiling on `simulateFlight` calls per decision.
+   * How hard a self-harm-avoiding bot weighs its own skin against the target's,
+   * in pixels of extra apparent miss per pixel of overlap between the blast and
+   * the shooter. At 3 the bot gives up three pixels of accuracy to keep one
+   * pixel further out of its own crater. Zero switches it off, which is how
+   * `test/ai-search.test.ts` measures what it buys.
    *
+   * Deliberately proportional and deliberately finite, which together are what
+   * make it a judgement rather than a rule. A direct hit that grazes the
+   * shooter by 10 px costs 30 and is still worth taking over a clean miss of
+   * 60; the same hit with the blast centred 50 px inside the shooter costs 150
+   * and is not. That is the trade a good player makes at point-blank range.
+   */
+  readonly selfHarmWeight: number;
+  /** Hard ceiling on `simulateFlight` calls per decision. */
+  readonly maxFlights: number;
+}
+
+/** The plan production uses. The only value `chooseShot` ever runs with. */
+export const DEFAULT_SEARCH_PLAN: SearchPlan = {
+  coarseStep: 10,
+  coarseProbes: 4,
+  refineOffsets: [-6, -3, 3, 6],
+  refineProbes: 3,
+  selfHarmWeight: 3,
+  /**
    * A backstop, not the working bound. The widest ladder any personality has
    * today is eight rungs, so the search costs at most 8*4 + 4*3 = 44 flights
    * and the ceiling never fires — `test/ai-performance.test.ts` measures the
@@ -387,7 +436,7 @@ const SEARCH = {
    * enough cannot turn a turn into a freeze while nobody is looking.
    */
   maxFlights: 64,
-} as const;
+};
 
 /**
  * Fraction of the measured correction a bracketing bot actually applies.
@@ -419,17 +468,6 @@ const BRACKET_ELEVATION_STEP = 5;
  * a penalty the search would occasionally prefer that to a real near miss.
  */
 const OFF_MAP_PENALTY = 400;
-
-/**
- * How hard a self-harm-avoiding bot weighs its own skin against the target's.
- *
- * Expressed as pixels of extra apparent miss per pixel of overlap between the
- * blast and the shooter, so at 3 the bot will give up three pixels of accuracy
- * to keep one pixel further out of its own crater. Not infinite: a shot that
- * kills the last opponent is worth taking damage for, and the score still
- * prefers a direct hit that clips the shooter to a clean miss that does nothing.
- */
-const SELF_HARM_WEIGHT = 3;
 
 /** Most packs of any one weapon a bot buys in a single visit to the shop. */
 const MAX_PACKS_PER_ITEM = 4;
@@ -467,14 +505,31 @@ export function botStream(
  *
  * Nearest living opponent by default. `picksTheKill` swaps the first key for
  * health, because a finished tank pays a 5000 bounty and a wounded one that
- * gets a turn back does not. Both chains end on the tank index, which is unique
- * by construction, so the choice is the same on every machine — a tie broken by
- * array order would be a tie broken by lobby join order.
+ * gets a turn back does not.
+ *
+ * A genuine tie — same distance, same health — goes to the lower seat index,
+ * because both comparisons are strict and the loop runs forwards. That is
+ * ARRAY ORDER, which is lobby join order, and it is worth being straight about
+ * it: an earlier version of this comment claimed the chains ended on the unique
+ * tank index and therefore did not depend on array order, and neither chain
+ * contains an index term. Ties are real (24 in 1680 seats at match start on a
+ * symmetric board) and swapping two seats really does change which tank gets
+ * shot at. There is still no determinism risk, and that is the reason it is
+ * left alone rather than the reason it was never a problem: `tanks` is
+ * persisted, ordered, and identical on the server and on every client replaying
+ * the match, so every machine breaks the tie the same way.
+ *
+ * `personality` overrides the seat, and must: `decide` resolves the brain once
+ * and everything downstream has to agree about which brain it is.
  */
-export function chooseTarget(state: GameState, tankIndex: number): number | null {
+export function chooseTarget(
+  state: GameState,
+  tankIndex: number,
+  personality?: BotPersonality,
+): number | null {
   const shooter = state.tanks[tankIndex];
   if (shooter === undefined) return null;
-  const profile = PROFILES[shooter.bot ?? 'shooter'];
+  const profile = PROFILES[personality ?? shooter.bot ?? 'shooter'];
 
   let bestIndex: number | null = null;
   let bestDistance = Infinity;
@@ -515,17 +570,37 @@ export function chooseTarget(state: GameState, tankIndex: number): number | null
  * Always returns something the tank can legally fire. Baby Missile is free and
  * unlimited, so there is always an answer.
  */
-export function chooseWeapon(state: GameState, tankIndex: number): WeaponId {
+export function chooseWeapon(
+  state: GameState,
+  tankIndex: number,
+  personality?: BotPersonality,
+): WeaponId {
   const tank = state.tanks[tankIndex];
   if (tank === undefined) return BABY_MISSILE;
-  const profile = PROFILES[tank.bot ?? 'shooter'];
-  const targetIndex = chooseTarget(state, tankIndex);
+  const brain = personality ?? tank.bot ?? 'shooter';
+  const profile = PROFILES[brain];
+  const targetIndex = chooseTarget(state, tankIndex, brain);
   const targetHealth =
     targetIndex === null ? DEFAULT_WORLD.maxHealth : (state.tanks[targetIndex] as Tank).health;
   return pickWeapon(tank, profile, targetHealth);
 }
 
 function pickWeapon(tank: Tank, profile: BotProfile, targetHealth: number): WeaponId {
+  // `damage > 0` states the intent but does not currently decide anything, and
+  // it is worth saying so rather than leaving the next reader to assume it is
+  // load-bearing: `ammoFor` reports the free Baby Missile as infinite, so a
+  // 25-damage round is always a candidate, `heaviest` sorts damage-descending,
+  // and `economical` only ever looks at rounds that would finish the target. A
+  // zero-damage weapon therefore loses both branches on its own merits — the
+  // clause is a guard for an arsenal that does not exist yet, and deleting it
+  // changes no decision this suite can find.
+  //
+  // `ammoFor` here is what does the work, and it is now the ONLY thing standing
+  // between a bot and a gun it does not own. There used to be a second ammo
+  // check on the way out, which meant neither could be shown to matter: delete
+  // either one alone and the suite stayed green. The one on the way out is
+  // gone, so removing this line puts a Nuke nobody bought into a `fire()` frame
+  // and the property test in `test/ai.test.ts` fails.
   const owned = WEAPONS.filter(
     (weapon) =>
       weapon.damage > 0 && weapon.tier <= profile.weaponTierCap && ammoFor(tank, weapon.id) > 0,
@@ -562,53 +637,60 @@ function compareIds(a: WeaponDef, b: WeaponDef): number {
 // ---------------------------------------------------------------------------
 
 /**
+ * Overrides for a decision. Production passes none of them.
+ *
+ * `rng` — left out, the bot uses `botStream()`, which is derived from persisted
+ * state and is therefore immune to where the room's RNG has got to. Pass one
+ * only when you deliberately want to sample a personality's distribution from a
+ * fixed state, which is what the personality tests do. Passing the room's live
+ * RNG would reintroduce exactly the dependency this file exists to avoid.
+ *
+ * `personality` — run a different brain from the same seat without rebuilding
+ * the state. It is honoured by EVERYTHING the decision depends on, target
+ * selection included; it used to stop short of `chooseTarget`, which quietly
+ * made the same Annihilator brain shoot at a different tank depending on whose
+ * chair you sat it in, and meant the personality sweeps never exercised
+ * `picksTheKill` at all.
+ *
+ * `search` — ablate a stage of the solver. See `SearchPlan`.
+ */
+export interface BotOverrides {
+  rng?: Rng;
+  personality?: BotPersonality;
+  search?: SearchPlan;
+}
+
+/**
  * What this bot fires this turn.
  *
  * Pure. Same state in, byte-identical decision out, on every engine and however
  * many times you ask.
- *
- * `rng` is an OVERRIDE, and the default is the point: left out, the bot uses
- * `botStream()`, which is derived from persisted state and is therefore immune
- * to where the room's RNG has got to. Pass one only when you deliberately want
- * to sample a personality's distribution from a fixed state, which is what the
- * personality tests do. Passing the room's live RNG would reintroduce exactly
- * the dependency this file exists to avoid.
- *
- * `personality` is the second override, for the same kind of measurement: it
- * runs a different brain from the same seat without rebuilding the state. In
- * production it is left out and the seat's own `tank.bot` decides.
  *
  * There is deliberately no `memory` parameter — see the file header.
  */
 export function chooseShot(
   state: GameState,
   tankIndex: number,
-  rng?: Rng,
-  personality?: BotPersonality,
+  overrides: BotOverrides = {},
 ): BotDecision {
-  return decide(state, tankIndex, rng, personality).decision;
+  return decide(state, tankIndex, overrides).decision;
 }
 
 /** `chooseShot` with the search's workings attached. */
 export function chooseShotDetailed(
   state: GameState,
   tankIndex: number,
-  rng?: Rng,
-  personality?: BotPersonality,
+  overrides: BotOverrides = {},
 ): BotDecisionReport {
-  return decide(state, tankIndex, rng, personality);
+  return decide(state, tankIndex, overrides);
 }
 
-function decide(
-  state: GameState,
-  tankIndex: number,
-  suppliedRng: Rng | undefined,
-  suppliedPersonality: BotPersonality | undefined,
-): BotDecisionReport {
+function decide(state: GameState, tankIndex: number, overrides: BotOverrides): BotDecisionReport {
   const tank = state.tanks[tankIndex];
   const personality: BotPersonality =
-    suppliedPersonality ?? (tank?.bot != null ? tank.bot : 'shooter');
+    overrides.personality ?? (tank?.bot != null ? tank.bot : 'shooter');
   const profile = PROFILES[personality];
+  const plan = overrides.search ?? DEFAULT_SEARCH_PLAN;
 
   // Nothing that follows may throw for any state the server can legally hand
   // us, so the two things that could be missing are answered first.
@@ -621,23 +703,27 @@ function decide(
     };
   }
 
-  const targetIndex = chooseTarget(state, tankIndex);
-  const weapon = getWeapon(pickWeapon(tank, profile, targetHealthOf(state, targetIndex)));
-  const weaponId = weapon?.id ?? BABY_MISSILE;
+  const targetIndex = chooseTarget(state, tankIndex, personality);
+  const weaponId = pickWeapon(tank, profile, targetHealthOf(state, targetIndex));
 
   // Last tank standing, or everybody else already dead: hold the current aim.
   // The round is over; there is nothing to solve and no reason to move the gun.
+  //
+  // This is the one path that puts UNSOLVED numbers into a decision — they come
+  // straight off the persisted tank — which is why `clampAim` is here and not
+  // just a habit. A room resumed from a doctored or corrupted row can carry any
+  // `angleDeg` at all, and `fire()` would reject it.
   if (targetIndex === null) {
     return {
-      decision: legalize({ angleDeg: tank.angleDeg, power: tank.power, weapon: weaponId }, tank),
+      decision: { ...clampAim(tank.angleDeg, tank.power, 0), weapon: weaponId },
       flights: 0,
       targetIndex: null,
       personality,
     };
   }
 
-  const rng = suppliedRng ?? botStream(state, tankIndex, personality);
-  const solver = makeSolver(state, tankIndex, targetIndex, weapon ?? requireBabyMissile(), profile);
+  const rng = overrides.rng ?? botStream(state, tankIndex, personality);
+  const solver = makeSolver(state, tankIndex, targetIndex, requireWeapon(weaponId), profile, plan);
 
   let aim: { angleDeg: number; power: number };
   switch (profile.aim) {
@@ -653,7 +739,7 @@ function decide(
   }
 
   return {
-    decision: legalize({ ...aim, weapon: weaponId }, tank),
+    decision: { ...aim, weapon: weaponId },
     flights: solver.flights,
     targetIndex,
     personality,
@@ -664,23 +750,38 @@ function targetHealthOf(state: GameState, targetIndex: number | null): number {
   return targetIndex === null ? DEFAULT_WORLD.maxHealth : (state.tanks[targetIndex] as Tank).health;
 }
 
-function requireBabyMissile(): WeaponDef {
-  // The free weapon is a fixture of the table; this is the type system's
-  // problem rather than a real one.
-  return getWeapon(BABY_MISSILE) as WeaponDef;
-}
-
 /**
- * The last gate before the wire. Whatever the search did, what comes out is a
- * move `fire()` will accept: a finite angle in [0, 180], a finite power in
- * [0, 100], and a weapon this tank actually owns.
+ * The one gate every aim goes through, and the only one.
+ *
+ * A finite angle in [0, 180] and a finite power in [`floor`, 100] — the bounds
+ * `fire()` enforces, plus whatever floor the caller wants under the power.
+ *
+ * There used to be a second copy of these clamps in `blur` and a third in
+ * `wildAim`, and the effect of three copies was that no single one of them could
+ * be shown to matter: a reviewer deleted this function's clamps, the suite
+ * stayed green, deleted the other copy's clamps, the suite stayed green, and the
+ * only mutation that failed was deleting both at once. Defence in depth is fine
+ * for a hostile input; for our own arithmetic it just means nothing is tested.
+ * So there is one gate, every path goes through it, and
+ * `test/ai.test.ts` proves it by handing the last-tank-standing path a persisted
+ * aim of 400 degrees.
+ *
+ * Note what is NOT here any more: a weapon check. `pickWeapon` already filters
+ * on `ammoFor` and returns the free Baby Missile when nothing else is owned, so
+ * a second ammo check here could never fire — and while it sat here, deleting
+ * `pickWeapon`'s check left the suite green too. With it gone, the property test
+ * in `test/ai.test.ts` fails the moment `pickWeapon` names a gun the tank does
+ * not own.
  */
-function legalize(decision: BotDecision, tank: Tank): BotDecision {
-  const angleDeg = Number.isFinite(decision.angleDeg) ? clamp(decision.angleDeg, 0, 180) : 45;
-  const power = Number.isFinite(decision.power) ? clamp(decision.power, 0, 100) : 50;
-  const known = getWeapon(decision.weapon);
-  const weapon = known !== undefined && ammoFor(tank, known.id) > 0 ? known.id : BABY_MISSILE;
-  return { angleDeg, power, weapon };
+function clampAim(
+  angleDeg: number,
+  power: number,
+  floor: number,
+): { angleDeg: number; power: number } {
+  return {
+    angleDeg: Number.isFinite(angleDeg) ? clamp(angleDeg, 0, 180) : 45,
+    power: Number.isFinite(power) ? clamp(power, floor, 100) : Math.max(floor, 50),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +809,7 @@ interface Solver {
   readonly rise: number;
   readonly weapon: WeaponDef;
   readonly avoidsSelfHarm: boolean;
+  readonly plan: SearchPlan;
   flights: number;
 }
 
@@ -717,6 +819,7 @@ function makeSolver(
   targetIndex: number,
   weapon: WeaponDef,
   profile: BotProfile,
+  plan: SearchPlan,
 ): Solver {
   const shooter = state.tanks[shooterIndex] as Tank;
   const target = state.tanks[targetIndex] as Tank;
@@ -740,6 +843,7 @@ function makeSolver(
     rise: muzzleY - targetY,
     weapon,
     avoidsSelfHarm: profile.avoidsSelfHarm,
+    plan,
     flights: 0,
   };
 }
@@ -750,25 +854,52 @@ function fly(solver: Solver, angleDeg: number, power: number): Trajectory {
 }
 
 /**
- * How bad a shot is, in pixels. Zero is a direct hit on the intended target.
+ * How bad a shot is, in pixels. Zero is a clean direct hit on the target.
  *
  * Distance to the target's hit circle, plus the two corrections that stop the
  * search preferring something that merely looks close: a shell that left the
  * world is not a near miss, and for a bot that cares, a crater centred on its
  * own hull is not a good outcome however close to the target it was.
+ *
+ * The self-harm term is added to a DIRECT HIT as well, and that is the whole of
+ * its effect. It used to short-circuit — a hit returned 0 before the term was
+ * reached — which sounded harmless and made the flag nearly inert, because the
+ * only shots the term could still see were the ones that had already missed.
+ * The bots advertised as self-preserving were blowing themselves up almost as
+ * often as the ones that are not, since they are the ones accurate enough to
+ * land a 90 px blast on a neighbour 60 px away.
+ *
+ * No percentages are quoted here on purpose. The version of this comment that
+ * quoted two did not reproduce for the reviewer who tried, because it named no
+ * corpus precisely enough to rebuild — which is a worse failure than saying
+ * nothing. The claim is a test instead: `test/ai-search.test.ts` › "paying for
+ * self-preservation buys self-preservation" builds a point-blank corpus, runs
+ * the same personality over it with `selfHarmWeight` at its shipped value and
+ * at zero, and asserts the shipped one clips itself less — printing both of
+ * today's numbers in the failure message, where a number that moves is a red
+ * test rather than a stale comment.
+ *
+ * Zero therefore still means what the early exits in `solveAim` and `walkPower`
+ * assume — a direct hit that does not also land on the shooter — so they remain
+ * correct and still fire on the common case of a duel fought at range.
  */
 function scoreOf(solver: Solver, trajectory: Trajectory): number {
   const { impact } = trajectory;
-  if (impact.kind === 'tank' && impact.tankIndex === solver.targetIndex) return 0;
+  const selfHarm = selfHarmPenalty(solver, trajectory);
+  if (impact.kind === 'tank' && impact.tankIndex === solver.targetIndex) return selfHarm;
 
   let miss = hypot2(impact.x - solver.targetX, impact.y - solver.targetY);
   if (impact.kind === 'wall' || impact.kind === 'expired') miss += OFF_MAP_PENALTY;
-  if (solver.avoidsSelfHarm) {
-    const toSelf = hypot2(impact.x - solver.muzzleX, impact.y - solver.muzzleY);
-    const overlap = solver.weapon.radius - toSelf;
-    if (overlap > 0) miss += overlap * SELF_HARM_WEIGHT;
-  }
-  return miss;
+  return miss + selfHarm;
+}
+
+/** Pixels of apparent miss charged for landing the blast on your own hull. */
+function selfHarmPenalty(solver: Solver, trajectory: Trajectory): number {
+  if (!solver.avoidsSelfHarm) return 0;
+  const { impact } = trajectory;
+  const toSelf = hypot2(impact.x - solver.muzzleX, impact.y - solver.muzzleY);
+  const overlap = solver.weapon.radius - toSelf;
+  return overlap > 0 ? overlap * solver.plan.selfHarmWeight : 0;
 }
 
 interface Best {
@@ -790,26 +921,29 @@ function angleFor(solver: Solver, elevation: number): number {
 
 /**
  * The coarse ladder for a band: evenly spaced from the bottom, and always
- * ending exactly on the top.
+ * ending exactly on the top, with no rung repeated.
  *
- * The top rung has to be there explicitly. Stopping at the last multiple of the
- * step would quietly narrow every personality whose band is not a whole number
- * of steps wide — the Tosser's 58..84 would top out at 78 and lose the steepest
- * six degrees it exists for. Appending it rather than letting the loop reach it
- * is what stops a band that IS a whole number of steps wide (the Cyborg's
- * 15..85) from firing its top rung twice, which cost four wasted flights per
- * decision.
+ * Both halves of that are contracts rather than incidental behaviour, and
+ * `test/ai-search.test.ts` asserts them against every personality's real band.
+ *
+ * Ending on the top matters because stopping at the last multiple of the step
+ * would narrow every band that is not a whole number of steps wide — the
+ * Tosser's 58..84 would top out at 78. Be honest about the size of that: the
+ * refinement pass reaches +6 from the winning rung, so 84 is still reachable
+ * when 78 wins the coarse pass, and dropping the explicit top rung costs the
+ * Tosser far less than the drama of "the steepest six degrees it exists for".
+ * What it does cost is measured in `test/ai-search.test.ts`, which is where a
+ * number about this belongs.
+ *
+ * Not repeating a rung matters for cost, not accuracy: appending the top
+ * unconditionally to a band that IS a whole number of steps wide (the Cyborg's
+ * 15..85) would fire it twice, for four wasted flights on every decision the
+ * Cyborg makes.
  */
-function elevationLadder(profile: BotProfile): number[] {
+export function elevationLadder(lo: number, hi: number, step: number): number[] {
   const rungs: number[] = [];
-  for (
-    let elevation = profile.elevationLo;
-    elevation < profile.elevationHi;
-    elevation += SEARCH.coarseStep
-  ) {
-    rungs.push(elevation);
-  }
-  rungs.push(profile.elevationHi);
+  for (let elevation = lo; elevation < hi; elevation += step) rungs.push(elevation);
+  rungs.push(hi);
   return rungs;
 }
 
@@ -821,6 +955,7 @@ function elevationLadder(profile: BotProfile): number[] {
  * scoring probe seen anywhere, not the final iterate of anything.
  */
 function solveAim(solver: Solver, profile: BotProfile): Best {
+  const plan = solver.plan;
   const best: Best = {
     angleDeg: angleFor(solver, 45),
     power: 60,
@@ -828,20 +963,24 @@ function solveAim(solver: Solver, profile: BotProfile): Best {
     elevation: 45,
   };
 
-  for (const elevation of elevationLadder(profile)) {
-    if (solver.flights + SEARCH.coarseProbes > SEARCH.maxFlights) break;
-    walkPower(solver, elevation, SEARCH.coarseProbes, best, undefined);
+  for (const elevation of elevationLadder(
+    profile.elevationLo,
+    profile.elevationHi,
+    plan.coarseStep,
+  )) {
+    if (solver.flights + plan.coarseProbes > plan.maxFlights) break;
+    walkPower(solver, elevation, plan.coarseProbes, best, undefined);
     if (best.score === 0) return best;
   }
 
   const centre = best.elevation;
   const seed = best.power;
-  for (const offset of SEARCH.refineOffsets) {
+  for (const offset of plan.refineOffsets) {
     if (best.score === 0) break;
-    if (solver.flights + SEARCH.refineProbes > SEARCH.maxFlights) break;
+    if (solver.flights + plan.refineProbes > plan.maxFlights) break;
     const elevation = clamp(centre + offset, profile.elevationLo, profile.elevationHi);
     if (elevation === centre) continue;
-    walkPower(solver, elevation, SEARCH.refineProbes, best, seed);
+    walkPower(solver, elevation, plan.refineProbes, best, seed);
   }
 
   return best;
@@ -856,11 +995,20 @@ function solveAim(solver: Solver, profile: BotProfile): Best {
  * root find that costs ONE `simulateFlight` per iteration instead of two, which
  * is the difference between a 46-flight decision and a 92-flight one.
  *
- * The floor under `reached` is what makes it survive a blocked shot. A shell
+ * The `max(reached, 1)` is a divide-by-zero guard and nothing more. There used
+ * to be a second floor under it — `range * 0.25` — carrying a comment claiming
+ * it was "what makes it survive a blocked shot", on the reasoning that a shell
  * that detonates on the hillside in front of the muzzle has travelled almost no
- * distance, and the true derivative there is nothing like the model's — so the
- * step is computed against a quarter of the range instead, which escalates
- * power sharply rather than dividing by something near zero.
+ * distance and the true derivative there is nothing like the model's. The
+ * reasoning is fine and the effect was not there: with the floor and without it,
+ * the opening-shot sweep, the ten-turn convergence duels, a 240-state
+ * lob-over-a-ridge corpus and a 720-state point-blank corpus all produce the
+ * same hit rate and the same mean miss to the last digit printed. It changed a
+ * decision here and there (19 of 720 point-blank Cyborg decisions) and never
+ * changed an outcome, because both the floored and the unfloored Newton step
+ * blow past power 100 and clamp there. It is deleted rather than commented,
+ * which is the rule this file now holds itself to: a stage nobody can measure
+ * is not a stage.
  */
 function walkPower(
   solver: Solver,
@@ -887,7 +1035,7 @@ function walkPower(
     const error = reached - solver.range;
     if (Math.abs(error) < 0.5) return;
 
-    const slope = (2 * Math.max(reached, solver.range * 0.25, 1)) / Math.max(power, 1);
+    const slope = (2 * Math.max(reached, 1)) / Math.max(power, 1);
     const next = clamp(power - error / slope, MIN_SOLVED_POWER, 100);
     // Pinned at a bound: another iteration would recompute the same number.
     if (next === power) return;
@@ -923,14 +1071,19 @@ function analyticPower(solver: Solver, elevation: number): number {
   return clamp(Math.sqrt(speedSquared) / PHYSICS.powerScale, MIN_SOLVED_POWER, 100);
 }
 
-/** Scatter the solved aim by the personality's deliberate error. */
+/**
+ * Scatter the solved aim by the personality's deliberate error.
+ *
+ * The power floor is not a legality clamp — `fire()` is happy with power 3 —
+ * it is the rule that a bot trying to hit somebody else does not arrive at a
+ * shell that falls back onto its own hull. See `MIN_SOLVED_POWER`.
+ */
 function blur(best: Best, profile: BotProfile, rng: Rng): { angleDeg: number; power: number } {
-  const angleDeg = best.angleDeg + rng.range(-profile.angleError, profile.angleError);
-  const power = best.power + rng.range(-profile.powerError, profile.powerError);
-  return {
-    angleDeg: clamp(angleDeg, 0, 180),
-    power: clamp(power, MIN_SOLVED_POWER, 100),
-  };
+  return clampAim(
+    best.angleDeg + rng.range(-profile.angleError, profile.angleError),
+    best.power + rng.range(-profile.powerError, profile.powerError),
+    MIN_SOLVED_POWER,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -944,10 +1097,9 @@ function wildAim(
   rng: Rng,
 ): { angleDeg: number; power: number } {
   const elevation = rng.range(profile.elevationLo, profile.elevationHi);
-  return {
-    angleDeg: clamp(angleFor(solver, elevation), 0, 180),
-    power: clamp(rng.range(MORON_POWER.lo, MORON_POWER.hi), 0, 100),
-  };
+  // Floor of 0: the Moron is the one personality allowed under
+  // `MIN_SOLVED_POWER`, because dropping a shell on its own head is the joke.
+  return clampAim(angleFor(solver, elevation), rng.range(MORON_POWER.lo, MORON_POWER.hi), 0);
 }
 
 /**
@@ -983,17 +1135,12 @@ function bracketAim(
   const power = clamp(tank.power, MIN_SOLVED_POWER, 100);
   const angleDeg = angleFor(solver, elevation);
 
-  const jitter = (aim: {
-    angleDeg: number;
-    power: number;
-  }): { angleDeg: number; power: number } => ({
-    angleDeg: clamp(aim.angleDeg + rng.range(-profile.angleError, profile.angleError), 0, 180),
-    power: clamp(
+  const jitter = (aim: { angleDeg: number; power: number }): { angleDeg: number; power: number } =>
+    clampAim(
+      aim.angleDeg + rng.range(-profile.angleError, profile.angleError),
       aim.power + rng.range(-profile.powerError, profile.powerError),
       MIN_SOLVED_POWER,
-      100,
-    ),
-  });
+    );
 
   const trajectory = fly(solver, angleDeg, power);
   const held = scoreOf(solver, trajectory);
@@ -1002,7 +1149,7 @@ function bracketAim(
 
   const reached = (trajectory.impact.x - solver.muzzleX) * solver.dir;
   const error = reached - solver.range;
-  const slope = (2 * Math.max(reached, solver.range * 0.25, 1)) / Math.max(power, 1);
+  const slope = (2 * Math.max(reached, 1)) / Math.max(power, 1);
 
   let nextElevation = elevation;
   let nextPower = power - (BRACKET_GAIN * error) / slope;

@@ -19,14 +19,15 @@
  * to resolve with.
  *
  *     turn            1     2     3     4     5     6     7     8     9    10
- *     POOLSHARK mean 197   158   128   107    79    73    68    61    60    56
- *               med  121    74    53    42    31    27    26    28    30    28
- *               hit%   8    14    19    27    31    41    39    32    29    34
- *     SHOOTER   mean  75    74    81    63    59    59    62    63    68    63
- *               med   36    36    46    37    38    42    42    42    45    42
- *               hit%  27    32    31    31    27    29    28    29    26    25
- *     CYBORG    mean  32    22    26    24    28    25    31    37    37    45
- *               hit%  66    68    64    59    55    55    42    50    48    41
+ *     POOLSHARK mean 203   168   142   126    92    82    69    67    70    62
+ *               med  106    69    54    45    32    24    26    27    31    30
+ *               hit%   9     6    14    28    33    41    40    33    23    31
+ *     SHOOTER   mean  74    74    68    56    54    57    64    58    73    56
+ *               med   35    44    44    39    36    40    48    47    41    42
+ *               hit%  25    28    31    28    25    29    26    28    21    24
+ *     CYBORG    mean  24    27    29    29    25    24    29    46    47    56
+ *               med    0    12    12    15    17    15    25    18    22    22
+ *               hit%  65    61    63    56    54    60    44    50    43    40
  *
  * ---------------------------------------------------------------------------
  * Why the SHOOTER column is here
@@ -139,7 +140,7 @@ describe('the Poolshark walks its aim in', () => {
   it('misses by less every turn for the first five turns', () => {
     // The strongest form of the claim, and the one a player would recognise:
     // not "better by the end" but visibly closing, turn after turn. Measured
-    // means over the 80 duels: 195, 155, 128, 107, 84.
+    // means over the 80 duels: 203, 168, 142, 126, 92.
     const means = byTurn('poolshark').map(mean);
     for (let turn = 1; turn < 5; turn += 1) {
       expect(means[turn] as number, report('poolshark')).toBeLessThan(means[turn - 1] as number);
@@ -149,7 +150,7 @@ describe('the Poolshark walks its aim in', () => {
   it('ends up missing by a third of what it opened with', () => {
     const early = meanOverTurns('poolshark', 0, 2);
     const late = meanOverTurns('poolshark', 7, 10);
-    // Measured 178 px opening against 59 px closing, a ratio of 0.33.
+    // Measured 185 px opening against 66 px closing, a ratio of 0.36.
     expect(late / early, report('poolshark')).toBeLessThan(0.5);
   }, 300_000);
 
@@ -173,7 +174,7 @@ describe('the Poolshark walks its aim in', () => {
     const cyborg = meanOverTurns('cyborg', 7, 10) / meanOverTurns('cyborg', 0, 2);
     const summary = `${report('poolshark')}\n${report('shooter')}\n${report('cyborg')}`;
 
-    // Measured: Poolshark 0.33, Shooter 0.87, Cyborg 1.44 — the Cyborg actually
+    // Measured: Poolshark 0.36, Shooter 0.85, Cyborg 1.93 — the Cyborg actually
     // gets WORSE as the target settles into the crater it dug for it.
     expect(poolshark, summary).toBeLessThan(0.5);
     expect(shooter, summary).toBeGreaterThan(0.6);
@@ -224,6 +225,76 @@ describe('the memory is derived, not stored', () => {
     // remembered at power 25 does not come back at 95.
     expect(Math.abs(low.power - 25)).toBeLessThan(Math.abs(low.power - 95));
   });
+
+  it('refuses to walk its aim onto a shot that sails off the map', () => {
+    /*
+     * The bracket accepts a correction on one comparison — `scoreOf(corrected)
+     * < scoreOf(held)` — which makes it the one aiming style where a shot that
+     * leaves the world can win outright. A shell that crosses the edge stops
+     * being simulated at the margin and reports its impact THERE, so when the
+     * target is itself jammed against that edge the reported impact sits within
+     * a few pixels of it and scores like a bullseye. The solver never falls for
+     * it because `walkPower` drives on the range error rather than the score;
+     * the bracket has no such second opinion, and `OFF_MAP_PENALTY` is what
+     * stops it walking its aim out of the world and staying there.
+     *
+     * Measured over the 1800 edge-hugging situations built below — 60 maps x 6
+     * shooter/target placements with the target on or beside the boundary x 5
+     * winds — the Poolshark's shots leave the map on 0.28% of turns. With
+     * `OFF_MAP_PENALTY` set to 0 that rises to 1.33%, a factor of nearly five.
+     *
+     * It is also the ONLY personality the constant moves: swept separately over
+     * the same geometry, the four solving personalities produce byte-identical
+     * off-map rates with the penalty and without it, because `walkPower` steers
+     * on the range error rather than on the score and the penalty never reaches
+     * their argmax. So this test lives here, with the bracket, and not in the
+     * personalities file.
+     */
+    const states: GameState[] = [];
+    for (const style of TERRAIN_STYLES) {
+      for (let seed = 0; seed < 12; seed += 1) {
+        const base = createGame({ seed: `edge-${style}-${seed}`, width: WIDTH, height: HEIGHT }, [
+          { id: 'a', name: 'A', bot: 'poolshark' },
+          { id: 'b', name: 'B' },
+        ]);
+        for (const [shooterX, targetX] of [
+          [60, 1275],
+          [1275, 60],
+          [5, 1270],
+          [640, 1279],
+          [640, 0],
+          [200, 1279],
+        ] as [number, number][]) {
+          for (const wind of [-10, -5, 0, 5, 10]) {
+            states.push({
+              ...base,
+              wind,
+              tanks: base.tanks.map((tank, index) => ({
+                ...tank,
+                x: index === 0 ? shooterX : targetX,
+              })),
+            });
+          }
+        }
+      }
+    }
+
+    let offMap = 0;
+    for (const state of states) {
+      const decision = chooseShot(state, 0);
+      const trajectory = predictShot(state, 0, decision.angleDeg, decision.power);
+      if (trajectory.impact.kind === 'wall' || trajectory.impact.kind === 'expired') offMap += 1;
+    }
+    const rate = offMap / states.length;
+    // A rate, not a count, and a threshold placed between the two measured
+    // values rather than at either of them: 0.28% as shipped, 1.33% with the
+    // penalty gone. 0.8% leaves the shipped bracket nearly 3x of headroom while
+    // still sitting well under what removing the penalty produces.
+    expect(
+      rate,
+      `poolshark left the map on ${(100 * rate).toFixed(2)}% of ${states.length}`,
+    ).toBeLessThan(0.008);
+  }, 300_000);
 
   it('survives being handed an aim pointing the wrong way down the map', () => {
     // After a kill the next target can be on the other side, so the remembered

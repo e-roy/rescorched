@@ -154,7 +154,7 @@ describe('the decision is a pure function of the state', () => {
       for (let seat = 0; seat < 4; seat += 1) {
         for (const turnNumber of [1, 2, 3, 4, 5]) {
           const state: GameState = { ...base, turnNumber, activeTank: seat };
-          const d = chooseShot(state, seat, undefined, personality);
+          const d = chooseShot(state, seat, { personality });
           decisions.add(`${d.angleDeg}|${d.power}`);
         }
       }
@@ -517,7 +517,7 @@ function scenarios(): Scenario[] {
 describe('a bot never throws, whatever it is handed', () => {
   it.each(BOT_PERSONALITIES)('%s survives every hostile state', (personality) => {
     for (const scenario of scenarios()) {
-      const report = chooseShotDetailed(scenario.state, scenario.shooter, undefined, personality);
+      const report = chooseShotDetailed(scenario.state, scenario.shooter, { personality });
       const decision = report.decision;
 
       expect(Number.isFinite(decision.angleDeg), scenario.name).toBe(true);
@@ -548,6 +548,50 @@ describe('a bot never throws, whatever it is handed', () => {
     expect(report.decision.angleDeg).toBe(37.5);
     expect(report.decision.power).toBe(63.25);
     expect(report.flights).toBe(0);
+  });
+
+  it('clamps a persisted aim the sim would never have written', () => {
+    /*
+     * The one gate, exercised through the one path that can reach it.
+     *
+     * `clampAim` is the only place a decision is bounded, and everywhere else
+     * the numbers come out of the search already inside the band — so the only
+     * way to prove the gate does anything is to reach the path that passes
+     * numbers through UNSOLVED. That is the last-tank-standing branch, which
+     * hands back the aim sitting on the tank, and a persisted row can carry
+     * anything: a doctored save, a storage row written by a future build, a
+     * field somebody edited by hand in the DO's SQLite.
+     *
+     * Judged by `fire()` rather than by re-checking 0..180 here, so it stays a
+     * statement about what the server accepts.
+     */
+    const base = duel('corrupt-aim', 'cyborg');
+    for (const [angleDeg, power] of [
+      [400, 250],
+      [-90, -30],
+      [Number.NaN, Number.NaN],
+      [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY],
+    ]) {
+      const solo: GameState = {
+        ...base,
+        activeTank: 0,
+        tanks: base.tanks.map((tank, index) => ({
+          ...tank,
+          alive: index === 0,
+          angleDeg: angleDeg as number,
+          power: power as number,
+        })),
+      };
+      const decision = chooseShot(solo, 0);
+      expect(() =>
+        fire(solo, 'p0', {
+          turnNumber: solo.turnNumber,
+          angleDeg: decision.angleDeg,
+          power: decision.power,
+          weapon: decision.weapon,
+        }),
+      ).not.toThrow();
+    }
   });
 
   it('refuses to be handed a shot for a seat that does not exist', () => {

@@ -27,11 +27,14 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  BOT_PERSONALITIES as SIM_BOT_PERSONALITIES,
   createGame,
   fire,
+  isBotPersonality,
   leaveShop,
   startNextRound,
   toSnapshot,
+  type BotPersonality as SimBotPersonality,
   type GameEvent,
   type GamePhase,
   type GameSnapshot,
@@ -40,11 +43,13 @@ import {
 } from '@scorched/sim';
 
 import {
+  BOT_PERSONALITIES as WIRE_BOT_PERSONALITIES,
   encodeServerMessage,
   GameEventSchema,
   IMPACT_KINDS,
   isKnownImpactKind,
   parseServerMessage,
+  type BotPersonality as WireBotPersonality,
   type GamePhase as WireGamePhase,
   type ImpactKind as WireImpactKind,
   type ServerMessage,
@@ -94,6 +99,20 @@ type _WireImpactKindsFitTheSim = Assert<Fits<WireImpactKind, SimImpactKind>>;
 /** Every phase the sim can be in must be a phase the wire can carry, and vice versa. */
 type _SimPhasesFitTheWire = Assert<Fits<GamePhase, WireGamePhase>>;
 type _WirePhasesFitTheSim = Assert<Fits<WireGamePhase, GamePhase>>;
+
+/**
+ * Every computer player the lobby can ask for must be one the sim can drive,
+ * and vice versa.
+ *
+ * `addBot` names a personality on the wire and the room hands that string
+ * straight to `createGame` as `PlayerSeed.bot`. A wire value the sim has never
+ * heard of is therefore not a validation nicety: it is a seat whose `chooseShot`
+ * falls back to a brain nobody asked for, on a tank the lobby has labelled as
+ * something else. The other direction catches a personality shipped in the sim
+ * that no lobby can ever seat.
+ */
+type _SimBotsFitTheWire = Assert<Fits<SimBotPersonality, WireBotPersonality>>;
+type _WireBotsFitTheSim = Assert<Fits<WireBotPersonality, SimBotPersonality>>;
 
 /**
  * The assignment the `as never` casts were hiding. `GameEvent[]` and
@@ -303,6 +322,17 @@ describe('the sim fits through the wire', () => {
         ? '[sim-boundary] no snapshot in this match contained a negative zero'
         : `[sim-boundary] JSON flattened -0 to 0 at: ${[...new Set(negativeZeroPaths)].join(', ')}`,
     );
+  });
+
+  it('offers exactly the computer players the sim can drive', () => {
+    // The runtime half of the compile-time pin above. The types being equal
+    // does not stop the two ARRAYS drifting — a personality could be in the
+    // sim's union and missing from either list — and the room iterates the
+    // wire's list to decide what a lobby may ask for.
+    expect([...WIRE_BOT_PERSONALITIES]).toEqual([...SIM_BOT_PERSONALITIES]);
+    for (const personality of WIRE_BOT_PERSONALITIES) {
+      expect(isBotPersonality(personality), personality).toBe(true);
+    }
   });
 
   it('carries a turn built the way the room builds one, with no casts anywhere', () => {

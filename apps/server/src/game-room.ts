@@ -32,8 +32,11 @@ import {
   type ServerMessage,
 } from '@scorched/protocol';
 import {
+  applyBotShopping,
   BABY_MISSILE,
+  BOT_DISPLAY_NAMES,
   buy,
+  chooseShot,
   createGame,
   everyoneHasShopped,
   fire,
@@ -45,6 +48,7 @@ import {
   startNextRound,
   toPersisted,
   toSnapshot,
+  type BotPersonality,
   type GameEvent,
   type GamePhase,
   type GameState,
@@ -85,6 +89,38 @@ const MAX_SOCKETS = MAX_PLAYERS + MAX_SPECTATORS;
  */
 export const TURN_TIMEOUT_MS = 60_000;
 export const SHOP_TIMEOUT_MS = 120_000;
+
+/**
+ * How long the room waits before a computer player takes its turn.
+ *
+ * A bot's decision costs single-digit milliseconds, so this is not thinking
+ * time — it is pacing, and it is a product decision rather than a technical
+ * one. Two reasons for it:
+ *
+ * 1. A human should see whose turn it is before the shell is already in the
+ *    air. Three bots firing inside one animation frame reads as a glitch, not
+ *    as opponents.
+ * 2. The client plays a turn's events as an animation and has no queue: a
+ *    second `events` frame arriving mid-flight restarts the playback. It always
+ *    converges — `playEvents` renders the authoritative snapshot in a `finally`
+ *    — but the shot the player was watching disappears. Spacing the turns out
+ *    is the server side of that; a queue on the client is the proper fix and
+ *    belongs to the client.
+ *
+ * Delivered by the turn alarm rather than by a timer, because a Durable Object
+ * has no timers it can hold across hibernation — see `armClock`.
+ */
+export const BOT_TURN_DELAY_MS = 1_500;
+
+/**
+ * Which computer player a lobby gets when it does not say.
+ *
+ * The Shooter: it aims properly and ignores the wind, which is beatable by
+ * someone who has understood the wind and not by someone who has not. A room
+ * whose default opponent is the Moron teaches nothing; one whose default is the
+ * Annihilator sends first-time players away.
+ */
+export const DEFAULT_BOT_PERSONALITY: BotPersonality = 'shooter';
 
 /**
  * How many turns in a row the clock may decide before the room gives up on the
@@ -157,6 +193,20 @@ interface RoomPlayer {
   name: string;
   ready: boolean;
   colorIndex: number;
+  /**
+   * Which computer player holds this seat, or null for a person.
+   *
+   * A bot seat is a seat in every other respect: it has an id, a colour, a tank
+   * and a wallet, and it is counted against `MAX_PLAYERS`. What it does not
+   * have is a socket, which is exactly why it is stored here and not inferred
+   * from the connection — nothing about a bot is knowable from the sockets the
+   * room is holding.
+   *
+   * It gets a `secret` like anybody else, and that secret goes nowhere: it is
+   * never broadcast and never sent to a client, so `hello` can never match a
+   * bot seat and no player can take one over.
+   */
+  bot: BotPersonality | null;
 }
 
 type RateBucketKind = 'chatter' | 'action';
@@ -358,7 +408,14 @@ export class GameRoom implements DurableObject {
       // people who looked in and left would leave the room permanently full.
       // Once the match is running the seat is held: it is a tank, some money
       // and an inventory, and its owner is expected back.
-      this.writePlayers(this.readPlayers().filter((player) => player.id !== playerId));
+      const remaining = this.readPlayers().filter((player) => player.id !== playerId);
+      // …and a lobby of nothing but computer players is not a lobby. Whoever
+      // walks in next should get an empty room to set up their own way, not
+      // somebody else's three Morons and no way to remove them (they would not
+      // be host until the room noticed, and by then they would have started a
+      // match against a line-up they did not choose).
+      const anyoneHome = remaining.some((player) => player.bot === null);
+      this.writePlayers(anyoneHome ? remaining : []);
     }
 
     this.promoteHostIfNeeded(left ? 'host_left' : 'host_disconnected', ws);
@@ -383,13 +440,65 @@ export class GameRoom implements DurableObject {
       return;
     }
 
-    // Nobody is waiting on this turn. Re-arming would wake the room every
-    // minute forever for an audience of nobody — precisely the standing cost
-    // the hibernation API exists to remove. `hello` restarts the clock when
-    // someone comes back.
-    if (!this.hasConnectedPlayer()) return;
+    /*
+     * Nobody is waiting on this turn. Re-arming would wake the room every
+     * minute forever for an audience of nobody — precisely the standing cost
+     * the hibernation API exists to remove. `hello` restarts the clock when
+     * someone comes back.
+     *
+     * Who counts as "somebody" depends on what this alarm was going to do, and
+     * this is the one place in the room where the distinction matters. A turn
+     * the CLOCK is about to decide is only worth waking for if a seated player
+     * is still here to be covered for — a spectator cannot fire, so nothing
+     * changes for them but the same board arriving a minute later. A turn a
+     * COMPUTER PLAYER is about to take is worth waking for if ANYBODY is
+     * watching, because a bot's turn needs no socket: an all-bot match with an
+     * audience is a match, and freezing it because none of the seats happens to
+     * own a connection is a stopped board the viewer sees.
+     *
+     * With nobody connected at all both answers are false and the room goes
+     * back to sleep either way, which is the property that keeps an idle room
+     * free — including a room full of computer players playing to an empty
+     * theatre.
+     */
+    const botIsUp = isBotTurn(game);
+    if (!(botIsUp ? this.hasAudience() : this.hasConnectedPlayer())) return;
 
-    const streak = this.readTurnInfo().timeoutStreak + 1;
+    const info = this.readTurnInfo();
+
+    /*
+     * A computer player's turn, and NOT a timeout.
+     *
+     * This is the only path by which a bot ever fires, and it is deliberately
+     * the alarm rather than a continuation of whatever move led here. A Durable
+     * Object can be evicted between any two invocations, so a bot turn held in
+     * memory is a bot turn that can evaporate; a bot turn held as an alarm over
+     * persisted state cannot. The room wakes, re-reads the game from SQLite,
+     * asks the sim what this seat does — the same answer, because `chooseShot`
+     * is a pure function of exactly that state — and fires it.
+     *
+     * It is checked BEFORE the timeout bookkeeping, and that ordering is the
+     * whole of "a bot is never starved by the clock". A bot cannot run out of
+     * time because the clock never gets to look at its turn: however late this
+     * alarm arrives — a slow wake-up, a room resumed hours later, a deadline
+     * long past — a seat with a brain behind it fires its shot rather than
+     * being fired on its behalf.
+     *
+     * The timeout streak is carried through rather than reset. A room where one
+     * person walked away and a bot keeps answering is still a room only the
+     * clock is playing, and resetting here would mean it never got abandoned.
+     */
+    if (botIsUp) {
+      try {
+        await this.playBotTurn(game, info);
+      } catch (error) {
+        console.error('GameRoom bot turn failed', error);
+        await this.abandonMatch();
+      }
+      return;
+    }
+
+    const streak = info.timeoutStreak + 1;
     if (streak > MAX_CONSECUTIVE_TIMEOUTS) {
       await this.abandonMatch();
       return;
@@ -473,6 +582,14 @@ export class GameRoom implements DurableObject {
 
       case 'start':
         await this.handleStart(ws, joined);
+        return;
+
+      case 'addBot':
+        this.handleAddBot(ws, joined, message.personality ?? DEFAULT_BOT_PERSONALITY);
+        return;
+
+      case 'removeBot':
+        this.handleRemoveBot(ws, joined, message.playerId);
         return;
 
       case 'aim': {
@@ -602,10 +719,20 @@ export class GameRoom implements DurableObject {
       const spectatorId = `spec-${attachment.connId}`;
       const joined = this.attach(ws, attachment, spectatorId, spectatorId, message.name, true);
       this.sendWelcome(ws, joined);
+      /*
+       * An audience is not a player, so a match waiting on an absent HUMAN
+       * stays asleep: there is nobody here for the clock to cover for and
+       * waking to time somebody out for a viewer buys nothing.
+       *
+       * A computer player's turn is the exception, and the only one. It needs
+       * no socket, so somebody arriving to watch is by itself reason enough to
+       * start the clock again. Without this, an all-bot match that emptied out
+       * could only ever be resumed by a returning seat holder — and in a match
+       * whose seats are all machines there is no seat holder to return.
+       */
+      await this.restartClockIfStopped({ botTurnsOnly: true });
       this.sendLiveState(ws);
       this.broadcastSpectators();
-      // Deliberately no clock restart: an audience is not a player, and a room
-      // with nobody left to take a turn should stay asleep.
       return;
     }
 
@@ -615,6 +742,7 @@ export class GameRoom implements DurableObject {
       name: message.name,
       ready: false,
       colorIndex: nextFreeColor(players),
+      bot: null,
     };
     players.push(player);
     this.writePlayers(players);
@@ -626,6 +754,82 @@ export class GameRoom implements DurableObject {
     // A finished match is still worth seeing: whoever walks in next gets the
     // final board rather than an empty screen.
     this.sendLiveState(ws);
+  }
+
+  /**
+   * Seat a computer player.
+   *
+   * This is the whole of "one person can sit down and play". Everything else
+   * about a bot — taking its turn, spending its money — follows from the seat
+   * existing, because the sim decides all of it from `tank.bot`.
+   *
+   * Host only and lobby only, for the same reason `start` is: adding a seat
+   * changes the match everyone else is about to be dealt into. Refused with the
+   * existing error codes rather than new ones; nothing here is a new KIND of
+   * refusal.
+   */
+  private handleAddBot(
+    ws: WebSocket,
+    attachment: JoinedAttachment,
+    personality: BotPersonality,
+  ): void {
+    if (this.rejectSpectator(ws, attachment)) return;
+
+    const meta = this.readMeta();
+    if (meta.hostId !== null && meta.hostId !== attachment.playerId) {
+      this.sendError(ws, 'not_host', 'Only the host can add a computer player');
+      return;
+    }
+    if (this.matchInProgress()) {
+      this.sendError(ws, 'wrong_phase', 'The match has already started');
+      return;
+    }
+
+    const players = this.readPlayers();
+    if (players.length >= MAX_PLAYERS) {
+      this.sendError(ws, 'room_full', 'Every seat in this room is taken');
+      return;
+    }
+
+    players.push({
+      id: generateSessionId(),
+      secret: generateSessionId(),
+      name: botName(personality, players),
+      // Always ready. A bot is never the reason a lobby is waiting.
+      ready: true,
+      colorIndex: nextFreeColor(players),
+      bot: personality,
+    });
+    this.writePlayers(players);
+    this.broadcastLobby();
+  }
+
+  /** Free a seat a computer player is sitting in. Host only, lobby only. */
+  private handleRemoveBot(ws: WebSocket, attachment: JoinedAttachment, playerId: string): void {
+    if (this.rejectSpectator(ws, attachment)) return;
+
+    const meta = this.readMeta();
+    if (meta.hostId !== null && meta.hostId !== attachment.playerId) {
+      this.sendError(ws, 'not_host', 'Only the host can remove a computer player');
+      return;
+    }
+    if (this.matchInProgress()) {
+      this.sendError(ws, 'wrong_phase', 'The match has already started');
+      return;
+    }
+
+    const players = this.readPlayers();
+    const target = players.find((player) => player.id === playerId);
+    // Deliberately the same refusal for "no such seat" and "that seat is a
+    // person": `removeBot` is not a way to find out who in the room is human,
+    // and it is certainly not a way to kick them.
+    if (target === undefined || target.bot === null) {
+      this.sendError(ws, 'unknown_player', 'That seat does not hold a computer player');
+      return;
+    }
+
+    this.writePlayers(players.filter((player) => player.id !== playerId));
+    this.broadcastLobby();
   }
 
   private async handleStart(ws: WebSocket, attachment: JoinedAttachment): Promise<void> {
@@ -644,6 +848,9 @@ export class GameRoom implements DurableObject {
     }
 
     const players = this.readPlayers();
+    // Computer players count. That is the point of them: one person plus one
+    // Shooter is a match, and before bots existed this room needed two humans
+    // before anything at all could happen.
     if (players.length < MIN_PLAYERS) {
       this.sendError(ws, 'no_players', `Need at least ${MIN_PLAYERS} players`);
       return;
@@ -659,6 +866,10 @@ export class GameRoom implements DurableObject {
         id: player.id,
         name: player.name,
         colorIndex: player.colorIndex,
+        // `PlayerSeed.bot` is optional and `undefined` means a person, so a
+        // human seat must not carry `bot: null` — it would be a different
+        // object shape for the same meaning.
+        ...(player.bot !== null ? { bot: player.bot } : {}),
       })),
     );
 
@@ -816,6 +1027,74 @@ export class GameRoom implements DurableObject {
     });
   }
 
+  /**
+   * A computer player takes its turn.
+   *
+   * The room's only move is still "hand the sim an input" — this is the same
+   * `fire()` a human's frame goes through, with the same validation and the
+   * same events. What the room adds is nothing: it does not aim, it does not
+   * decide, it does not know what a good shot is. `chooseShot` does all of it
+   * from the persisted state, which is what makes the shot identical whether it
+   * is computed now or after the object has been evicted and woken up again.
+   */
+  private async playBotTurn(game: GameState, info: TurnInfo): Promise<void> {
+    const active = game.tanks[game.activeTank];
+    if (active === undefined) {
+      await this.abandonMatch();
+      return;
+    }
+
+    const decision = chooseShot(game, game.activeTank);
+    const result = fire(game, active.id, {
+      turnNumber: game.turnNumber,
+      angleDeg: decision.angleDeg,
+      power: decision.power,
+      weapon: decision.weapon,
+    });
+
+    await this.commitTurn(game.turnNumber, result.state, result.events, {
+      timeoutStreak: info.timeoutStreak,
+      expiredTurn: info.expiredTurn,
+    });
+  }
+
+  /**
+   * Take every computer player through the shop and out the other side.
+   *
+   * Run at the moment the shop opens rather than on a clock, because a bot has
+   * nothing to think about: `choosePurchases` is a preference list against a
+   * budget. So the state that gets broadcast when a round ends already shows
+   * the bots' new inventories and already has them out of `pendingShoppers`,
+   * and the humans see a shop that is waiting for them alone.
+   *
+   * If that empties the shop — every remaining shopper was a bot — the next
+   * round is rolled here too, so the room never sits in a `shopping` phase
+   * nobody is going to leave.
+   */
+  private settleBotShopping(
+    state: GameState,
+    events: ServerEventPayload,
+  ): { state: GameState; events: ServerEventPayload } {
+    if (state.phase !== 'shopping') return { state, events };
+
+    let next = state;
+    for (let index = 0; index < next.tanks.length; index += 1) {
+      const tank = next.tanks[index];
+      if (tank === undefined || tank.bot === null) continue;
+      if (!next.pendingShoppers.includes(tank.id)) continue;
+      next = applyBotShopping(next, index);
+      next = leaveShop(next, tank.id);
+    }
+    if (next === state) return { state, events };
+
+    if (!everyoneHasShopped(next)) return { state: next, events };
+    const rolled = startNextRound(next);
+    return {
+      state: rolled.state,
+      events: [...events, ...(rolled.events as ServerEventPayload)],
+    };
+  }
+
   /** Somebody never left the shop. Close it for everyone still in there. */
   private async forceShopEnd(game: GameState, streak: number): Promise<void> {
     let next = game;
@@ -848,10 +1127,15 @@ export class GameRoom implements DurableObject {
    *
    * Only the small turn row is rewritten — re-arming a timer is no reason to
    * push a whole heightmap back through storage.
+   *
+   * `botTurnsOnly` is what a spectator gets: restart a clock a computer player
+   * is going to answer, leave a clock that is waiting on an absent human alone.
+   * See the spectator branch of `handleHello`.
    */
-  private async restartClockIfStopped(): Promise<void> {
+  private async restartClockIfStopped(options: { botTurnsOnly?: boolean } = {}): Promise<void> {
     const game = this.readGame();
     if (game === null || clockFor(game.phase) === null) return;
+    if (options.botTurnsOnly === true && !isBotTurn(game)) return;
     if ((await this.ctx.storage.getAlarm()) !== null) return;
 
     // The streak counts turns nobody was there to play. Somebody is there now,
@@ -900,8 +1184,25 @@ export class GameRoom implements DurableObject {
 
     // A Durable Object holds at most one alarm, so this replaces the previous
     // turn's: a turn played normally cancels its own timeout as a side effect.
-    if (deadlineAt === null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(deadlineAt);
+    if (deadlineAt === null) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    /*
+     * A computer player's turn is scheduled on the same alarm, just sooner.
+     *
+     * The bot is not going to run out of time, so the turn clock has nothing to
+     * do on its turn; what the alarm is for here is the pause in front of the
+     * shot (`BOT_TURN_DELAY_MS`). Reusing the one alarm rather than inventing a
+     * second mechanism is what keeps this hibernation-safe: there is no timer
+     * to lose, no continuation to hold in memory, and the wake-up re-derives
+     * the whole decision from storage.
+     *
+     * `deadlineAt` in the turn row stays the real turn deadline, so a bot seat
+     * that somehow does not fire is still covered by the ordinary clock.
+     */
+    await this.ctx.storage.setAlarm(isBotTurn(state) ? Date.now() + BOT_TURN_DELAY_MS : deadlineAt);
   }
 
   private async commitTurn(
@@ -910,19 +1211,24 @@ export class GameRoom implements DurableObject {
     events: readonly GameEvent[] | ServerEventPayload,
     options: { timeoutStreak: number; expiredTurn: number | null },
   ): Promise<void> {
-    await this.commitState(state, options);
-    this.recordReplay(turnPlayed, events);
-    this.recordRoundWins(events);
+    // Bots shop before the turn is committed, so what gets persisted, replayed
+    // and broadcast is one consistent picture rather than a round end followed
+    // by a second frame nobody asked for.
+    const settled = this.settleBotShopping(state, events as ServerEventPayload);
+
+    await this.commitState(settled.state, options);
+    this.recordReplay(turnPlayed, settled.events);
+    this.recordRoundWins(settled.events);
 
     this.broadcast({
       t: 'events',
       turnNumber: turnPlayed,
-      events: events as ServerEventPayload,
-      snapshot: toSnapshot(state),
+      events: settled.events,
+      snapshot: toSnapshot(settled.state),
     });
-    this.broadcastTurnTimer(state);
+    this.broadcastTurnTimer(settled.state);
 
-    if (state.phase === 'gameover') this.broadcastMatchResult(state);
+    if (settled.state.phase === 'gameover') this.broadcastMatchResult(settled.state);
   }
 
   private broadcastTurnTimer(state: GameState, target?: WebSocket): void {
@@ -1097,6 +1403,20 @@ export class GameRoom implements DurableObject {
     return this.connectedPlayerIds().size > 0;
   }
 
+  /**
+   * Anybody on the other end at all — a seated player OR a spectator.
+   *
+   * The weaker of the two audience tests, and it is used in exactly one place:
+   * deciding whether a computer player's turn is worth waking up for. See
+   * `alarm()` for why the two differ.
+   */
+  private hasAudience(): boolean {
+    for (const socket of this.ctx.getWebSockets()) {
+      if (readAttachment(socket)?.playerId != null) return true;
+    }
+    return false;
+  }
+
   private spectatorAttachments(except?: WebSocket): SocketAttachment[] {
     const viewers: SocketAttachment[] = [];
     for (const socket of this.ctx.getWebSockets()) {
@@ -1195,8 +1515,12 @@ export class GameRoom implements DurableObject {
           id: player.id,
           name: player.name,
           ready: player.ready,
-          connected: connected.has(player.id),
+          // A computer player is always "connected": there is no socket to
+          // drop, and showing it greyed out like an absent human would be a
+          // lie about a seat that is going to take its turn.
+          connected: player.bot !== null || connected.has(player.id),
           colorIndex: player.colorIndex,
+          bot: player.bot,
         })),
       },
       except,
@@ -1235,7 +1559,15 @@ export class GameRoom implements DurableObject {
   }
 
   private readPlayers(): RoomPlayer[] {
-    return this.readKv<RoomPlayer[]>('players', []);
+    // `bot` is normalised on the way out rather than trusted, because a row
+    // written before the field existed simply has no key — and a seat whose
+    // `bot` came back `undefined` would be neither a person nor a computer
+    // player, which is the sort of third state that gets found in production.
+    // `serialize.ts` reads the same field the same way, for the same reason.
+    return this.readKv<RoomPlayer[]>('players', []).map((player) => ({
+      ...player,
+      bot: player.bot ?? null,
+    }));
   }
 
   private writePlayers(players: RoomPlayer[]): void {
@@ -1336,6 +1668,54 @@ function readAttachment(ws: WebSocket): SocketAttachment | null {
     name: typeof candidate.name === 'string' ? candidate.name : '',
     spectator: candidate.spectator === true,
   };
+}
+
+/** Which computer player holds a seat, or null for a person or no seat at all. */
+function botSeatOf(state: GameState, tankIndex: number): BotPersonality | null {
+  return state.tanks[tankIndex]?.bot ?? null;
+}
+
+/**
+ * Is the room waiting on a machine rather than on a person?
+ *
+ * One definition, read by all three places that care — the alarm that decides
+ * whether to fire or to time out, the clock that decides how long to wait, and
+ * the spectator arrival that decides whether to restart a stopped clock. Three
+ * copies of `phase === 'aiming' && tank.bot !== null` would be three chances to
+ * disagree about it, and a room that thinks a seat is a bot when it arms the
+ * clock and a person when the clock fires times a computer player out.
+ *
+ * The phase half is not decoration, and it is the half that looks removable.
+ * `endRound` in `packages/sim/src/game.ts` leaves `activeTank` where it was, so
+ * a bot that fires the shot which wins a round is still the active seat while
+ * the room sits in `shopping`. On the seat alone this reads as "a machine is
+ * up": the room would arm the pause in front of a bot shot instead of the shop
+ * clock, wake, ask `fire()` to shoot during `shopping`, and abandon the match on
+ * the refusal — throwing a solo player out of a round they just won. Pinned by
+ * "does not mistake the shop for a computer player's turn when a bot ends the
+ * round" in the server suite.
+ */
+function isBotTurn(state: GameState): boolean {
+  return state.phase === 'aiming' && botSeatOf(state, state.activeTank) !== null;
+}
+
+/**
+ * A name for a new computer player: its personality, numbered if the lobby
+ * already has one.
+ *
+ * Numbered rather than randomised because two tanks called "Shooter" is a
+ * scoreboard nobody can read, and `PlayerNameSchema` caps a name at 16
+ * characters — "Annihilator 8" is 13, and eight seats is the most this room has.
+ */
+function botName(personality: BotPersonality, players: readonly RoomPlayer[]): string {
+  const base = BOT_DISPLAY_NAMES[personality];
+  const taken = new Set(players.map((player) => player.name));
+  if (!taken.has(base)) return base;
+  for (let suffix = 2; suffix <= MAX_PLAYERS + 1; suffix += 1) {
+    const candidate = `${base} ${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return base;
 }
 
 function nextFreeColor(players: readonly RoomPlayer[]): number {
