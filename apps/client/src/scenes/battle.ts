@@ -74,6 +74,12 @@ export interface BattleCallbacks {
   onIdle(): void;
 }
 
+/** One turn waiting its place in the playback chain. See `playEvents`. */
+interface QueuedTurn {
+  readonly events: readonly WireGameEvent[];
+  readonly finalSnapshot: GameSnapshot;
+}
+
 export class BattleScene extends Phaser.Scene {
   static readonly KEY = 'battle';
 
@@ -81,6 +87,11 @@ export class BattleScene extends Phaser.Scene {
   private callbacks: BattleCallbacks = { onIdle: () => {} };
   private animating = false;
   private ready = false;
+
+  /** Tail of the playback chain. See `playEvents`. Never rejects. */
+  private playbackTail: Promise<void> = Promise.resolve();
+  /** The newest turn handed in. Anything older than this is skipped. */
+  private pending: QueuedTurn | null = null;
 
   private skyImage: Phaser.GameObjects.Image | null = null;
   private skyKey = '';
@@ -234,14 +245,48 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
+  /**
+   * Aim as the players are CURRENTLY holding it, keyed by player id.
+   *
+   * The snapshot's `angleDeg` is the server's copy, and the server only learns
+   * an angle when a shot is fired — so drawing the barrel from the snapshot
+   * alone left it frozen while a player wound the angle up and down. Reported
+   * from real play: "when I adjust the angle the turret doesn't move".
+   *
+   * Filled from two sources, both of which already existed: the local player's
+   * own HUD, and the `aim` frames the server broadcasts for everyone else.
+   * Cleared when the turn number moves, because at that point the snapshot is
+   * the freshest thing there is.
+   */
+  private readonly liveAim = new Map<string, number>();
+  private liveAimTurn = -1;
+
+  /** Point a tank's barrel now, without waiting for the next snapshot. */
+  setLiveAim(playerId: string, angleDeg: number): void {
+    if (this.liveAim.get(playerId) === angleDeg) return;
+    this.liveAim.set(playerId, angleDeg);
+    // Only the tanks need repainting — terrain and sky are untouched by aiming,
+    // and repainting them on every arrow keypress would be a waste.
+    if (this.ready && this.snapshot !== null && !this.animating) {
+      this.redrawTanks(this.snapshot);
+    }
+  }
+
   private redrawTanks(snapshot: GameSnapshot): void {
+    if (snapshot.turnNumber !== this.liveAimTurn) {
+      this.liveAim.clear();
+      this.liveAimTurn = snapshot.turnNumber;
+    }
+
     this.tankLayer.removeAll(true);
 
     snapshot.tanks.forEach((tank, index) => {
       const graphics = this.add.graphics();
+      const live = this.liveAim.get(tank.id);
       drawTank(graphics, tank, {
         isActive: index === snapshot.activeTank && tank.alive && snapshot.phase !== 'gameover',
         isAiming: snapshot.phase === 'aiming',
+        ...(live === undefined ? {} : { aimDeg: live }),
       });
       this.tankLayer.add(graphics);
 
@@ -318,8 +363,52 @@ export class BattleScene extends Phaser.Scene {
   /**
    * Animate a turn's events, then settle on the authoritative snapshot.
    * The snapshot is the truth; the animation is decoration on the way to it.
+   *
+   * Turns QUEUE. A second call that arrives while one is playing waits for it
+   * instead of cutting it off, and the caller's promise resolves when its own
+   * turn has finished — so a `.then()` that reconciles state still fires in
+   * arrival order.
+   *
+   * This is what lets the room pace computer players at something shorter than
+   * an animation. A plain turn takes about a second and a half to play, so at
+   * the old flat 1500 ms pause a bot's frame landed roughly as the previous one
+   * finished; anything quicker used to interrupt the shot the player was
+   * watching, because playback simply restarted. Waiting instead means the
+   * pause is dead air the server can spend or not, and the visible pace is set
+   * by the animation either way.
+   *
+   * The backlog is ONE. If a third turn arrives while one is playing and one is
+   * waiting, the waiting one is dropped and the newest takes its place: a
+   * client that cannot keep up must fall behind by a bounded amount and then
+   * catch up, never by an unbounded and growing one. Dropping is safe because
+   * every frame carries the authoritative snapshot — a skipped turn costs the
+   * animation, never the board.
    */
   async playEvents(events: readonly WireGameEvent[], finalSnapshot: GameSnapshot): Promise<void> {
+    const turn: QueuedTurn = { events, finalSnapshot };
+    this.pending = turn;
+
+    // Append to the chain rather than testing `isAnimating`: a flag has to be
+    // read and written across an await, and two callers resuming in the same
+    // microtask drain would both find it clear and play at once.
+    const run = this.playbackTail.then(async () => {
+      // Overtaken while we waited. The newest turn is the only one worth
+      // drawing, and its frame carries the same authoritative snapshot.
+      if (this.pending !== turn) return;
+      this.pending = null;
+      await this.playTurn(turn.events, turn.finalSnapshot);
+    });
+
+    // The chain must never reject, or one bad turn poisons every turn after it.
+    // The caller still gets the real promise, so nothing is swallowed twice.
+    this.playbackTail = run.catch(() => {});
+    await run;
+  }
+
+  private async playTurn(
+    events: readonly WireGameEvent[],
+    finalSnapshot: GameSnapshot,
+  ): Promise<void> {
     this.animating = true;
     this.trails.clear();
     this.lastImpact = null;

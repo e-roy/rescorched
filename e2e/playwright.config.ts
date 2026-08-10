@@ -39,7 +39,20 @@ export default defineConfig({
       'pnpm --filter @scorched/client build && pnpm --filter @scorched/server exec wrangler dev --port ' +
       PORT,
     url: `${BASE_URL}/api/health`,
-    reuseExistingServer: !process.env['CI'],
+    /*
+     * Always build and start fresh, even locally.
+     *
+     * `reuseExistingServer: !CI` is the usual setting and it is a trap here: the
+     * webServer command is what BUILDS the client, so reusing a server means
+     * reusing whatever `dist/` happened to be lying around. A client fix then
+     * gets tested against the previous bundle and the suite reports on code that
+     * is not the code you wrote — which cost real time on the turret fix, where
+     * a correct change looked broken twice.
+     *
+     * Set SCORCHED_REUSE_SERVER=1 to opt back in while iterating on a test that
+     * does not touch the client.
+     */
+    reuseExistingServer: process.env['SCORCHED_REUSE_SERVER'] === '1',
     timeout: 180_000,
     stdout: 'pipe',
     stderr: 'pipe',

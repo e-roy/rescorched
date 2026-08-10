@@ -92,6 +92,10 @@ const ui = new Ui({
   // second instead of hundreds.
   onAimChange: (angleDeg, power, weapon) => {
     queueAimBroadcast(angleDeg, power, weapon);
+    // Point our own barrel immediately. The network round trip is throttled and
+    // the server does not echo our own aim back to us, so waiting for either
+    // would leave the turret frozen while the number on the HUD moved.
+    if (app.you !== null) battleScene()?.setLiveAim(app.you, angleDeg);
   },
 
   onFire: () => {
@@ -167,21 +171,50 @@ function handleMessage(message: ServerMessage): void {
       }
       // Lock input while the shell is in the air.
       ui.renderHud(message.snapshot, app.you ?? '', false);
-      void scene.playEvents(message.events, message.snapshot).then(() => {
-        applySnapshot(message.snapshot);
-      });
       app.snapshot = message.snapshot;
+      void scene.playEvents(message.events, message.snapshot).then(() => {
+        /*
+         * Only render this turn if it is still the latest one.
+         *
+         * Playback has no queue: a second `events` frame arriving mid-flight
+         * restarts it, and the animation it interrupted still resolves — a beat
+         * LATER than the newer frame was handled. Without this check that late
+         * callback re-applied its own older snapshot over the newer one, so the
+         * client would go back a turn and sit there until something else
+         * arrived. With a computer player in the room that is the normal case
+         * rather than a rare one: the room takes the bot's turn 1.5s after
+         * yours, which lands inside the explosion you are still watching.
+         *
+         * Identity rather than turn number, deliberately: a new round restarts
+         * the count, so "newer" is not "larger".
+         *
+         * `solo-bot.spec.ts` › "cannot rewind the board" is what holds this
+         * line down. It reschedules the socket so the bot's frame lands 200ms
+         * into our own animation every run, rather than hoping the wire does
+         * it — and with this condition deleted it reports the board going back
+         * to the previous turn and staying there.
+         */
+        if (app.snapshot === message.snapshot) applySnapshot(message.snapshot);
+      });
       return;
     }
 
     case 'aim':
-      // Opponent moved their barrel — purely cosmetic.
+      // An opponent moved their barrel. Cosmetic, but worth drawing: watching
+      // the other tank traverse is most of what makes a turn-based game feel
+      // like someone is on the other end of it.
+      battleScene()?.setLiveAim(message.playerId, message.angleDeg);
       return;
 
     case 'chat':
       return;
 
     case 'error':
+      // A refusal the lobby asked for is shown there and goes no further. It
+      // matters beyond tidiness: `room_full` answering "add a computer player"
+      // is not the same event as `room_full` answering "let me in", and the
+      // second one throws the player back to the title screen.
+      if (ui.claimError(message.message)) return;
       ui.showToast(message.message);
       if (message.code === 'room_full' || message.code === 'bad_protocol') {
         ui.showTitleError(message.message);

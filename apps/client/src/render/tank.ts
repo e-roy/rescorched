@@ -64,11 +64,21 @@ export interface TankDrawOptions {
   readonly isActive: boolean;
   /** True while the active player is still choosing — drives the turn marker. */
   readonly isAiming: boolean;
+  /**
+   * Aim to draw the barrel at, when it is known more recently than the snapshot.
+   *
+   * `tank.angleDeg` is the SERVER's copy, and the server only learns an angle
+   * when a shot is fired. Drawing from it alone meant the barrel sat still while
+   * the player wound the angle up and down — the HUD number moved and the tank
+   * did not, which reads as the game ignoring you. The scene keeps the live
+   * value and passes it here.
+   */
+  readonly aimDeg?: number;
 }
 
 /** Muzzle position for the given aim — the effect layer spawns a flash there. */
-export function muzzlePoint(tank: TankSnapshot): { x: number; y: number } {
-  const radians = (tank.angleDeg * Math.PI) / 180;
+export function muzzlePoint(tank: TankSnapshot, aimDeg?: number): { x: number; y: number } {
+  const radians = ((aimDeg ?? tank.angleDeg) * Math.PI) / 180;
   return {
     x: tank.x + Math.cos(radians) * BARREL_LENGTH,
     y: tank.y + PIVOT_Y - Math.sin(radians) * BARREL_LENGTH,
@@ -134,7 +144,7 @@ export function drawTank(
   // Drawn LAST so that at a steep elevation it sweeps in front of the health
   // bar rather than being clipped by it. Draw it earlier and a tank aiming
   // near-vertically appears to have a stub.
-  const radians = (tank.angleDeg * Math.PI) / 180;
+  const radians = ((options.aimDeg ?? tank.angleDeg) * Math.PI) / 180;
   const tipX = tank.x + Math.cos(radians) * BARREL_LENGTH;
   const tipY = tank.y + PIVOT_Y - Math.sin(radians) * BARREL_LENGTH;
 
