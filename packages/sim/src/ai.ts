@@ -80,13 +80,18 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * The roster, weakest first. Names kept from the original where they fit.
+ * The roster. Names kept from the original where they fit.
  *
- * The order is the difficulty order and `test/ai-personalities.test.ts` asserts
- * it holds as a measured hit rate rather than as a comment — with the two
- * deliberate exceptions called out there: TOSSER trades range for loft and
- * POOLSHARK's whole point is that it improves over turns rather than nailing
- * the first one, so neither belongs in a single-shot ranking.
+ * This is the SET of computer players and nothing more — a list to iterate, to
+ * validate a wire value against, to build a menu from. It is deliberately not a
+ * difficulty order any more, because for two of the six there is no honest
+ * position in one: see `BOT_DIFFICULTY_LADDER` and `BOT_SPECIALISTS`, which
+ * split it into the part that is ranked and the part that is not.
+ *
+ * It used to be documented as "weakest first" and read that way by the lobby,
+ * which sold the Poolshark — 6.5% on its opening shot, the second worst on the
+ * list — as the fourth hardest of six. Nothing broke, because nothing measured
+ * the middle of that ladder; there was no ladder to measure.
  */
 export const BOT_PERSONALITIES = [
   'moron',
@@ -98,6 +103,39 @@ export const BOT_PERSONALITIES = [
 ] as const;
 
 export type BotPersonality = (typeof BOT_PERSONALITIES)[number];
+
+/**
+ * The four that can be honestly ranked against each other, weakest first.
+ *
+ * Ranked means MEASURED: `test/ai-personalities.test.ts` walks this array and
+ * asserts each rung out-hits the one below it by at least 15 percentage points
+ * over 200 opening shots on 100 generated maps, and misses by less on the same
+ * corpus. Reordering it, or slipping a fifth personality into it, turns that
+ * suite red — which is what makes a "3 of 4" printed in the lobby a claim the
+ * project can back rather than a claim it merely repeats.
+ *
+ * Exported for the lobby's picker. There must be exactly one opinion about the
+ * ordering and it must be the one under measurement; a second copy in the
+ * client would be a difficulty ladder no test can see.
+ */
+export const BOT_DIFFICULTY_LADDER = ['moron', 'shooter', 'cyborg', 'annihilator'] as const;
+
+/**
+ * The two that are different rather than better, and why each one is.
+ *
+ * TOSSER always lobs: it gives up the flat trajectory and gets the shot over a
+ * ridge in exchange, so it is a different weapon rather than a better shot —
+ * measured, it lands its opening shell about as often as the SHOOTER does while
+ * throwing it twice as high.
+ *
+ * POOLSHARK never solves anything: it fires, watches, and corrects, so its
+ * FIRST shot is the second worst on the roster and its fourth is not.
+ * `test/ai-poolshark.test.ts` measures that as convergence over ten turns,
+ * which is the only frame in which the personality means anything.
+ *
+ * Both would be libelled by a rung on the ladder, in opposite directions.
+ */
+export const BOT_SPECIALISTS = ['tosser', 'poolshark'] as const;
 
 /** How the roster is spelled in the lobby and on the HUD. */
 export const BOT_DISPLAY_NAMES: Readonly<Record<BotPersonality, string>> = {

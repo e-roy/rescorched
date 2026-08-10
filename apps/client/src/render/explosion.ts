@@ -51,6 +51,39 @@ export interface BlastStyle {
   readonly flash: number;
 }
 
+/**
+ * How big the FIRE is, given the blast the sim reported.
+ *
+ * Not the same question as how big the blast is, and conflating them is why the
+ * first shot a new player ever fires looked like nothing happened. A Baby
+ * Missile has an 18 px radius, `drawBlast` peaks at 1.08 of it, and the result
+ * is a ~19 px fireball around a 12 px shell — a pop, on the one weapon every
+ * player fires first and fires most.
+ *
+ * So the drawn fire is lifted at the bottom of the range and left alone at the
+ * top: `LIFT` at radius 0, falling linearly to nothing at `LIFT_UNTIL`. Two
+ * properties matter and both are deliberate:
+ *
+ *  - It is strictly increasing (the derivative is `1 + LIFT - 2·LIFT·r/UNTIL`,
+ *    positive for every radius in the arsenal), so the ladder survives: a
+ *    Missile still reads as bigger than a Baby Missile, a Nuke as bigger again.
+ *    A flat floor — `max(radius, 30)` — would have flattened the bottom three
+ *    tiers into one look, which is a worse defect than the one being fixed.
+ *  - It moves the FIRE only. The crater, the damage and the decal all keep the
+ *    sim's radius, so the free weapon is exactly as weak as it was; it just
+ *    stops being invisible. `weapons.ts` still owns what a shot is worth.
+ *
+ * Measured on the capture: Baby Missile 19 px of fire → 30 px, Missile 30 → 41,
+ * Nuke 97 → 97.
+ */
+const FIREBALL_LIFT = 0.75;
+const FIREBALL_LIFT_UNTIL = 60;
+
+export function fireballRadius(blastRadius: number): number {
+  const lift = FIREBALL_LIFT * (1 - clamp(blastRadius / FIREBALL_LIFT_UNTIL, 0, 1));
+  return blastRadius * (1 + lift);
+}
+
 const FIRE_RINGS: readonly BlastRing[] = [
   { scale: 1.0, color: 0x8c1400, core: false },
   { scale: 0.84, color: 0xd93b00, core: false },

@@ -26,6 +26,7 @@ import { describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION, parseServerMessage, type ServerMessage } from '@scorched/protocol';
 import {
   BABY_MISSILE,
+  BOT_PERSONALITIES,
   chooseShot,
   fire,
   fromPersisted,
@@ -37,7 +38,15 @@ import {
 
 import worker from '../src/index.ts';
 import { allocateRoomCode } from '../src/room-code.ts';
-import { MAX_PLAYERS, MAX_SPECTATORS, SHOP_TIMEOUT_MS, TURN_TIMEOUT_MS } from '../src/game-room.ts';
+import {
+  BOT_TURN_DELAY_MS,
+  botTurnDelayMs,
+  MAX_PLAYERS,
+  MAX_SPECTATORS,
+  SHOP_TIMEOUT_MS,
+  TURN_TIMEOUT_MS,
+} from '../src/game-room.ts';
+import { estimatePlaybackMs } from '../src/playback.ts';
 
 const BASE = 'http://example.com';
 const MAX_SOCKETS = MAX_PLAYERS + MAX_SPECTATORS;
@@ -60,11 +69,54 @@ interface Client {
   next(predicate?: (message: ServerMessage) => boolean, from?: number): Promise<ServerMessage>;
   all(): ServerMessage[];
   mark(): number;
+  /**
+   * Draw a line under everything received so far: it was setup, not the thing
+   * under test. `next` searches forward from here unless given an explicit
+   * cursor, and `since()` reads the tail.
+   *
+   * It exists because starting a match now delivers a real turn — the armoury
+   * closing and round one opening — before any test has done anything. Without
+   * a baseline, every `next(m => m.t === 'events')` in this file would match
+   * that opener instead of the frame the test was waiting for, and the
+   * assertions would be about the wrong turn while still looking right.
+   */
+  settle(): void;
+  /** Everything received since `settle()`. */
+  since(): ServerMessage[];
   close(): void;
 }
 
-/** Open a real WebSocket into a room and collect frames as they arrive. */
-async function openSocket(roomCode: string): Promise<Client> {
+/**
+ * Bring a room into existence, the way `POST /api/rooms` does.
+ *
+ * A room that nobody was ever given the code to refuses `hello` — see
+ * `roomExists` — so a test that skipped this would be testing the refusal
+ * rather than whatever it came to test. Every socket in the real product is
+ * preceded by either a Create (which claims the code) or a Join to a room
+ * somebody already created, so opening the room here is what makes these tests
+ * start where a player does.
+ */
+async function openRoom(roomCode: string): Promise<void> {
+  const response = await stub(roomCode).fetch(
+    new Request(`${BASE}/claim?room=${roomCode}`, { method: 'POST' }),
+  );
+  expect(response.status).toBe(200);
+  // Drain it. A Durable Object response whose body is never read leaves the
+  // request in flight, and an object with a request in flight cannot be
+  // evicted — which is how four eviction tests in this file started timing out
+  // the moment room creation grew a round trip.
+  await response.json();
+}
+
+/**
+ * Open a real WebSocket into a room and collect frames as they arrive.
+ *
+ * `open: false` skips the claim above, which is how a test reaches a code that
+ * is not a room.
+ */
+async function openSocket(roomCode: string, options: { open?: boolean } = {}): Promise<Client> {
+  if (options.open !== false) await openRoom(roomCode);
+
   const response = await worker.fetch(
     new Request(`${BASE}/api/rooms/${roomCode}/ws`, { headers: { Upgrade: 'websocket' } }),
     env,
@@ -100,10 +152,16 @@ async function openSocket(roomCode: string): Promise<Client> {
     }
   });
 
+  let baseline = 0;
+
   return {
     socket,
     all: () => received,
     mark: () => received.length,
+    settle: () => {
+      baseline = received.length;
+    },
+    since: () => received.slice(baseline),
     close: () => {
       // Abandon anything still waiting BEFORE closing. A pending waiter whose
       // timer fires after the test has finished shows up as an unhandled
@@ -111,7 +169,7 @@ async function openSocket(roomCode: string): Promise<Client> {
       while (waiters.length > 0) waiters.pop()?.abandon();
       socket.close();
     },
-    next(predicate = () => true, from = 0) {
+    next(predicate = () => true, from = baseline) {
       const existing = received.slice(from).find(predicate);
       if (existing !== undefined) return Promise.resolve(existing);
       return new Promise<ServerMessage>((resolve, reject) => {
@@ -145,6 +203,7 @@ function stub(roomCode: string): DurableObjectStub {
 }
 
 async function info(roomCode: string): Promise<{
+  exists: boolean;
   players: number;
   spectators: number;
   inProgress: boolean;
@@ -153,6 +212,7 @@ async function info(roomCode: string): Promise<{
   const response = await stub(roomCode).fetch(new Request(`${BASE}/info`));
   expect(response.status).toBe(200);
   return (await response.json()) as {
+    exists: boolean;
     players: number;
     spectators: number;
     inProgress: boolean;
@@ -201,8 +261,14 @@ async function join(
   };
 }
 
-/** Seat everyone, then have the first one start the match. */
-async function startMatch(
+/**
+ * Seat everyone, then have the first one start the match.
+ *
+ * Stops in the ARMOURY. A match opens in `shopping` with everybody pending, so
+ * this is where a player spends their starting money — the room broadcasts the
+ * shop, not a battlefield, and nobody can fire yet.
+ */
+async function startArmoury(
   roomCode: string,
   names: readonly string[],
 ): Promise<{ seats: Seat[]; snapshot: GameSnapshot }> {
@@ -216,6 +282,64 @@ async function startMatch(
   if (started.t !== 'state') throw new Error('unreachable');
   for (const seat of seats) await seat.client.next((m) => m.t === 'state');
   return { seats, snapshot: started.snapshot };
+}
+
+/**
+ * Everyone presses Ready in the armoury, which opens round one.
+ *
+ * The last `shopDone` is the one that rolls the round, and it arrives as an
+ * `events` frame rather than a `state` frame — the same frame that carries
+ * every other turn.
+ */
+async function leaveArmoury(seats: readonly Seat[]): Promise<GameSnapshot> {
+  // Cursors first. A rematch runs this a second time, and by then every client
+  // is holding the `events` frames of the match that just finished — without a
+  // cursor the wait below matches one of those and hands back a `gameover`
+  // snapshot as though it were round one.
+  const cursors = seats.map((seat) => seat.client.mark());
+  for (const seat of seats) send(seat.client.socket, { t: 'shopDone' });
+
+  let opened: GameSnapshot | undefined;
+  for (let i = 0; i < seats.length; i += 1) {
+    const seat = seats[i] as Seat;
+    const frame = await seat.client.next((m) => m.t === 'events', cursors[i]);
+    if (frame.t !== 'events') throw new Error('unreachable');
+    opened = frame.snapshot;
+  }
+  if (opened === undefined) throw new Error('nobody was in the armoury');
+  // Round one opening is setup for almost every test in this file.
+  for (const seat of seats) seat.client.settle();
+  return opened;
+}
+
+/**
+ * Run the match back and come out the other side aiming.
+ *
+ * A rematch is a fresh match, so it opens in the armoury exactly as the first
+ * one did — which is the assertion in the middle rather than a step to be got
+ * past quietly.
+ */
+async function rematch(host: Seat, seats: readonly Seat[]): Promise<GameSnapshot> {
+  const cursors = seats.map((seat) => seat.client.mark());
+  send(host.client.socket, { t: 'start' });
+  for (let i = 0; i < seats.length; i += 1) {
+    const seat = seats[i] as Seat;
+    const armoury = await seat.client.next(
+      (m) => m.t === 'state' && m.snapshot.phase === 'shopping',
+      cursors[i],
+    );
+    if (armoury.t !== 'state') throw new Error('unreachable');
+  }
+  return leaveArmoury(seats);
+}
+
+/** Seat everyone, start, shop nothing, and come out the other side aiming. */
+async function startMatch(
+  roomCode: string,
+  names: readonly string[],
+): Promise<{ seats: Seat[]; snapshot: GameSnapshot }> {
+  const { seats } = await startArmoury(roomCode, names);
+  return { seats, snapshot: await leaveArmoury(seats) };
 }
 
 /** Start a two-player match and hand back whichever client shoots first. */
@@ -235,6 +359,21 @@ async function twoPlayerMatch(roomCode: string): Promise<{
   const shooter = activeId === alice.id ? alice : bob;
   const waiter = activeId === alice.id ? bob : alice;
   return { alice, bob, shooter, waiter, snapshot };
+}
+
+/**
+ * The events of the last turn this client was sent.
+ *
+ * The pacing tests need the frame the room broadcast, not just the snapshot it
+ * carried: what the next computer player waits for is how long that frame takes
+ * to ANIMATE.
+ */
+function lastEventsFrame(seat: Seat): Extract<ServerMessage, { t: 'events' }>['events'] {
+  for (let index = seat.client.all().length - 1; index >= 0; index -= 1) {
+    const frame = seat.client.all()[index];
+    if (frame?.t === 'events') return frame.events;
+  }
+  throw new Error('this client has never been sent a turn');
 }
 
 /** Whichever seat the snapshot says is up. */
@@ -428,6 +567,85 @@ describe('worker routes', () => {
       const response = await worker.fetch(new Request(`${BASE}/api/rooms/${code}/ws`), env);
       expect(response.status).toBe(404);
     }
+  });
+});
+
+describe('a room code that is not a room', () => {
+  /** Say hello on a socket and hand back the first frame the room answers with. */
+  async function helloOn(client: Client, name: string): Promise<ServerMessage> {
+    send(client.socket, { t: 'hello', protocol: PROTOCOL_VERSION, name });
+    return client.next((m) => m.t === 'welcome' || m.t === 'error');
+  }
+
+  it('refuses a code nobody was ever given, and does not create it by refusing', async () => {
+    /*
+     * The defect: a typo dropped the player into an empty room that looked
+     * exactly like the one their friend was waiting in. `idFromName` resolves
+     * every well-formed code to a Durable Object, so "does not exist" is a
+     * decision the room has to make out loud rather than a routing failure it
+     * can discover.
+     */
+    const client = await openSocket('QZQZ', { open: false });
+    const answer = await helloOn(client, 'Lost');
+
+    expect(answer.t).toBe('error');
+    if (answer.t !== 'error') throw new Error('unreachable');
+    expect(answer.code).toBe('room_not_found');
+    // Worth reading: a code is a thing you were given by somebody.
+    expect(answer.message).toMatch(/code/i);
+
+    // Nobody was seated, and the refusal did not quietly bring the room into
+    // being for the next person to walk into either.
+    const summary = await info('QZQZ');
+    expect(summary.players).toBe(0);
+    expect(summary.exists).toBe(false);
+
+    const second = await openSocket('QZQZ', { open: false });
+    expect((await helloOn(second, 'AlsoLost')).t).toBe('error');
+
+    client.close();
+    second.close();
+  });
+
+  it('seats a player in a room the server handed out', async () => {
+    // The other half: creating a room still works, and it is the POST that
+    // makes the room rather than the socket that follows it.
+    const response = await worker.fetch(new Request(`${BASE}/api/rooms`, { method: 'POST' }), env);
+    const { roomCode } = (await response.json()) as { roomCode: string };
+    expect((await info(roomCode)).exists).toBe(true);
+
+    const client = await openSocket(roomCode, { open: false });
+    const answer = await helloOn(client, 'Host');
+    expect(answer.t).toBe('welcome');
+    expect((await info(roomCode)).players).toBe(1);
+
+    client.close();
+  });
+
+  it('is still a room after everyone leaves the lobby', async () => {
+    /*
+     * The regression this fix could easily have caused, so it is pinned.
+     *
+     * A departure before the match starts frees the seat, and a lobby with
+     * nobody human left in it is emptied entirely — so "has players" is not a
+     * durable answer to "is this a room". Somebody who steps out of their own
+     * lobby for a minute must not come back to "no room with that code", and
+     * neither must the friend they invited.
+     */
+    const room = 'QZQY';
+    const response = await worker.fetch(new Request(`${BASE}/api/rooms`, { method: 'POST' }), env);
+    void response;
+    await openRoom(room);
+
+    const alice = await openSocket(room, { open: false });
+    expect((await helloOn(alice, 'Alice')).t).toBe('welcome');
+    alice.close();
+    await waitForSocketCount(room, 0);
+    expect((await info(room)).players).toBe(0);
+
+    const bob = await openSocket(room, { open: false });
+    expect((await helloOn(bob, 'Bob')).t).toBe('welcome');
+    bob.close();
   });
 });
 
@@ -698,7 +916,7 @@ describe('gameplay over the wire', () => {
     expect(restart.t === 'error' && restart.code).toBe('wrong_phase');
 
     expect(
-      alice.client.all().some((m) => m.t === 'events'),
+      alice.client.since().some((m) => m.t === 'events'),
       'a rejected move must never produce events',
     ).toBe(false);
 
@@ -1963,6 +2181,168 @@ describe('the shop', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The armoury, before the first shell
+// ---------------------------------------------------------------------------
+
+describe('the pre-round-one armoury', () => {
+  it('opens the shop instead of the battlefield, and refuses fire until it closes', async () => {
+    const room = 'ARMA';
+    const { seats, snapshot } = await startArmoury(room, ['Alice', 'Bob']);
+    const [alice, bob] = seats as [Seat, Seat];
+
+    // What every client is looking at is a shop with everybody still in it.
+    expect(snapshot.phase).toBe('shopping');
+    expect([...snapshot.pendingShoppers].sort()).toEqual([alice.id, bob.id].sort());
+    expect(snapshot.round).toBe(1);
+    // The room agrees this is a live match, so nobody can take a seat or
+    // restart it while the shopping is going on.
+    expect((await info(room)).inProgress).toBe(true);
+
+    // And nobody can shoot their way out of the shop.
+    const cursor = alice.client.mark();
+    send(alice.client.socket, {
+      t: 'fire',
+      turnNumber: snapshot.turnNumber,
+      angleDeg: 45,
+      power: 60,
+      weapon: 'baby_missile',
+    });
+    const refusal = await alice.client.next((m) => m.t === 'error', cursor);
+    expect(refusal.t === 'error' && refusal.code).toBe('wrong_phase');
+
+    alice.client.close();
+    bob.client.close();
+  });
+
+  it('lets a human buy and a computer player arm itself, then opens round one', async () => {
+    /*
+     * The whole feature, end to end over the wire: a match starts, the shop is
+     * open, a human buys, a bot has already bought, and round one begins with
+     * both of them armed.
+     *
+     * The bot's half is the part that is easy to get wrong and impossible to
+     * see from outside: it has no socket, so a room that did not walk it
+     * through the shop would simply fight round one with the free weapon, and
+     * the lobby would look completely normal the whole time.
+     */
+    const room = 'ARMB';
+    const alice = await join(room, 'Alice');
+    send(alice.client.socket, { t: 'addBot', personality: 'cyborg' });
+    const lobby = await alice.client.next((m) => m.t === 'lobby' && m.players.length === 2);
+    if (lobby.t !== 'lobby') throw new Error('unreachable');
+    const botId = lobby.players.find((player) => player.bot != null)?.id as string;
+
+    send(alice.client.socket, { t: 'start' });
+    const opening = await alice.client.next((m) => m.t === 'state');
+    if (opening.t !== 'state') throw new Error('unreachable');
+
+    // The computer player shopped on its way through `start` and is already
+    // out, so the room is waiting for the person alone.
+    expect(opening.snapshot.phase).toBe('shopping');
+    expect(opening.snapshot.pendingShoppers).toEqual([alice.id]);
+    const botAtShop = opening.snapshot.tanks.find((tank) => tank.id === botId);
+    const humanAtStart = opening.snapshot.tanks.find((tank) => tank.id === alice.id);
+    expect(Object.keys(botAtShop?.inventory ?? {}).length).toBeGreaterThan(0);
+    // It paid for it, out of the same opening bank the human still has whole.
+    expect(botAtShop?.money as number).toBeLessThan(humanAtStart?.money as number);
+
+    // The human buys, over the wire, and gets the wallet back.
+    const buying = alice.client.mark();
+    send(alice.client.socket, { t: 'buy', weapon: 'missile', quantity: 2 });
+    const bought = await alice.client.next((m) => m.t === 'state', buying);
+    if (bought.t !== 'state') throw new Error('unreachable');
+    const humanAtShop = bought.snapshot.tanks.find((tank) => tank.id === alice.id);
+    expect(humanAtShop?.inventory['missile']).toBeGreaterThan(0);
+    expect(humanAtShop?.money as number).toBeLessThan(humanAtStart?.money as number);
+    // Still shopping: buying is not leaving.
+    expect(bought.snapshot.phase).toBe('shopping');
+
+    // Ready. Round one opens, and both tanks carry what they bought into it.
+    const opened = await leaveArmoury([alice]);
+    expect(opened.phase).toBe('aiming');
+    expect(opened.round).toBe(1);
+    expect(opened.pendingShoppers).toEqual([]);
+
+    for (const tank of opened.tanks) {
+      const armed = Object.entries(tank.inventory).filter(([, rounds]) => rounds > 0);
+      expect(armed.length, `${tank.name} opened round one with nothing bought`).toBeGreaterThan(0);
+    }
+    expect(opened.tanks.find((tank) => tank.id === alice.id)?.inventory['missile']).toBe(
+      humanAtShop?.inventory['missile'],
+    );
+
+    // …and the round is real: the shot goes off, fired from the shop's stock.
+    const active = opened.tanks[opened.activeTank];
+    if (active?.id === alice.id) {
+      const cursor = alice.client.mark();
+      send(alice.client.socket, {
+        t: 'fire',
+        turnNumber: opened.turnNumber,
+        angleDeg: 45,
+        power: 60,
+        weapon: 'missile',
+      });
+      const frame = await alice.client.next((m) => m.t === 'events', cursor);
+      expect(frame.t === 'events' && frame.events.some((event) => event.type === 'shot')).toBe(
+        true,
+      );
+    }
+
+    alice.client.close();
+  });
+
+  it('leaves the shop waiting for the person and nobody else', async () => {
+    // Two machines and one person. Nothing about the room may depend on a bot
+    // pressing a button, because a bot never will.
+    const room = 'ARMC';
+    const alice = await join(room, 'Alice');
+    for (const personality of ['shooter', 'annihilator']) {
+      const before = alice.client.mark();
+      send(alice.client.socket, { t: 'addBot', personality });
+      await alice.client.next((m) => m.t === 'lobby', before);
+    }
+
+    send(alice.client.socket, { t: 'start' });
+    const opening = await alice.client.next((m) => m.t === 'state');
+    if (opening.t !== 'state') throw new Error('unreachable');
+    expect(opening.snapshot.tanks).toHaveLength(3);
+    expect(opening.snapshot.pendingShoppers).toEqual([alice.id]);
+    for (const tank of opening.snapshot.tanks) {
+      if (tank.id === alice.id) continue;
+      expect(Object.keys(tank.inventory).length, `${tank.name} did not shop`).toBeGreaterThan(0);
+    }
+
+    alice.client.close();
+  });
+
+  it('closes the armoury on the shop clock, not the turn clock', async () => {
+    // A player who walks off in the armoury must not freeze the match, and the
+    // clock they are on is the shop's — the longer of the two, because reading
+    // an arsenal takes longer than picking an angle.
+    const room = 'ARMD';
+    const { seats } = await startArmoury(room, ['Alice', 'Bob']);
+    const [alice, bob] = seats as [Seat, Seat];
+
+    const row = await readTurnRow(room);
+    expect(row.phase).toBe('shopping');
+    expect(row.deadlineAt).not.toBeNull();
+    const left = (row.deadlineAt as number) - Date.now();
+    expect(left).toBeLessThanOrEqual(SHOP_TIMEOUT_MS);
+    expect(left).toBeGreaterThan(TURN_TIMEOUT_MS);
+
+    // Nobody presses anything; the clock closes it and round one starts anyway.
+    expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+    const forced = await bob.client.next((m) => m.t === 'events');
+    if (forced.t !== 'events') throw new Error('unreachable');
+    expect(forced.snapshot.phase).toBe('aiming');
+    expect(forced.snapshot.round).toBe(1);
+
+    alice.client.close();
+    bob.client.close();
+  });
+});
+
 describe('end of match', () => {
   it('refuses moves after the last round and lets the host run it back', async () => {
     const room = 'HHHA';
@@ -1988,17 +2368,10 @@ describe('end of match', () => {
 
     // … but it is not a dead room: the host can start a rematch, and the new
     // match is a different match, not a replay of the old one.
-    const beforeRematch = bob.client.mark();
-    send(alice.client.socket, { t: 'start' });
-    const rematch = await bob.client.next(
-      (m) => m.t === 'state' && m.snapshot.phase === 'aiming',
-      beforeRematch,
-    );
-    expect(rematch.t).toBe('state');
-    if (rematch.t === 'state') {
-      expect(rematch.snapshot.seed).not.toBe(snapshot.seed);
-      expect(rematch.snapshot.tanks.every((tank) => tank.health > 0)).toBe(true);
-    }
+    const again = await rematch(alice, [alice, bob]);
+    expect(again.seed).not.toBe(snapshot.seed);
+    expect(again.tanks.every((tank) => tank.health > 0)).toBe(true);
+    expect(again.phase).toBe('aiming');
 
     alice.client.close();
     bob.client.close();
@@ -2114,6 +2487,145 @@ describe('end of match', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The ending has to reach everybody
+// ---------------------------------------------------------------------------
+
+/**
+ * Finish a match by resolving one shot, and hand back the seats.
+ *
+ * The board is doctored to the last round with one tank standing and enough
+ * health on it that no shot can take it out, so resolving ANY turn ends the
+ * match with a winner. Scripting a kill instead would make these tests about
+ * aiming, which is not what they are for.
+ */
+async function finishMatch(
+  room: string,
+  names: readonly string[],
+): Promise<{ seats: Seat[]; winnerId: string }> {
+  const { seats, snapshot } = await startMatch(room, names);
+  const shooter = activeSeat(seats, snapshot);
+
+  await editPersistedGame(room, (game) => ({
+    ...game,
+    round: game.totalRounds,
+    tanks: game.tanks.map((tank, index) => ({
+      ...tank,
+      alive: index === game.activeTank,
+      health: index === game.activeTank ? 5000 : 0,
+    })),
+  }));
+
+  send(shooter.client.socket, {
+    t: 'fire',
+    turnNumber: snapshot.turnNumber,
+    angleDeg: 45,
+    power: 70,
+    weapon: 'baby_missile',
+  });
+  for (const seat of seats) await seat.client.next((m) => m.t === 'matchResult');
+  return { seats, winnerId: shooter.id };
+}
+
+describe('the ending is visible and final', () => {
+  it('tells every client in the room the same result, unprompted', async () => {
+    /*
+     * Not "the shooter finds out". A match ends for everybody at once, and the
+     * losers are the ones who need telling.
+     */
+    const room = 'ENDA';
+    const { seats, winnerId } = await finishMatch(room, ['Alice', 'Bob', 'Carol']);
+
+    const results = seats.map((seat) => {
+      const frame = seat.client.since().find((m) => m.t === 'matchResult');
+      expect(frame, `${seat.id} was never told the match ended`).toBeDefined();
+      return frame as Extract<ServerMessage, { t: 'matchResult' }>;
+    });
+
+    for (const result of results) {
+      expect(result.winnerId).toBe(winnerId);
+      expect(result.standings).toHaveLength(3);
+      expect(result.standings[0]?.place).toBe(1);
+      expect(result.standings.map((row) => row.playerId).sort()).toEqual(
+        seats.map((seat) => seat.id).sort(),
+      );
+    }
+    // Byte-identical, not merely consistent: three clients drawing three
+    // different scoreboards for one match is the failure this rules out.
+    expect(new Set(results.map((result) => JSON.stringify(result))).size).toBe(1);
+
+    // And the sim's own verdict, on the wire, agrees with the scoreboard.
+    const finalState = seats[0]?.client
+      .since()
+      .filter((m) => m.t === 'events')
+      .pop();
+    expect(finalState?.t === 'events' && finalState.snapshot.phase).toBe('gameover');
+    expect(finalState?.t === 'events' && finalState.snapshot.winnerId).toBe(winnerId);
+    expect(
+      finalState?.t === 'events' && finalState.events.some((event) => event.type === 'gameOver'),
+    ).toBe(true);
+
+    for (const seat of seats) seat.client.close();
+  });
+
+  it('tells somebody who arrives after it is over, too', async () => {
+    /*
+     * `matchResult` used to be sent exactly once, at the moment the match
+     * ended, so anyone who joined, reconnected or was a beat late in
+     * handshaking got the final snapshot and no standings. That is not an empty
+     * screen — a client can rank the snapshot by score — but the fallback
+     * cannot know places or rounds won, so two people looking at the same
+     * finished match saw two different scoreboards.
+     */
+    const room = 'ENDB';
+    const { seats, winnerId } = await finishMatch(room, ['Alice', 'Bob']);
+    const original = seats[0]?.client.since().find((m) => m.t === 'matchResult');
+
+    const latecomer = await join(room, 'Dave');
+    const state = await latecomer.client.next((m) => m.t === 'state');
+    expect(state.t === 'state' && state.snapshot.phase).toBe('gameover');
+
+    const told = await latecomer.client.next((m) => m.t === 'matchResult');
+    expect(told.t).toBe('matchResult');
+    expect(told.t === 'matchResult' && told.winnerId).toBe(winnerId);
+    // The same scoreboard the room sent when it happened, not a reconstruction.
+    expect(JSON.stringify(told)).toBe(JSON.stringify(original));
+
+    // A returning seat holder gets it as well — the reconnect path and the
+    // fresh-arrival path both run through `sendLiveState`.
+    const back = await join(room, 'Alice', { sessionId: seats[0]?.secret });
+    const again = await back.client.next((m) => m.t === 'matchResult');
+    expect(JSON.stringify(again)).toBe(JSON.stringify(original));
+
+    for (const seat of seats) seat.client.close();
+    latecomer.client.close();
+    back.client.close();
+  });
+
+  it('leaves a room that can be played again', async () => {
+    // Final, not fatal. The match takes no more moves, and the host can run it
+    // back — which is the only "play again" the room can offer.
+    const room = 'ENDC';
+    const { seats } = await finishMatch(room, ['Alice', 'Bob']);
+    const [alice, bob] = seats as [Seat, Seat];
+
+    expect((await info(room)).inProgress).toBe(false);
+
+    const cursor = alice.client.mark();
+    send(alice.client.socket, { t: 'buy', weapon: 'missile', quantity: 1 });
+    const refusal = await alice.client.next((m) => m.t === 'error', cursor);
+    expect(refusal.t === 'error' && refusal.code).toBe('wrong_phase');
+
+    const again = await rematch(alice, [alice, bob]);
+    expect(again.phase).toBe('aiming');
+    expect(again.round).toBe(1);
+    expect(again.tanks.every((tank) => tank.alive && tank.health > 0)).toBe(true);
+
+    alice.client.close();
+    bob.client.close();
+  });
+});
+
 describe('persistence', () => {
   it('keeps a replay log that survives eviction and never grows without bound', async () => {
     const room = 'JJJA';
@@ -2171,19 +2683,13 @@ describe('persistence', () => {
     // which is the entire reason `replay_v2` carries a match column and the old
     // `replay` table was dropped rather than migrated.
     await editPersistedGame(room, (game) => ({ ...game, phase: 'gameover' }));
-    const cursor = bob.client.mark();
-    send(alice.client.socket, { t: 'start' });
-    const rematch = await bob.client.next(
-      (m) => m.t === 'state' && m.snapshot.phase === 'aiming',
-      cursor,
-    );
-    if (rematch.t !== 'state') throw new Error('unreachable');
+    const rerun = await rematch(alice, [alice, bob]);
 
-    const up = activeSeat([alice, bob], rematch.snapshot);
+    const up = activeSeat([alice, bob], rerun);
     const upCursor = up.client.mark();
     send(up.client.socket, {
       t: 'fire',
-      turnNumber: rematch.snapshot.turnNumber,
+      turnNumber: rerun.turnNumber,
       angleDeg: 45,
       power: 70,
       weapon: 'baby_missile',
@@ -2196,9 +2702,14 @@ describe('persistence', () => {
     // The collision really happened: one turn number, two matches, both rows
     // still there.
     const collidingTurn = (second[0] as { turn: number }).turn;
-    expect(rows.filter((row) => row.turn === collidingTurn).map((row) => row.match)).toEqual([
-      1, 2,
-    ]);
+    // A SET, not a list: the row that opens a round and the row for the first
+    // shot of that round both carry the round's opening turn number, so match 1
+    // legitimately has two rows at turn 1. What is being tested is that a
+    // rematch did not overwrite them, and that is about which MATCHES are
+    // present, not how many rows each contributed.
+    expect(
+      new Set(rows.filter((row) => row.turn === collidingTurn).map((row) => row.match)),
+    ).toEqual(new Set([1, 2]));
 
     alice.client.close();
     bob.client.close();
@@ -2206,7 +2717,7 @@ describe('persistence', () => {
 
   it('caps the replay log', async () => {
     const room = 'JJJB';
-    const { alice, bob } = await twoPlayerMatch(room);
+    const { alice, bob, snapshot } = await twoPlayerMatch(room);
 
     // Stuff the log past its cap directly — playing several hundred turns of
     // artillery to prove a DELETE runs would be a slow way to test a DELETE.
@@ -2221,13 +2732,8 @@ describe('persistence', () => {
       }
     });
 
-    const shooterSnapshot = await alice.client.next((m) => m.t === 'state');
-    const turnNumber = shooterSnapshot.t === 'state' ? shooterSnapshot.snapshot.turnNumber : 1;
-    const activeId =
-      shooterSnapshot.t === 'state'
-        ? shooterSnapshot.snapshot.tanks[shooterSnapshot.snapshot.activeTank]?.id
-        : undefined;
-    const shooter = activeId === alice.id ? alice : bob;
+    const turnNumber = snapshot.turnNumber;
+    const shooter = activeSeat([alice, bob], snapshot);
 
     send(shooter.client.socket, {
       t: 'fire',
@@ -2281,7 +2787,13 @@ async function soloVersusBot(
   send(alice.client.socket, { t: 'start' });
   const started = await alice.client.next((m) => m.t === 'state');
   if (started.t !== 'state') throw new Error('unreachable');
-  return { alice, botId: seat.id, snapshot: started.snapshot };
+  // The match opens in the armoury. The computer player shopped and left on the
+  // way through `start`; the human has to press Ready, and that is what opens
+  // round one.
+  expect(started.snapshot.phase).toBe('shopping');
+  expect(started.snapshot.pendingShoppers).toEqual([alice.id]);
+  const opened = await leaveArmoury([alice]);
+  return { alice, botId: seat.id, snapshot: opened };
 }
 
 /** The shot the sim says this seat takes, derived from what the room persisted. */
@@ -2336,6 +2848,10 @@ async function allBotMatch(
   }
   send(alice.client.socket, { t: 'start' });
   await alice.client.next((m) => m.t === 'state');
+  // Out of the armoury first, and with a human still holding a seat: the shop
+  // waits for a socket, and a seat that has just been turned into a machine
+  // does not have one.
+  await leaveArmoury([alice]);
 
   await editPersistedGame(roomCode, (game) => ({
     ...game,
@@ -2463,6 +2979,210 @@ describe('computer players', () => {
     // And the match moved on: the turn came back to the human.
     expect(frame.snapshot.turnNumber).toBe(before.turnNumber + 1);
     expect(frame.snapshot.tanks[frame.snapshot.activeTank]?.id).toBe(alice.id);
+
+    alice.client.close();
+  });
+
+  it('paces a computer player like an opponent thinking, not like a wait', async () => {
+    /*
+     * Pacing, measured without waiting for any of it.
+     *
+     * The pause in front of a bot's shot used to be a flat 1500 ms, which over
+     * a bot-only match of dozens of turns is most of the match spent watching
+     * nothing. Two things had to be true to shorten it, and both are asserted
+     * here rather than argued:
+     *
+     *  - it is SHORT. Every personality pauses for well under a second and a
+     *    half, so the dead air is gone.
+     *  - it VARIES, and in an order that means something. A metronome at any
+     *    speed reads as a machine waiting; a Moron that snaps off a shot and an
+     *    Annihilator that takes a beat over it read as two different opponents.
+     *    The Moron does not aim at all — that is its whole personality — so it
+     *    is the one that must be quickest.
+     *
+     * Read off the pure function the room schedules with, so nothing here sits
+     * through a real delay, and stated as relationships rather than as the
+     * millisecond counts, which a test that repeated them would not be testing.
+     */
+    const delays = BOT_PERSONALITIES.map((personality) => ({
+      personality,
+      ms: BOT_TURN_DELAY_MS[personality],
+    }));
+
+    for (const { personality, ms } of delays) {
+      expect(ms, `${personality} pauses for ${ms}ms`).toBeGreaterThan(0);
+      // Comfortably inside a second and a half, which is where this started.
+      expect(ms, `${personality} pauses for ${ms}ms`).toBeLessThan(1_200);
+      // And nowhere near a human's turn clock: this is pacing, not thinking.
+      expect(ms).toBeLessThan(TURN_TIMEOUT_MS / 10);
+    }
+
+    // Not a metronome.
+    expect(new Set(delays.map((row) => row.ms)).size).toBeGreaterThan(2);
+    // The one that does not aim is the one that does not pause.
+    const quickest = delays.reduce((a, b) => (b.ms < a.ms ? b : a));
+    expect(quickest.personality).toBe('moron');
+    expect(BOT_TURN_DELAY_MS.annihilator).toBeGreaterThan(BOT_TURN_DELAY_MS.moron * 2);
+  });
+
+  it('gives each seat the pause its own personality asks for', async () => {
+    /*
+     * The table above is only pacing if the room reads it per seat. A room that
+     * scheduled every bot on one number would pass every assertion in the test
+     * above and pace nothing, so this one goes through the real alarm: seat two
+     * different personalities and compare the gap each of them is given.
+     *
+     * `botTurnDelayMs` is the function the room schedules with, and it is
+     * applied to the room's OWN persisted state — not to a state built here —
+     * so the two cannot drift apart.
+     *
+     * The gap the room actually leaves is this pause PLUS the animation of the
+     * turn it just sent — that is the next test — so what is checked here is
+     * that the personality half of it is present and is the seat's own.
+     */
+    const room = 'PACE';
+    const alice = await join(room, 'Alice');
+    for (const personality of ['moron', 'annihilator']) {
+      const before = alice.client.mark();
+      send(alice.client.socket, { t: 'addBot', personality });
+      await alice.client.next((m) => m.t === 'lobby', before);
+    }
+    send(alice.client.socket, { t: 'start' });
+    await alice.client.next((m) => m.t === 'state');
+    let snapshot = await leaveArmoury([alice]);
+    let lastEvents = lastEventsFrame(alice);
+
+    const seen = new Map<string, number>();
+    // Walk the turn round the table, reading the alarm on every bot turn.
+    for (let turn = 0; turn < 6 && seen.size < 2; turn += 1) {
+      const game = fromPersisted(await readPersistedGame(room));
+      const active = game.tanks[game.activeTank];
+      const pause = botTurnDelayMs(game);
+
+      if (pause === null) {
+        expect(active?.id).toBe(alice.id);
+        snapshot = await passTurn(alice, snapshot);
+        lastEvents = lastEventsFrame(alice);
+        continue;
+      }
+
+      const alarmAt = await runInDurableObject(stub(room), (_instance, state) =>
+        state.storage.getAlarm(),
+      );
+      const deadline = (await readTurnRow(room)).deadlineAt as number;
+      expect(alarmAt).not.toBeNull();
+      /*
+       * The alarm is the gap, not the turn clock. `deadlineAt` was written from
+       * the same `Date.now()` that set the alarm, so subtracting the clock's
+       * own length recovers the instant the room armed it — no wall-clock
+       * reading from out here, and therefore no round trip in the measurement.
+       */
+      const gap = (alarmAt as number) - (deadline - TURN_TIMEOUT_MS);
+      expect(gap).toBe(pause + estimatePlaybackMs(lastEvents));
+      seen.set(active?.bot ?? '', pause);
+
+      const cursor = alice.client.mark();
+      expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+      const frame = await alice.client.next((m) => m.t === 'events', cursor);
+      if (frame.t !== 'events') throw new Error('unreachable');
+      snapshot = frame.snapshot;
+      lastEvents = frame.events;
+    }
+
+    expect([...seen.keys()].sort()).toEqual(['annihilator', 'moron']);
+    // The two seats really were paced differently, by the room, on real alarms.
+    expect(seen.get('moron')).toBeLessThan(seen.get('annihilator') as number);
+
+    alice.client.close();
+  });
+
+  it('never lets a computer player outrun the turn the client is still animating', async () => {
+    /*
+     * The regression this whole pacing split exists for, stated as the property
+     * a player would notice.
+     *
+     * `BOT_TURN_DELAY_MS` is 400–1000 ms per personality and a turn takes
+     * roughly 840–1500 ms to animate. `BattleScene` queues turns with a backlog
+     * of exactly ONE and drops the older one when overtaken — a sound design,
+     * and the reason the board stays correct — so a server that outruns
+     * playback does not corrupt anything. It just means the player never sees a
+     * share of the shots, and the game reads as skipping. With three computer
+     * players in the room that was the normal case, not an edge one.
+     *
+     * So: walk a real match on real alarms, and for every hand-off from one
+     * machine to another require the gap the room scheduled to be at least the
+     * animation cost of the frame it just broadcast. Measured, not waited for —
+     * the whole point of `estimatePlaybackMs` being a pure function is that this
+     * test costs milliseconds.
+     */
+    const room = 'PACB';
+    const alice = await join(room, 'Alice');
+    for (const personality of ['shooter', 'cyborg', 'annihilator']) {
+      const before = alice.client.mark();
+      send(alice.client.socket, { t: 'addBot', personality });
+      await alice.client.next((m) => m.t === 'lobby', before);
+    }
+    send(alice.client.socket, { t: 'start' });
+    await alice.client.next((m) => m.t === 'state');
+    let snapshot = await leaveArmoury([alice]);
+
+    /** Every bot-to-bot hand-off seen, as (animation, whole gap). */
+    const handoffs: { playbackMs: number; gapMs: number; pauseMs: number }[] = [];
+
+    for (let turn = 0; turn < 10 && handoffs.length < 4; turn += 1) {
+      const game = fromPersisted(await readPersistedGame(room));
+      if (botTurnDelayMs(game) === null) {
+        snapshot = await passTurn(alice, snapshot);
+        continue;
+      }
+
+      // Take the bot's turn and keep the frame the room sent for it.
+      const cursor = alice.client.mark();
+      expect(await runDurableObjectAlarm(stub(room))).toBe(true);
+      const frame = await alice.client.next((m) => m.t === 'events', cursor);
+      if (frame.t !== 'events') throw new Error('unreachable');
+      snapshot = frame.snapshot;
+
+      // …then look at what the room scheduled for whoever is up next.
+      const next = fromPersisted(await readPersistedGame(room));
+      const pause = botTurnDelayMs(next);
+      if (pause === null) continue; // handed back to the human: a clock, not pacing
+
+      const alarmAt = await runInDurableObject(stub(room), (_instance, state) =>
+        state.storage.getAlarm(),
+      );
+      const deadline = (await readTurnRow(room)).deadlineAt as number;
+      expect(alarmAt).not.toBeNull();
+
+      handoffs.push({
+        playbackMs: estimatePlaybackMs(frame.events),
+        gapMs: (alarmAt as number) - (deadline - TURN_TIMEOUT_MS),
+        pauseMs: pause,
+      });
+    }
+
+    expect(handoffs.length, 'no machine ever handed over to another machine').toBeGreaterThan(0);
+
+    for (const { playbackMs, gapMs, pauseMs } of handoffs) {
+      // The turn really does take a visible amount of time to watch, so the
+      // assertion below is not being satisfied by an empty frame.
+      expect(playbackMs, 'a real turn animated for no time at all').toBeGreaterThan(300);
+      // The fix: the animation is paid for, and the personality pause is on top.
+      expect(gapMs).toBeGreaterThanOrEqual(playbackMs);
+      expect(gapMs).toBe(playbackMs + pauseMs);
+    }
+
+    /*
+     * …and the defect itself, measured rather than asserted from the report: a
+     * real turn outlasts the shortest pause in the table, so a room that paced
+     * on the pause alone would be handing the next machine the board while the
+     * client was still drawing the last one.
+     */
+    const longest = Math.max(...handoffs.map((handoff) => handoff.playbackMs));
+    const quickest = Math.min(...Object.values(BOT_TURN_DELAY_MS));
+    expect(longest, 'no turn here animates for longer than the quickest pause').toBeGreaterThan(
+      quickest,
+    );
 
     alice.client.close();
   });
@@ -2795,10 +3515,12 @@ describe('computer players', () => {
     const started = await bob.client.next((m) => m.t === 'state');
     if (started.t !== 'state') throw new Error('unreachable');
     await alice.client.next((m) => m.t === 'state');
+    // Both humans out of the armoury; the Cyborg shopped and left on its own.
+    const opened = await leaveArmoury([alice, bob]);
 
     // Whoever the seed put first, walk the turn round to the machine.
     const humans = [alice, bob];
-    let snapshot = started.snapshot;
+    let snapshot = opened;
     while (humans.some((seat) => seat.id === snapshot.tanks[snapshot.activeTank]?.id)) {
       snapshot = await passTurn(activeSeat(humans, snapshot), snapshot);
     }

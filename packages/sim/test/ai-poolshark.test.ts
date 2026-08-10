@@ -45,16 +45,10 @@
 import { describe, expect, it } from 'vitest';
 
 import { chooseShot, chooseShotDetailed, type BotPersonality } from '../src/ai.ts';
-import {
-  createGame,
-  DEFAULT_WORLD,
-  fire,
-  predictShot,
-  type GameState,
-  type Tank,
-} from '../src/game.ts';
+import { DEFAULT_WORLD, fire, predictShot, type GameState, type Tank } from '../src/game.ts';
 import { hypot2 } from '../src/math.ts';
 import { TERRAIN_STYLES } from '../src/terrain.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -86,7 +80,7 @@ function missOf(state: GameState, decision: ReturnType<typeof chooseShot>): numb
 /** Turn-by-turn miss for one personality over one duel. */
 function duel(seed: string, personality: BotPersonality): number[] {
   let state = handBack(
-    createGame({ seed, width: WIDTH, height: HEIGHT }, [
+    openedGame({ seed, width: WIDTH, height: HEIGHT }, [
       { id: 'a', name: 'A', bot: personality },
       { id: 'b', name: 'B' },
     ]),
@@ -185,7 +179,7 @@ describe('the Poolshark walks its aim in', () => {
     // The bracket is cheap by construction — it re-flies one remembered aim,
     // checks the correction, and has one way out of a trap. If it ever starts
     // costing what the solver costs, it has stopped being a bracket.
-    const state = createGame({ seed: 'cost', width: WIDTH, height: HEIGHT }, [
+    const state = openedGame({ seed: 'cost', width: WIDTH, height: HEIGHT }, [
       { id: 'a', name: 'A', bot: 'poolshark' },
       { id: 'b', name: 'B' },
     ]);
@@ -205,7 +199,7 @@ describe('the memory is derived, not stored', () => {
    * claim in `ai.ts` is false.
    */
   it('brackets from the aim the tank is carrying', () => {
-    const base = createGame({ seed: 'derived', width: WIDTH, height: HEIGHT }, [
+    const base = openedGame({ seed: 'derived', width: WIDTH, height: HEIGHT }, [
       { id: 'a', name: 'A', bot: 'poolshark' },
       { id: 'b', name: 'B' },
     ]);
@@ -253,7 +247,7 @@ describe('the memory is derived, not stored', () => {
     const states: GameState[] = [];
     for (const style of TERRAIN_STYLES) {
       for (let seed = 0; seed < 12; seed += 1) {
-        const base = createGame({ seed: `edge-${style}-${seed}`, width: WIDTH, height: HEIGHT }, [
+        const base = openedGame({ seed: `edge-${style}-${seed}`, width: WIDTH, height: HEIGHT }, [
           { id: 'a', name: 'A', bot: 'poolshark' },
           { id: 'b', name: 'B' },
         ]);
@@ -300,7 +294,7 @@ describe('the memory is derived, not stored', () => {
     // After a kill the next target can be on the other side, so the remembered
     // aim is mirrored. The bracket has to fold it onto the right side rather
     // than spend a turn shooting off the edge of the world.
-    const base = createGame({ seed: 'mirrored', width: WIDTH, height: HEIGHT }, [
+    const base = openedGame({ seed: 'mirrored', width: WIDTH, height: HEIGHT }, [
       { id: 'a', name: 'A', bot: 'poolshark' },
       { id: 'b', name: 'B' },
     ]);

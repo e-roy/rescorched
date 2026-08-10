@@ -69,9 +69,10 @@
 import { describe, expect, it } from 'vitest';
 
 import { BOT_PERSONALITIES, chooseShotDetailed, type BotPersonality } from '../src/ai.ts';
-import { createGame, predictShot, type GameState, type PlayerSeed } from '../src/game.ts';
+import { predictShot, type GameState, type PlayerSeed } from '../src/game.ts';
 import { TERRAIN_STYLES } from '../src/terrain.ts';
 import { WEAPONS } from '../src/weapons.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -99,7 +100,7 @@ const GAMES: Match[] = [];
 for (const style of TERRAIN_STYLES) {
   for (const count of COUNTS) {
     for (let seed = 0; seed < SEEDS; seed += 1) {
-      const base = createGame(
+      const base = openedGame(
         {
           seed: `perf-${style}-${count}-${seed}`,
           terrainStyle: style,

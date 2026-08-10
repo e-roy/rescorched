@@ -30,6 +30,8 @@ import {
   fire,
   hashGameState,
   IllegalMoveError,
+  isArmouryBeforeRoundOne,
+  roundStartTurn,
   type GamePhase,
   type GameState,
   type Tank,
@@ -50,6 +52,7 @@ import {
 } from '../src/economy.ts';
 import { BABY_MISSILE, getWeapon, requireWeapon, WEAPONS, type WeaponDef } from '../src/weapons.ts';
 import { makeRng } from '../src/rng.ts';
+import { openedGame } from './opening.ts';
 
 const PLAYERS = [
   { id: 'p1', name: 'Alice' },
@@ -92,13 +95,19 @@ async function loadProtocol(): Promise<{
 }
 
 /**
- * A game parked in the intermission after `round` rounds.
+ * A game parked in the INTERMISSION after `round` rounds.
  *
  * `state.round` is the round just finished while the phase is `shopping`, which
  * is exactly what the arms level counts, so `round` here IS "rounds fought".
  * The underlying game is built once and only ever spread from: `createGame`
  * generates a 1280-column terrain, and the property tests below ask for
  * thousands of these.
+ *
+ * `turnNumber` is not decoration. A `shopping` state on turn 0 is the pre-match
+ * ARMOURY, which counts zero rounds fought whatever `round` says — see
+ * `isArmouryBeforeRoundOne`. Handing that state to a test about the arms level
+ * would silently measure the wrong shop, so this fixture puts the clock where a
+ * real intermission after `round` rounds would have left it.
  */
 let sharedBase: GameState | undefined;
 function shoppingState(round = 5, money = 100000): GameState {
@@ -108,9 +117,17 @@ function shoppingState(round = 5, money = 100000): GameState {
     ...base,
     round,
     phase: 'shopping',
+    turnNumber: roundStartTurn({ round, tanks: base.tanks }),
     pendingShoppers: base.tanks.map((tank) => tank.id),
     tanks: base.tanks.map((tank) => ({ ...tank, money, inventory: {} })),
   };
+}
+
+/** The real pre-match armoury, exactly as `createGame` hands it over. */
+function armouryState(money = DEFAULT_WORLD.startingMoney): GameState {
+  sharedBase ??= createGame({ seed: 'SHOP:1', totalRounds: 9 }, PLAYERS);
+  const base = sharedBase;
+  return { ...base, tanks: base.tanks.map((tank) => ({ ...tank, money, inventory: {} })) };
 }
 
 function tankOf(state: GameState, id: string): Tank {
@@ -181,7 +198,7 @@ function predictBuy(
   weaponId: string,
   quantity: number,
 ): ShopErrorCode | null {
-  if (state.phase !== 'shopping' && state.phase !== 'lobby') return 'wrong_phase';
+  if (state.phase !== 'shopping') return 'wrong_phase';
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_PURCHASE_QUANTITY) {
     return 'bad_quantity';
   }
@@ -471,13 +488,22 @@ describe('shop hours', () => {
     expect(() => buy(state, 'p1', CHEAP.id)).not.toThrow();
   });
 
-  it('trades in the pre-match armoury, which nothing opens yet', () => {
-    // `lobby` is a hook for buying before round 1. No code path produces it
-    // today; the rules for it are the same rules, so they are asserted here
-    // rather than left to be discovered when someone wires it up.
-    const state: GameState = { ...shoppingState(1), phase: 'lobby', round: 1 };
+  it('trades in the pre-match armoury, which is where a match now begins', () => {
+    // Not a hook any more: `createGame` hands this state straight back, so the
+    // very first thing a player does in a match is spend their opening bank.
+    const state = armouryState();
+    expect(isArmouryBeforeRoundOne(state)).toBe(true);
     expect(roundsFought(state)).toBe(0);
     expect(() => buy(state, 'p1', CHEAP.id)).not.toThrow();
+  });
+
+  it('is shut in the lobby, which is no longer a shop', () => {
+    // `isShopOpen` used to accept `lobby` as the pre-match armoury. The armoury
+    // is a real `shopping` phase now, so `lobby` is just a phase with no game
+    // in it — and a shop that opens there would let a client trade against a
+    // state the turn machine has not built yet.
+    const state: GameState = { ...armouryState(), phase: 'lobby' };
+    expectRefusal(() => buy(state, 'p1', CHEAP.id), 'wrong_phase', /shop is closed/i);
   });
 });
 
@@ -492,9 +518,8 @@ describe('the free weapon', () => {
     expect(items).toHaveLength(FOR_SALE.length);
   });
 
-  it('cannot be bought at any quantity, in any phase the shop is open', () => {
-    for (const phase of ['shopping', 'lobby'] as const) {
-      const state: GameState = { ...shoppingState(), phase };
+  it('cannot be bought at any quantity, at either visit to the shop', () => {
+    for (const state of [shoppingState(), armouryState()]) {
       for (const quantity of [1, 2, MAX_PURCHASE_QUANTITY]) {
         expectRefusal(
           () => buy(state, 'p1', BABY_MISSILE, quantity),
@@ -806,16 +831,11 @@ describe('arms level', () => {
     expect(DEFAULT_WORLD.startingMoney + perRound).toBeGreaterThanOrEqual(dearest.price);
   });
 
-  it('says plainly what an ungated tier 3 would mean in a pre-match armoury', () => {
-    // The gate that was removed could only ever have fired here, in the `lobby`
-    // shop nothing opens yet. This is the consequence, pinned so that whoever
-    // wires that shop up sees the numbers instead of discovering them: an
-    // opening bank reaches four of the five tier 3 weapons and no further.
-    const armoury: GameState = {
-      ...shoppingState(1, DEFAULT_WORLD.startingMoney),
-      phase: 'lobby',
-      round: 1,
-    };
+  it('lets an opening bank reach four of the five tier 3 weapons, and no further', () => {
+    // The consequence of having no tier 3 gate, now that the pre-match armoury
+    // is a real shop rather than a hook: this is what 10000 buys before a shot
+    // is fired.
+    const armoury = armouryState(DEFAULT_WORLD.startingMoney);
     expect(roundsFought(armoury)).toBe(0);
 
     const tierThree = FOR_SALE.filter((weapon) => weapon.tier === 3);
@@ -851,7 +871,22 @@ describe('arms level', () => {
     expect(roundsFought({ ...base, phase: 'gameover' })).toBe(3);
     expect(roundsFought({ ...base, phase: 'aiming' })).toBe(2);
     expect(roundsFought({ ...base, phase: 'resolving' })).toBe(2);
-    expect(roundsFought({ ...base, phase: 'lobby', round: 1 })).toBe(0);
+    // The armoury is the one `shopping` state that has fought nothing.
+    expect(roundsFought(armouryState())).toBe(0);
+  });
+
+  it('offers the same shelf at the armoury as the client believes it does', () => {
+    /*
+     * `apps/client/src/ui/armoury.ts` computes rounds fought as `round` for any
+     * `shopping` phase, so at the pre-match armoury it says 1 where this
+     * package says 0. That is allowed to stand only because the two answers
+     * cannot differ in effect, and this is the test that keeps it that way: add
+     * a gate at one round fought and it goes red, instead of the client
+     * offering a weapon `buy()` then refuses.
+     */
+    for (const weapon of FOR_SALE) {
+      expect(isOnTheShelf(weapon, 0), weapon.id).toBe(isOnTheShelf(weapon, 1));
+    }
   });
 });
 
@@ -1157,7 +1192,7 @@ describe('what a round pays', () => {
     // Two tanks stacked on one spot: the shell hits the second tank's circle at
     // the muzzle, so this is a scripted, deterministic kill through the real
     // fire → detonate → endRound path rather than an assertion about it.
-    const base = createGame({ seed: 'PAYOUT:1', totalRounds: 3 }, [
+    const base = openedGame({ seed: 'PAYOUT:1', totalRounds: 3 }, [
       { id: 'p1', name: 'A' },
       { id: 'p2', name: 'B' },
     ]);

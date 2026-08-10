@@ -13,14 +13,16 @@ import {
 import { buy, leaveShop } from '../src/economy.ts';
 import { BABY_MISSILE } from '../src/weapons.ts';
 import { fromPersisted, toPersisted, toSnapshot } from '../src/serialize.ts';
+import { openedGame } from './opening.ts';
 
 const PLAYERS = [
   { id: 'p1', name: 'Alice' },
   { id: 'p2', name: 'Bob' },
 ];
 
+/** A match past the opening armoury: round 1, turn 1, ready to shoot. */
 function newGame(seed: number | string = 'ABCD:1'): GameState {
-  return createGame({ seed, totalRounds: 2 }, PLAYERS);
+  return openedGame({ seed, totalRounds: 2 }, PLAYERS);
 }
 
 /** Whose turn it is. Turn order is shuffled per round, so nothing may assume 0. */

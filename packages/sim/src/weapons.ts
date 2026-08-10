@@ -21,6 +21,30 @@
  * it, where "hit" means damage actually dealt to a tank by a real detonation.
  * A pack price alone hides that — a $10000 pack of three looks expensive and is
  * in fact cheaper per shot than a $6000 pack of one.
+ *
+ * ---------------------------------------------------------------------------
+ * What `damage` buys, in shots to destroy a tank
+ * ---------------------------------------------------------------------------
+ *
+ * `damage` is peak damage at ground zero, and since `damageToTankAt` measures
+ * from the hull's skin it is also, exactly, what a shell caught on the hull
+ * does. Against `DEFAULT_WORLD.maxHealth` = 100 the table is therefore readable
+ * as a promise about direct hits, and that promise is the ladder:
+ *
+ *   tier 0   4 direct hits    the free weapon. Winnable with, tedious with.
+ *   tier 1   2-4              a pack of these is a round's worth of pressure.
+ *   tier 2   1-2              a considered purchase decides a duel.
+ *   tier 3+  1                you paid for an ending; you get one.
+ *
+ * Those counts are not a comment, they are `test/balance.test.ts` › "a direct
+ * hit hurts", which flies real shots through the real physics to find where a
+ * shell actually stops on a hull, detonates there, and counts. Changing a
+ * `damage` cell moves that test.
+ *
+ * The area weapons (napalm, clusters) exceed their tier's count on flat ground
+ * because several of their blasts land on the same tank; the test asserts an
+ * upper bound on shots, so beating it is allowed and beating it by a mile is
+ * what a MIRV is for.
  */
 
 import { clamp } from './math.ts';
@@ -109,7 +133,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 0,
     packSize: Number.POSITIVE_INFINITY,
     radius: 18,
-    damage: 25,
+    damage: 30,
     detonation: 'explode',
     tier: 0,
     description: 'Free and unlimited. Small blast, small damage, no excuses.',
@@ -134,7 +158,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 1500,
     packSize: 10,
     radius: 20,
-    damage: 30,
+    damage: 34,
     detonation: 'roller',
     rollDistance: 260,
     tier: 1,
@@ -146,7 +170,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 1700,
     packSize: 10,
     radius: 22,
-    damage: 30,
+    damage: 26,
     detonation: 'cluster',
     clusterCount: 8,
     clusterSpacing: 1.7,
@@ -159,7 +183,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 1800,
     packSize: 10,
     radius: 28,
-    damage: 45,
+    damage: 60,
     detonation: 'explode',
     tier: 1,
     description: 'The workhorse. Twice the bite of a Baby Missile, and cheap by the pack.',
@@ -182,7 +206,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 2400,
     packSize: 10,
     radius: 16,
-    damage: 20,
+    damage: 26,
     detonation: 'digger',
     digDepth: 70,
     tier: 1,
@@ -220,7 +244,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 4500,
     packSize: 6,
     radius: 26,
-    damage: 38,
+    damage: 46,
     detonation: 'napalm',
     burnSteps: 6,
     rollDistance: 150,
@@ -247,7 +271,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 4000,
     packSize: 5,
     radius: 30,
-    damage: 52,
+    damage: 66,
     detonation: 'roller',
     rollDistance: 340,
     tier: 2,
@@ -259,7 +283,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 3600,
     packSize: 4,
     radius: 30,
-    damage: 50,
+    damage: 62,
     detonation: 'leapfrog',
     hops: 4,
     hopSpacing: 2,
@@ -272,7 +296,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 5000,
     packSize: 5,
     radius: 24,
-    damage: 50,
+    damage: 64,
     detonation: 'digger',
     digDepth: 150,
     tier: 2,
@@ -284,7 +308,13 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 6000,
     packSize: 5,
     radius: 55,
-    damage: 90,
+    // Two direct hits, not one. At 105 it destroyed a full-health tank outright
+    // and the measured effect was a worse game, not a better one: a Cyborg duel
+    // (66% hit rate, one Baby Nuke pack from the armoury) decided its rounds in
+    // a mean of 1.9 turns, so whoever the turn order picked first usually won
+    // before the other tank had fired. 80 puts it back at two hits and the same
+    // duel at ~5 turns. Tier 3 is where one shot ends the argument.
+    damage: 80,
     detonation: 'explode',
     tier: 2,
     description: 'A crater you can park a tank in.',
@@ -309,7 +339,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 8000,
     packSize: 3,
     radius: 32,
-    damage: 48,
+    damage: 58,
     detonation: 'napalm',
     burnSteps: 10,
     rollDistance: 220,
@@ -322,7 +352,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 9000,
     packSize: 3,
     radius: 30,
-    damage: 42,
+    damage: 44,
     detonation: 'cluster',
     clusterCount: 5,
     clusterSpacing: 0.6,
@@ -335,7 +365,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 9000,
     packSize: 2,
     radius: 48,
-    damage: 115,
+    damage: 135,
     detonation: 'roller',
     rollDistance: 460,
     tier: 3,
@@ -347,7 +377,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 12000,
     packSize: 1,
     radius: 90,
-    damage: 150,
+    damage: 190,
     detonation: 'explode',
     tier: 3,
     description: 'Removes the argument, and most of the hill it was standing on.',
@@ -360,7 +390,7 @@ export const WEAPONS: readonly WeaponDef[] = [
     price: 30000,
     packSize: 1,
     radius: 120,
-    damage: 220,
+    damage: 280,
     detonation: 'explode',
     tier: 4,
     description: 'Three rounds of winnings for one shot. It ends whatever it lands near.',
@@ -399,6 +429,14 @@ export function pricePerShot(weapon: WeaponDef): number {
  * half, 16% at three quarters, ~3% at nine tenths. So a direct hit is decisive,
  * a near miss still hurts enough to matter, and lobbing shells vaguely in
  * someone's direction is a waste of ammunition.
+ *
+ * `distance` is measured from the SKIN of the target's hull, not from its
+ * centre — see `damageToTankAt` in `detonation.ts`, which is the only thing in
+ * the game that calls this with a real target's distance. The curve was never
+ * the reason a direct hit felt weak; the reason was that the impact point of a
+ * shell caught on the hull sits a full hull radius from the tank's centre, so
+ * "direct hit" was being fed the distance of a near miss. This function is
+ * unchanged apart from this paragraph.
  *
  * Written so hostile inputs fall out rather than propagate: `!(distance <
  * radius)` returns 0 for NaN as well as for anything at or past the edge. That

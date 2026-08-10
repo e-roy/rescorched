@@ -12,11 +12,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { createGame, fire, hashGameState, type GameState } from '../src/game.ts';
+import { fire, hashGameState, type GameState } from '../src/game.ts';
 import { generateTerrain, hashTerrain, TERRAIN_STYLES } from '../src/terrain.ts';
 import { simulateFlight } from '../src/physics.ts';
 import { makeRng } from '../src/rng.ts';
 import { WEAPONS } from '../src/weapons.ts';
+import { openedGame } from './opening.ts';
 
 interface RecordedShot {
   angleDeg: number;
@@ -37,7 +38,10 @@ const RECORDED_MATCH: readonly RecordedShot[] = [
 ];
 
 function replay(seed: string): GameState {
-  let state = createGame({ seed, totalRounds: 3, width: 1280, height: 720 }, [
+  // `openedGame`, because `createGame` now hands back the pre-match armoury and
+  // the loop below would break on the first iteration. See `fired` below: that
+  // is not a hypothetical, it is what happened.
+  let state = openedGame({ seed, totalRounds: 3, width: 1280, height: 720 }, [
     { id: 'p1', name: 'Alice' },
     { id: 'p2', name: 'Bob' },
     { id: 'p3', name: 'Cleo' },
@@ -62,10 +66,23 @@ function replay(seed: string): GameState {
       power: shot.power,
       weapon: shot.weapon,
     }).state;
+    fired += 1;
   }
 
   return state;
 }
+
+/**
+ * Shots the last `replay()` actually got through.
+ *
+ * A golden snapshot is a change detector, and the failure mode of a change
+ * detector is that it quietly stops detecting: the loop above bails the moment
+ * the phase is not `aiming`, so a state machine change that puts a fresh game
+ * in any other phase turns the whole "full match replay" into a snapshot of a
+ * board nobody shot at — still stable, still green after one `-u`, and
+ * measuring nothing. That is exactly what opening in the armoury did.
+ */
+let fired = 0;
 
 describe('golden: rng', () => {
   it('sfc32 output is stable', () => {
@@ -108,6 +125,12 @@ describe('golden: ballistics', () => {
 });
 
 describe('golden: full match replay', () => {
+  it('actually fires the whole recorded script', () => {
+    fired = 0;
+    replay('golden-match');
+    expect(fired).toBe(RECORDED_MATCH.length);
+  });
+
   it('produces a stable final state hash', () => {
     expect(replay('golden-match')).toBeDefined();
     expect(hashGameState(replay('golden-match'))).toMatchSnapshot();

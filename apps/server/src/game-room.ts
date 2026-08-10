@@ -55,6 +55,7 @@ import {
   type PersistedGame,
 } from '@scorched/sim';
 
+import { estimatePlaybackMs } from './playback.ts';
 import { generateSessionId, seedFromRoom } from './room-code.ts';
 
 /**
@@ -95,22 +96,78 @@ export const SHOP_TIMEOUT_MS = 120_000;
  *
  * A bot's decision costs single-digit milliseconds, so this is not thinking
  * time — it is pacing, and it is a product decision rather than a technical
- * one. Two reasons for it:
+ * one. A human should see whose turn it is before the shell is already in the
+ * air; three bots firing inside one animation frame reads as a glitch, not as
+ * opponents.
  *
- * 1. A human should see whose turn it is before the shell is already in the
- *    air. Three bots firing inside one animation frame reads as a glitch, not
- *    as opponents.
- * 2. The client plays a turn's events as an animation and has no queue: a
- *    second `events` frame arriving mid-flight restarts the playback. It always
- *    converges — `playEvents` renders the authoritative snapshot in a `finally`
- *    — but the shot the player was watching disappears. Spacing the turns out
- *    is the server side of that; a queue on the client is the proper fix and
- *    belongs to the client.
+ * It used to be a flat 1500 ms, chosen to be longer than a turn takes to
+ * animate, because the client had no playback queue and a frame arriving
+ * mid-flight restarted the animation the player was watching.
+ *
+ * This is now ONLY the character pause, and the animation is paid for
+ * separately: `armClock` adds `estimatePlaybackMs` of the turn it just
+ * broadcast, so the next machine starts after the last one has been seen. That
+ * split is the fix for a real regression against the old flat number — at 400
+ * to 1000 ms against a turn that animates for 840 to 1500, three or more bots
+ * outran playback persistently, `BattleScene` dropped the overtaken turns (a
+ * bounded backlog, deliberately), and the player never saw a share of the
+ * shots. See `playback.ts`.
+ *
+ * So it varies by personality, weakest first, and the variation is the point: a
+ * metronome at any speed reads as a machine waiting, while a Moron that snaps
+ * off a shot and an Annihilator that takes a beat over it read as two different
+ * opponents. The numbers are ordered by how much the bot actually deliberates —
+ * see `PROFILES` in `packages/sim/src/ai.ts` — so the ordering means something
+ * rather than being decoration.
  *
  * Delivered by the turn alarm rather than by a timer, because a Durable Object
- * has no timers it can hold across hibernation — see `armClock`.
+ * has no timers it can hold across hibernation — see `armClock`. Exported as
+ * data so a test can assert the shape of the pacing without waiting for any of
+ * it, and so nothing has to restate a millisecond count.
  */
-export const BOT_TURN_DELAY_MS = 1_500;
+export const BOT_TURN_DELAY_MS: Readonly<Record<BotPersonality, number>> = {
+  /** Does not aim. There is nothing for it to be thinking about. */
+  moron: 400,
+  shooter: 650,
+  tosser: 650,
+  /** Looking at where the last one went. */
+  poolshark: 900,
+  cyborg: 800,
+  /** Long enough that you notice it deciding, which it is. */
+  annihilator: 1_000,
+};
+
+/**
+ * The pause in front of this seat's shot, or null when the seat is a person.
+ *
+ * Null rather than 0 for a human, because "no bot is up" and "a bot with no
+ * pause" are different situations for `armClock` and conflating them is how a
+ * turn clock becomes a bot clock.
+ */
+export function botTurnDelayMs(state: GameState): number | null {
+  if (state.phase !== 'aiming') return null;
+  const personality = botSeatOf(state, state.activeTank);
+  return personality === null ? null : BOT_TURN_DELAY_MS[personality];
+}
+
+/**
+ * The whole gap in front of a computer player's shot: however long the turn
+ * just broadcast takes to WATCH, and then the seat's own character pause.
+ *
+ * The two halves are different things and are kept apart on purpose. The
+ * animation cost is a fact about the frame that was sent and applies to every
+ * seat identically; the pause is what makes a Moron and an Annihilator read as
+ * two different opponents. Adding them here — rather than inside
+ * `BOT_TURN_DELAY_MS` — is what stops the personality table quietly becoming a
+ * timing table nobody can tune.
+ *
+ * Null for a person, who is clocked rather than paced.
+ */
+export function botAlarmDelayMs(state: GameState, playbackMs: number): number | null {
+  const pause = botTurnDelayMs(state);
+  if (pause === null) return null;
+  return Math.max(0, playbackMs) + pause;
+}
 
 /**
  * Which computer player a lobby gets when it does not say.
@@ -215,6 +272,16 @@ interface RoomMeta {
   roomCode: string;
   hostId: string | null;
   gameNonce: number;
+  /**
+   * Somebody asked for this code and was given it — `POST /api/rooms` claimed
+   * it. See `roomExists`.
+   *
+   * It has to be recorded, because it cannot be inferred. `idFromName` resolves
+   * every well-formed code to a Durable Object, so all 331,776 of them "exist"
+   * as far as routing is concerned and a room nobody has ever opened is
+   * indistinguishable from one that is simply quiet.
+   */
+  opened?: boolean;
 }
 
 /**
@@ -321,7 +388,16 @@ export class GameRoom implements DurableObject {
 
       const roomCode = url.searchParams.get('room') ?? '';
       const meta = this.readMeta();
-      if (meta.roomCode === '' && roomCode !== '') {
+      /*
+       * Learn the code, but only for a room that is really there.
+       *
+       * Writing it unconditionally would mean a mistyped code left a storage
+       * row behind in a room nobody ever entered — one SQLite write per typo,
+       * on any of 331,776 objects, from an unauthenticated request. `hello`
+       * refuses the connection a moment later anyway; there is nothing here
+       * worth remembering about it.
+       */
+      if (meta.roomCode === '' && roomCode !== '' && this.roomExists()) {
         this.writeMeta({ ...meta, roomCode });
       }
 
@@ -346,6 +422,7 @@ export class GameRoom implements DurableObject {
       const meta = this.readMeta();
       return Response.json({
         roomCode: meta.roomCode,
+        exists: this.roomExists(),
         players: this.readPlayers().length,
         maxPlayers: MAX_PLAYERS,
         spectators: this.countSpectators(),
@@ -354,7 +431,50 @@ export class GameRoom implements DurableObject {
       });
     }
 
+    /*
+     * Claim this code for somebody about to create a room.
+     *
+     * Two jobs in one round trip, because `allocateRoomCode` probes candidates
+     * in a loop and a second call per candidate would double the cost of
+     * creating a room. It refuses a code somebody is already sitting in, and
+     * it MARKS the one it hands over — which is what makes "join" and "create"
+     * different operations rather than the same one under two buttons.
+     *
+     * Not reachable from the outside: the Worker's route only forwards `/ws`
+     * and `/info`, so the only caller is room allocation itself.
+     */
+    if (url.pathname.endsWith('/claim')) {
+      const meta = this.readMeta();
+      const occupied = this.readPlayers().length > 0 || this.matchInProgress();
+      if (!occupied) {
+        const roomCode = url.searchParams.get('room') ?? meta.roomCode;
+        this.writeMeta({ ...meta, roomCode, opened: true });
+      }
+      return Response.json({ claimed: !occupied });
+    }
+
     return new Response('Not found', { status: 404 });
+  }
+
+  /**
+   * Is there a room here at all?
+   *
+   * "Does not exist" has to be decided rather than discovered: the Worker
+   * resolves any well-formed code to a Durable Object, so a room nobody has
+   * ever joined answers requests exactly like one that is merely empty. Three
+   * ways to be real, and the last two are what keep rooms that predate the
+   * `opened` flag — and any room a test or a future entry point seats somebody
+   * in — joinable:
+   *
+   *  - somebody was handed this code by `POST /api/rooms`;
+   *  - somebody holds a seat in it;
+   *  - a match is stored in it (which is also how a reload mid-match gets back
+   *    in, since the seat is held but the connection is gone).
+   */
+  private roomExists(): boolean {
+    if (this.readMeta().opened === true) return true;
+    if (this.readPlayers().length > 0) return true;
+    return this.readKv<PersistedGame | null>('game', null) !== null;
   }
 
   // -------------------------------------------------------------------------
@@ -649,6 +769,28 @@ export class GameRoom implements DurableObject {
       return;
     }
 
+    /*
+     * A code nobody was ever given is not a room, and joining it must not make
+     * one.
+     *
+     * This is the whole of the fix for a defect that looked like nothing: a
+     * typo in a friend's room code seated the player in a brand new, empty
+     * room that was pixel for pixel the room their friend was waiting in, and
+     * both of them then sat looking at a lobby wondering where the other one
+     * was. Creating a room is a different act, and it has its own door —
+     * `POST /api/rooms`, which claims the code before the socket is opened.
+     *
+     * Refused before anything is written, so the phantom room stays phantom.
+     */
+    if (!this.roomExists()) {
+      this.sendError(
+        ws,
+        'room_not_found',
+        'No room with that code. Check it with whoever invited you, or create one.',
+      );
+      return;
+    }
+
     // A second `hello` on a socket that already joined is a re-sync, never a
     // second seat. Without this, one connection could quietly claim every slot
     // in the room by saying hello eight times.
@@ -873,9 +1015,21 @@ export class GameRoom implements DurableObject {
       })),
     );
 
-    await this.commitState(state, { timeoutStreak: 0, expiredTurn: null });
-    this.broadcast({ t: 'state', snapshot: toSnapshot(state) });
-    this.broadcastTurnTimer(state);
+    /*
+     * A match opens in the ARMOURY, not on the battlefield: `createGame`
+     * returns a `shopping` phase with everybody pending, so a player spends
+     * their starting money before the first shell flies. The room does not
+     * decide that and could not — it is a rule, and rules live in the sim. What
+     * the room has to do is exactly what it already does at every other shop:
+     * walk the computer players through it, and roll straight into round one if
+     * that empties the shop. Without this a lobby of nothing but bots would sit
+     * in a shop none of them was ever going to leave.
+     */
+    const settled = this.settleBotShopping(state, []);
+
+    await this.commitState(settled.state, { timeoutStreak: 0, expiredTurn: null });
+    this.broadcast({ t: 'state', snapshot: toSnapshot(settled.state) });
+    this.broadcastTurnTimer(settled.state);
   }
 
   private async handleFire(
@@ -1067,6 +1221,13 @@ export class GameRoom implements DurableObject {
    * the bots' new inventories and already has them out of `pendingShoppers`,
    * and the humans see a shop that is waiting for them alone.
    *
+   * Both shops go through here, and the pre-match ARMOURY is the one that
+   * matters most: `handleStart` calls this on the state `createGame` hands
+   * back, so a computer player arrives at round one armed with whatever its
+   * personality chose to buy. Without it, a bot would fight the opening round
+   * with the free weapon against a human who had shopped, and nothing on
+   * screen would say why.
+   *
    * If that empties the shop — every remaining shopper was a bot — the next
    * round is rolled here too, so the room never sits in a `shopping` phase
    * nobody is going to leave.
@@ -1152,7 +1313,7 @@ export class GameRoom implements DurableObject {
    */
   private async commitState(
     state: GameState,
-    options: { timeoutStreak: number; expiredTurn: number | null },
+    options: { timeoutStreak: number; expiredTurn: number | null; playbackMs?: number },
   ): Promise<void> {
     this.writeKv('game', toPersisted(state));
     await this.armClock(state, options);
@@ -1165,13 +1326,20 @@ export class GameRoom implements DurableObject {
    * `Date.now()` is legitimate here for the same reason it is in
    * `consumeRateLimit`: this is the server, and a deadline is wall-clock by
    * definition. The ban on clocks applies to `packages/sim`.
+   *
+   * Read ONCE, into `armedAt`, and used for both the deadline and the alarm.
+   * Two readings with a storage write between them differ by however long that
+   * write took, which makes the relationship between the row and the alarm
+   * unstateable — and it is exactly that relationship the pacing tests read to
+   * recover the gap the room scheduled without waiting for it.
    */
   private async armClock(
     state: GameState,
-    options: { timeoutStreak: number; expiredTurn: number | null },
+    options: { timeoutStreak: number; expiredTurn: number | null; playbackMs?: number },
   ): Promise<void> {
+    const armedAt = Date.now();
     const duration = clockFor(state.phase);
-    const deadlineAt = duration === null ? null : Date.now() + duration;
+    const deadlineAt = duration === null ? null : armedAt + duration;
     const active = state.tanks[state.activeTank];
     this.writeKv('turn', {
       turnNumber: state.turnNumber,
@@ -1193,16 +1361,22 @@ export class GameRoom implements DurableObject {
      * A computer player's turn is scheduled on the same alarm, just sooner.
      *
      * The bot is not going to run out of time, so the turn clock has nothing to
-     * do on its turn; what the alarm is for here is the pause in front of the
-     * shot (`BOT_TURN_DELAY_MS`). Reusing the one alarm rather than inventing a
+     * do on its turn; what the alarm is for here is the gap in front of the
+     * shot (`botAlarmDelayMs`) — the animation the client is still playing,
+     * then the seat's own pause. Reusing the one alarm rather than inventing a
      * second mechanism is what keeps this hibernation-safe: there is no timer
      * to lose, no continuation to hold in memory, and the wake-up re-derives
      * the whole decision from storage.
      *
      * `deadlineAt` in the turn row stays the real turn deadline, so a bot seat
-     * that somehow does not fire is still covered by the ordinary clock.
+     * that somehow does not fire is still covered by the ordinary clock — and
+     * capping the pause at it means an absurd playback estimate can only ever
+     * cost the room its normal patience, never more.
      */
-    await this.ctx.storage.setAlarm(isBotTurn(state) ? Date.now() + BOT_TURN_DELAY_MS : deadlineAt);
+    const gap = botAlarmDelayMs(state, options.playbackMs ?? 0);
+    await this.ctx.storage.setAlarm(
+      gap === null ? deadlineAt : Math.min(armedAt + gap, deadlineAt),
+    );
   }
 
   private async commitTurn(
@@ -1216,7 +1390,17 @@ export class GameRoom implements DurableObject {
     // by a second frame nobody asked for.
     const settled = this.settleBotShopping(state, events as ServerEventPayload);
 
-    await this.commitState(settled.state, options);
+    /*
+     * How long the frame about to go out takes to watch.
+     *
+     * Measured from the events themselves rather than assumed, and spent before
+     * the next computer player is allowed to move — see `botAlarmDelayMs`. A
+     * Nuke and a Baby Missile are not the same amount of time on screen, and a
+     * fixed pause that suits one hides the other.
+     */
+    const playbackMs = estimatePlaybackMs(settled.events);
+
+    await this.commitState(settled.state, { ...options, playbackMs });
     this.recordReplay(turnPlayed, settled.events);
     this.recordRoundWins(settled.events);
 
@@ -1251,13 +1435,17 @@ export class GameRoom implements DurableObject {
   }
 
   /**
-   * The final scoreboard, sent once when the sim declares the match over.
+   * The final scoreboard.
+   *
+   * Sent to the whole room when the sim declares the match over, and again to
+   * any single socket that arrives afterwards — see `sendLiveState`. `target`
+   * is which of the two: omitted broadcasts, given sends.
    *
    * `place` uses standard competition ranking, so an equal score is an equal
    * place. `roundsWon` counts rounds this player ended as the only tank left
    * standing; a round that times out with several survivors is won by nobody.
    */
-  private broadcastMatchResult(state: GameState): void {
+  private broadcastMatchResult(state: GameState, target?: WebSocket): void {
     try {
       const wins = this.readKv<Record<string, number>>('wins', {});
       let place = 1;
@@ -1277,12 +1465,14 @@ export class GameRoom implements DurableObject {
         };
       });
 
-      this.broadcast({
+      const frame: ServerMessage = {
         t: 'matchResult',
         winnerId: state.winnerId,
         roundsPlayed: state.round,
         standings,
-      });
+      };
+      if (target === undefined) this.broadcast(frame);
+      else this.send(target, frame);
     } catch (error) {
       // A scoreboard that will not encode must not take the turn commit with
       // it — the match is already decided and persisted at this point.
@@ -1485,6 +1675,23 @@ export class GameRoom implements DurableObject {
     if (game === null) return;
     this.send(ws, { t: 'state', snapshot: toSnapshot(game) });
     this.broadcastTurnTimer(game, ws);
+
+    /*
+     * A finished match tells its result to whoever walks in, not only to
+     * whoever was there when it ended.
+     *
+     * `matchResult` was sent exactly once, from `commitTurn`, so a client that
+     * joined, reconnected, or was still handshaking a beat later got the
+     * `gameover` snapshot and nothing else. That is not a blank screen — the
+     * client falls back to ranking the snapshot by score — but the fallback
+     * cannot know places (ties share a place) or rounds won, so two people
+     * looking at the same finished match saw two different scoreboards. An
+     * ending has to be the same ending for everybody.
+     *
+     * Idempotent by construction: it is derived from stored state, carries no
+     * "new" flag, and the client redraws the panel when it arrives.
+     */
+    if (game.phase === 'gameover') this.broadcastMatchResult(game, ws);
   }
 
   private broadcast(message: ServerMessage, except?: WebSocket): void {

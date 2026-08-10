@@ -70,8 +70,33 @@ export type DetonationEvent =
   | { type: 'death'; tankIndex: number; byTankIndex: number | null }
   | { type: 'shot'; tankIndex: number; weapon: string; path: number[]; impactKind: string };
 
+/**
+ * A tank's hull, as the blast maths sees it.
+ *
+ * `TANK_HULL_RADIUS` mirrors `DEFAULT_WORLD.tankRadius` in `game.ts` — the same
+ * circle `physics.ts` sweeps a shell against — and is written here rather than
+ * imported because `game.ts` imports this file and a value import back would
+ * close a runtime cycle. Nothing pins the two together by inspection, so they
+ * are pinned by measurement, from both sides:
+ *
+ *  - From BELOW by `test/game-damage.test.ts` › "a shell caught on the hull does
+ *    the weapon's full damage". Shrink the hull and a direct hit starts being
+ *    charged a near miss's falloff.
+ *  - From ABOVE by `test/detonation.test.ts` › "a blast reaches exactly one hull
+ *    past its own radius". Grow the hull and every weapon in the arsenal quietly
+ *    gains reach, which is a balance change nothing else would notice.
+ *
+ * That second half did not exist, and the comment here claimed it did. Measured
+ * before writing it: moving this constant to 8 or to 10 left the entire sim
+ * suite green apart from the golden hash in `determinism.test.ts` — and a golden
+ * hash is a change detector, not a specification. Both mutations are red now.
+ *
+ * `TANK_DAMAGE_OFFSET` is half of it: the centre of the hull above the tank's
+ * ground contact point, which is also where `game.ts` puts the hit circle.
+ */
+export const TANK_HULL_RADIUS = 9;
 /** Vertical offset from a tank's feet to the point blasts are measured against. */
-export const TANK_DAMAGE_OFFSET = 4.5;
+export const TANK_DAMAGE_OFFSET = TANK_HULL_RADIUS / 2;
 
 export interface DetonationRules {
   /** Cash awarded per point of damage dealt to someone else. */
@@ -175,6 +200,27 @@ const DIG_STAGE_DROP = 2.5;
 /** Hard stop on digger stages. Only bedrock or a bad `digDepth` gets near it. */
 const MAX_DIG_STAGES = 40;
 
+/** What the shell stopped against. Only a hull changes any weapon's behaviour. */
+export interface ImpactContext {
+  /**
+   * The shell was caught on a tank rather than on the ground.
+   *
+   * One weapon family cares, and it is the reason this exists: a Roller
+   * detonates where it comes to REST, so a Roller that hit a tank squarely used
+   * to roll off it and go off somewhere down the hill. Measured over 8 seeds of
+   * Tosser-vs-Tosser duels (the personality whose whole arsenal is rollers),
+   * that was a 14.8% connect rate and rounds running 27 turns against a 40-turn
+   * budget, with the clock rather than a shot ending 42% of them. With this,
+   * the same sweep connects on 33.9% and 95% of its rounds end with a kill.
+   *
+   * Optional and defaulting to "ground", because every other caller in the
+   * game — a fall, a test fixture, a sub-munition — is genuinely detonating
+   * against terrain, and a required parameter would make them all assert
+   * something they do not know.
+   */
+  onTank?: boolean;
+}
+
 /**
  * Resolve a weapon's impact. Mutates `target` and returns the events that
  * describe what happened, in order.
@@ -187,6 +233,7 @@ export function detonate(
   shooterIndex: number | null,
   rng: Rng,
   rules: DetonationRules,
+  impact: ImpactContext = {},
 ): DetonationEvent[] {
   const events: DetonationEvent[] = [];
 
@@ -317,6 +364,17 @@ export function detonate(
       //
       // The client animates the roll by tweening from the shot's impact point
       // to the explosion here — the sim only reports where it went off.
+
+      // Unless it hit a tank, in which case it has already found somebody and
+      // goes off against the hull. A shell that rolls off the target it just
+      // struck is not "it finds people", it is a direct hit that misses — and
+      // it is the one way a weapon in this file could still take the decisive
+      // hit away after `damageToTankAt` gave it back.
+      if (impact.onTank === true) {
+        blast(target, weapon, originX, y, shooterIndex, rules, events);
+        return events;
+      }
+
       const step = clamp(Math.round(weapon.radius / 3), 4, 12);
       // A roller may climb a lip about its own size — so a Heavy Roller shrugs
       // off ground that stops a Baby Roller, which is part of what it is for.
@@ -826,6 +884,42 @@ function poolReach(volume: number, repose: number): number {
 // Blast and damage
 // ---------------------------------------------------------------------------
 
+/**
+ * What one blast centred on `(x, y)` does to a tank standing at
+ * `(tankX, tankY)`, before any per-pool scaling.
+ *
+ * The single definition of how far a blast is from a tank, and the reason it is
+ * a function rather than two lines inside `blast()`: the answer is measured
+ * from the SKIN of the hull, not from its centre, and a second copy of that
+ * rule anywhere — in a test, in a bot's scoring, in a future weapon — would be
+ * a copy that could disagree.
+ *
+ * Why the skin. A tank is a `TANK_HULL_RADIUS` circle and `physics.ts` stops a
+ * shell the instant it touches that circle, so a shell caught square on the
+ * hull reports an impact point a full hull radius away from the point the
+ * damage is measured against. Charging it that radius of falloff is what made a
+ * direct hit do roughly half damage: on a Baby Missile (radius 18) the impact
+ * sat at exactly the 50% mark, so the free weapon dealt 13 a hit and took EIGHT
+ * hits to destroy a full-health tank, from a table row that says 25. Measured,
+ * not deduced — `test/game-damage.test.ts` flies real shots and counts.
+ *
+ * Subtracting the hull is the rule the crater already plays by (a blast that
+ * reaches the ground moves it) and it makes the number in the table mean "what
+ * a direct hit does". It widens every blast's reach by one hull as a side
+ * effect, which is the correct side effect: a blast that touches the tank has
+ * touched the tank.
+ */
+export function damageToTankAt(
+  weapon: WeaponDef,
+  x: number,
+  y: number,
+  tankX: number,
+  tankY: number,
+): number {
+  const distance = hypot2(tankX - x, tankY - TANK_DAMAGE_OFFSET - y) - TANK_HULL_RADIUS;
+  return damageAtDistance(weapon, distance > 0 ? distance : 0);
+}
+
 /** One explosion: carve the terrain, hurt everyone in range. */
 export function blast(
   target: DetonationTarget,
@@ -854,8 +948,7 @@ export function blast(
     const tank = target.tanks[index];
     if (tank === undefined || !tank.alive) continue;
 
-    const distance = hypot2(tank.x - x, tank.y - TANK_DAMAGE_OFFSET - y);
-    const damage = damageAtDistance(weapon, distance) * damageScale;
+    const damage = damageToTankAt(weapon, x, y, tank.x, tank.y) * damageScale;
     if (!(damage > 0)) continue;
 
     applyDamage(target, index, damage, shooterIndex, rules, events);

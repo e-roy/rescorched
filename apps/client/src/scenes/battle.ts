@@ -33,6 +33,7 @@ import {
   blastStyle,
   drawBlast,
   drawMuzzleFlash,
+  fireballRadius,
   type BlastKind,
   type BlastStyle,
 } from '../render/explosion.ts';
@@ -92,6 +93,19 @@ export class BattleScene extends Phaser.Scene {
   private playbackTail: Promise<void> = Promise.resolve();
   /** The newest turn handed in. Anything older than this is skipped. */
   private pending: QueuedTurn | null = null;
+  /**
+   * Turns that were overtaken in the queue and never drawn.
+   *
+   * Dropping is deliberate and safe — every frame carries the authoritative
+   * snapshot, so a skipped turn costs the animation and never the board — but it
+   * is also the only symptom of the server pacing itself faster than the client
+   * can play. Counted rather than merely allowed, because "the game looks like
+   * it is skipping" is otherwise invisible to every test in the suite: the board
+   * is correct the whole time. `solo-bot.spec.ts` reads it through
+   * `window.__scorched.droppedTurns()` and requires it to stay at zero in a room
+   * full of computer players.
+   */
+  private dropped = 0;
 
   private skyImage: Phaser.GameObjects.Image | null = null;
   private skyKey = '';
@@ -360,6 +374,11 @@ export class BattleScene extends Phaser.Scene {
     return this.animating;
   }
 
+  /** How many turns arrived faster than they could be drawn. See `dropped`. */
+  get droppedTurns(): number {
+    return this.dropped;
+  }
+
   /**
    * Animate a turn's events, then settle on the authoritative snapshot.
    * The snapshot is the truth; the animation is decoration on the way to it.
@@ -394,7 +413,10 @@ export class BattleScene extends Phaser.Scene {
     const run = this.playbackTail.then(async () => {
       // Overtaken while we waited. The newest turn is the only one worth
       // drawing, and its frame carries the same authoritative snapshot.
-      if (this.pending !== turn) return;
+      if (this.pending !== turn) {
+        this.dropped += 1;
+        return;
+      }
       this.pending = null;
       await this.playTurn(turn.events, turn.finalSnapshot);
     });
@@ -633,9 +655,13 @@ export class BattleScene extends Phaser.Scene {
     // thrown earth rather than as fire because it does no damage, but it is
     // still a charge going off, and it still takes the ground away. Only a
     // `dirt` event, which adds ground, leaves clean earth.
+    //
+    // The DECAL takes the sim's radius and the FIRE takes the lifted one: a
+    // crater is exactly the ground the heightmap lost, while the fireball is
+    // allowed to be bigger than the hole it made. See `fireballRadius`.
     addDecal(this.decals, { x: event.x, radius: event.radius, burnt: true });
     this.decalRevision += 1;
-    await this.spawnBlast(event.x, event.y, event.radius, style);
+    await this.spawnBlast(event.x, event.y, fireballRadius(event.radius), style);
   }
 
   private spawnBlast(x: number, y: number, radius: number, style: BlastStyle): Promise<void> {
@@ -760,7 +786,7 @@ export class BattleScene extends Phaser.Scene {
     const tank = this.snapshot?.tanks[tankIndex];
     if (tank === undefined) return;
     const style = blastStyle('death', 34, this.palette);
-    void this.spawnBlast(tank.x, tank.y - 8, 34, style);
+    void this.spawnBlast(tank.x, tank.y - 8, fireballRadius(34), style);
   }
 
   // ------------------------------------------------------------------ camera

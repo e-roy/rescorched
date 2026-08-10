@@ -1,5 +1,5 @@
 /**
- * The between-rounds shop.
+ * The shop.
  *
  * Money in, ammo out. Pure functions over `GameState` — the Durable Object
  * decides *when* the shop is open; this decides what a purchase is allowed to
@@ -53,14 +53,33 @@
  * bounties in `game.ts` — awarding it from the shop would mean the shop paying
  * players, which is not what a shop is.
  *
- * One more thing this file cannot fix: the shop only ever opens BETWEEN rounds.
- * Round 1 is fought entirely with the free Baby Missile while 10000 sits idle
- * in everyone's bank, because `createGame` goes straight to `aiming`. The
- * `lobby` branch of `isShopOpen` is the hook for a pre-match armoury; nothing
- * produces that phase yet.
+ * ---------------------------------------------------------------------------
+ * When the shop opens
+ * ---------------------------------------------------------------------------
+ *
+ * Twice per round boundary is wrong; once BEFORE each round is right, and that
+ * now includes the first. `createGame` opens in `shopping` with everybody
+ * pending, so a player spends their 10000 before the first shell flies, exactly
+ * as the original's armoury does. Round 1 used to be fought entirely with the
+ * free Baby Missile while that money sat idle, which is most of the reason a
+ * round felt like a grind: at four direct hits per kill from the only gun
+ * anybody had, nobody was going to die.
+ *
+ * The consequence for the price ladder is worth stating, because a 10000
+ * opening bank now reaches further than it used to be able to: everything
+ * except the 12000 Nuke and the 30000 Death's Head is buyable before a shot is
+ * fired. Spending most of an opening bank on one Baby Nuke is a decision, not a
+ * doomsday button — you get five rounds of it and no money for round two — and
+ * `test/economy.test.ts` pins which weapons that bank does and does not reach.
  */
 
-import { cloneState, IllegalMoveError, type GameState, type Tank } from './game.ts';
+import {
+  cloneState,
+  isArmouryBeforeRoundOne,
+  IllegalMoveError,
+  type GameState,
+  type Tank,
+} from './game.ts';
 import {
   BABY_MISSILE,
   getWeapon,
@@ -207,12 +226,27 @@ export function isOnTheShelf(weapon: WeaponDef, roundsFoughtCount: number): bool
 /**
  * How many rounds this match has actually played out.
  *
- * `state.round` is the round in progress, except in `shopping` and `gameover`
- * where it names the round that just finished — so the intermission after round
- * 1 reports 1, and a fresh game in `lobby` reports 0.
+ * `state.round` is the round in progress, except in `gameover` and the
+ * between-rounds `shopping` intermission, where it names the round that just
+ * finished — so the intermission after round 1 reports 1.
+ *
+ * The pre-match armoury is the exception, and it is why this is not a one-liner
+ * any more: it is a `shopping` phase whose `round` is 1 and whose rounds fought
+ * is 0. See `isArmouryBeforeRoundOne` in `game.ts`.
+ *
+ * `apps/client/src/ui/armoury.ts` keeps its own copy of this rule and does not
+ * know about the armoury case, so it reports 1 there where this reports 0. That
+ * divergence is deliberately allowed to exist rather than papered over here,
+ * because it cannot change what a player sees: the only shelf gate in the game
+ * is tier 4 at 2 rounds, and 0 and 1 both fail it. `test/economy.test.ts` pins
+ * exactly that — every weapon has the same shelf status at 0 rounds fought as
+ * at 1 — so a future gate at 1 round turns the suite red instead of quietly
+ * offering the client a weapon the sim will refuse to sell.
  */
 export function roundsFought(state: GameState): number {
-  return state.phase === 'shopping' || state.phase === 'gameover' ? state.round : state.round - 1;
+  if (state.phase === 'gameover') return state.round;
+  if (state.phase === 'shopping') return isArmouryBeforeRoundOne(state) ? 0 : state.round;
+  return state.round - 1;
 }
 
 export interface ShopItem {
@@ -271,15 +305,20 @@ function isForSale(weapon: WeaponDef): boolean {
 }
 
 /**
- * The two phases in which trading is legal.
+ * The one phase in which trading is legal.
  *
- * `shopping` is the between-rounds intermission. `lobby` is the pre-match
- * armoury — no code path currently puts a game in that phase, so it is a hook
- * rather than a feature, but the rules for it are the same rules and there is
- * no reason for them to differ.
+ * `shopping` covers both visits: the pre-match armoury `createGame` opens with,
+ * and the between-rounds intermission. They are the same shop with the same
+ * rules — the only thing that differs is what `roundsFought` reports, and that
+ * is `roundsFought`'s problem.
+ *
+ * This used to also accept `lobby`, as a hook for a pre-match armoury nothing
+ * produced. The armoury exists now and it is a `shopping` phase, so the hook is
+ * gone rather than left lying around: a branch for a phase no code path can
+ * reach is a branch no test can cover.
  */
 export function isShopOpen(state: GameState): boolean {
-  return state.phase === 'shopping' || state.phase === 'lobby';
+  return state.phase === 'shopping';
 }
 
 export interface PurchaseResult {

@@ -13,6 +13,7 @@
 
 import {
   BABY_MISSILE,
+  isArmouryBeforeRoundOne,
   refundForPack,
   requireWeapon,
   shopInventory,
@@ -43,6 +44,8 @@ export class ArmouryView {
   private readonly list = must<HTMLUListElement>('#shop-items');
   private readonly cash = must<HTMLElement>('#shop-money');
   private readonly waiting = must<HTMLElement>('#shop-waiting');
+  private readonly heading = must<HTMLElement>('#shop-heading');
+  private readonly hint = must<HTMLElement>('#shop-hint');
   private readonly rows = new Map<string, Row>();
 
   constructor(callbacks: ArmouryCallbacks) {
@@ -54,6 +57,7 @@ export class ArmouryView {
     if (tank === undefined) return;
 
     this.cash.textContent = money(tank.money);
+    this.renderTitle(snapshot);
     this.renderWaiting(snapshot, you);
 
     /*
@@ -72,6 +76,34 @@ export class ArmouryView {
 
     if (this.rows.size === 0) this.build(shelf);
     this.patch(shelf, tank);
+  }
+
+  /**
+   * The two screens this one panel is.
+   *
+   * It is the FIRST thing a match shows — before a shell has been fired, with
+   * the starting money in hand — and it is also what comes up between rounds.
+   * One line of copy served both and was wrong on the opening one twice over:
+   * it announced a round that had not happened, and it said "the shop only
+   * opens between rounds" on a screen that is the counter-example.
+   *
+   * Which of the two it is comes from `isArmouryBeforeRoundOne` in the sim
+   * rather than from a rule invented here — the same predicate `startNextRound`
+   * and `roundsFought` use, so the wording cannot disagree with the game about
+   * whether round one has been fought.
+   */
+  private renderTitle(snapshot: GameSnapshot): void {
+    if (isArmouryBeforeRoundOne(snapshot)) {
+      this.heading.textContent = 'Armoury';
+      this.hint.textContent =
+        `Before the first shot. Spend your starting cash — it is the same shelf, ` +
+        `the same prices, and the next chance to buy is after round 1.`;
+      return;
+    }
+    this.heading.textContent = 'Armoury';
+    this.hint.textContent =
+      `Round ${snapshot.round} of ${snapshot.totalRounds} is over. ` +
+      `Cash carries over, regrets do not — restock before the next one starts.`;
   }
 
   /** Who else is still shopping — the reason the Ready button has not moved on. */

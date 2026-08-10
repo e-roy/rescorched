@@ -747,10 +747,28 @@ export const StandingSchema = z.object({
 });
 export type Standing = z.infer<typeof StandingSchema>;
 
+/**
+ * `room_not_found` is the one code here that is not about a move.
+ *
+ * A room code resolves to a Durable Object whether or not anybody has ever been
+ * in it, so "no such room" cannot be a routing failure — it has to be a decision
+ * the room makes and says out loud. Without it, a typo in a friend's code seated
+ * the player alone in a brand new room that looked exactly like the one their
+ * friend was waiting in.
+ *
+ * Adding a member to this enum did NOT bump `PROTOCOL_VERSION`, and the test for
+ * that is the one stated at the top of this file: can an older peer still read
+ * what this build sends? An older client would refuse the frame as a schema
+ * failure and report "protocol error" instead of "no such room" — a worse
+ * message on a connection that is being refused either way, and nothing it could
+ * have done with the better one. That is not the kind of loss a version bump
+ * exists to prevent; throwing every open tab out of its room to gain it would be.
+ */
 export const ServerErrorCodeSchema = z.enum([
   'bad_message',
   'bad_protocol',
   'room_full',
+  'room_not_found',
   'room_closed',
   'not_your_turn',
   'stale_turn',

@@ -12,6 +12,7 @@ import {
   cheat,
   consoleErrors,
   createRoom,
+  expectClickable,
   fire,
   joinRoom,
   openPlayer,
@@ -40,7 +41,7 @@ test.describe('two players, one room', () => {
     await expect(alice.page.getByTestId('lobby-players').locator('li')).toHaveCount(2);
     await expect(bob.page.getByTestId('lobby-players').locator('li')).toHaveCount(2);
 
-    await startMatch(alice);
+    await startMatch(alice, bob);
 
     const before = await waitForSnapshot(alice.page);
     await waitForSnapshot(bob.page);
@@ -95,7 +96,7 @@ test.describe('two players, one room', () => {
     const bob = await openPlayer(browser, 'Bob');
     const roomCode = await createRoom(alice);
     await joinRoom(bob, roomCode);
-    await startMatch(alice);
+    await startMatch(alice, bob);
 
     const before = await waitForSnapshot(alice.page);
     const aliceId = await readSelf(alice.page);
@@ -128,7 +129,7 @@ test.describe('two players, one room', () => {
     const bob = await openPlayer(browser, 'Bob');
     const roomCode = await createRoom(alice);
     await joinRoom(bob, roomCode);
-    await startMatch(alice);
+    await startMatch(alice, bob);
 
     const before = await waitForSnapshot(bob.page);
     const bobId = await readSelf(bob.page);
@@ -193,6 +194,60 @@ test.describe('two players, one room', () => {
     await bob.context.close();
   });
 
+  test('a room code that does not exist is refused, not created', async ({ browser }) => {
+    /*
+     * The defect: a typo in a friend's room code dropped the player into a
+     * brand new, empty room that looked exactly like the one their friend was
+     * waiting in — same lobby, same "waiting for players", same everything —
+     * and the two of them then sat in separate rooms wondering where the other
+     * one was.
+     *
+     * The Worker resolves any well-formed code to a Durable Object, so "does
+     * not exist" cannot be discovered; it has to be decided and said. Creating
+     * a room is a different act with its own door (`POST /api/rooms`), and the
+     * assertions below are the two halves of the fix: the player is told, and
+     * the room they failed to find still does not exist afterwards.
+     */
+    const alice = await openPlayer(browser, 'Alice');
+    const bob = await openPlayer(browser, 'Bob');
+
+    // Four letters, well-formed, and never minted: the client's own format
+    // check passes it straight through to the server, which is the point.
+    const typo = 'QZQZ';
+    await alice.page.getByTestId('input-room').fill(typo);
+    await alice.page.getByTestId('btn-join').click();
+
+    const refusal = alice.page.getByTestId('title-error');
+    await expect(refusal).toBeVisible({ timeout: 20_000 });
+    await expect(refusal).toContainText(/no room/i);
+    // Told where they are, not silently seated somewhere else.
+    await expect(alice.page.getByTestId('panel-title')).toBeVisible();
+    await expect(alice.page.getByTestId('panel-lobby')).toBeHidden();
+    // And the message is on the screen rather than merely in the document.
+    await expectClickable(alice.page, 'title-error');
+
+    /*
+     * The refusal did not quietly bring the room into being either. If it had,
+     * this second player would now join "Alice's room" — which is the original
+     * defect wearing an error message.
+     */
+    await bob.page.getByTestId('input-room').fill(typo);
+    await bob.page.getByTestId('btn-join').click();
+    await expect(bob.page.getByTestId('title-error')).toContainText(/no room/i, {
+      timeout: 20_000,
+    });
+    await expect(bob.page.getByTestId('panel-lobby')).toBeHidden();
+
+    // …and the flow this must not have broken: create a room, join it by code.
+    const roomCode = await createRoom(alice);
+    await joinRoom(bob, roomCode);
+    await expect(alice.page.getByTestId('lobby-players').locator('li')).toHaveCount(2);
+
+    expect(consoleErrors(alice.page), 'client console errors').toEqual([]);
+    await alice.context.close();
+    await bob.context.close();
+  });
+
   test('a player who reloads mid-game gets their tank and the live state back', async ({
     browser,
   }) => {
@@ -200,7 +255,7 @@ test.describe('two players, one room', () => {
     const bob = await openPlayer(browser, 'Bob');
     const roomCode = await createRoom(alice);
     await joinRoom(bob, roomCode);
-    await startMatch(alice);
+    await startMatch(alice, bob);
 
     const before = await waitForSnapshot(bob.page);
     const bobId = await readSelf(bob.page);

@@ -54,9 +54,18 @@ export function seedFromRoom(roomCode: string, nonce: number): number {
 export const ROOM_CODE_ATTEMPTS = 5;
 
 /**
- * Mint a code for a room nobody is sitting in.
+ * Mint a code for a room nobody is sitting in, and open that room.
  *
- * `generate` is a parameter, and exported, for one reason: the probe below is
+ * The probe and the claim are one request (`/claim`), and that is deliberate on
+ * both counts. The probe is what stops a code being handed to somebody while
+ * strangers are playing in it. The claim is what makes this the ONLY way a room
+ * comes into being: `idFromName` turns every four-letter code into a Durable
+ * Object, so a room has to be marked as opened or "no such room" cannot be
+ * distinguished from "nobody has said anything yet" — see `roomExists` in
+ * `game-room.ts`. Before it existed, a typo'd join silently created the room it
+ * had failed to find.
+ *
+ * `generate` is a parameter, and exported, for one reason: the probe is
  * otherwise untestable. With 331,776 codes, a test that mints a handful and
  * checks they came back empty passes at 99.998% whether the probe runs or not —
  * it measures the dice, not the code. Handing in a generator that returns an
@@ -72,16 +81,35 @@ export async function allocateRoomCode(
     if (attempt > 0) candidate = generate();
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(candidate));
     try {
-      const response = await stub.fetch(new Request('https://room/info'));
+      const response = await stub.fetch(
+        new Request(`https://room/claim?room=${candidate}`, { method: 'POST' }),
+      );
       if (!response.ok) continue;
-      const summary = (await response.json()) as { players?: number; inProgress?: boolean };
-      if ((summary.players ?? 0) === 0 && summary.inProgress !== true) return candidate;
+      const summary = (await response.json()) as { claimed?: boolean };
+      if (summary.claimed === true) return candidate;
     } catch {
       // A room that cannot be asked is not a room we should hand out.
       continue;
     }
   }
-  // Every probe was occupied or unreachable. Return the last candidate rather
-  // than fail outright: a shared room is recoverable, "could not create" is not.
+  /*
+   * Every probe was occupied or unreachable. Return the last candidate rather
+   * than fail outright: a shared room is recoverable, "could not create" is not.
+   *
+   * It is claimed on the way out, because the caller is about to be told this
+   * is their room and being sent to one that then refuses them would be a worse
+   * outcome than sharing.
+   */
+  try {
+    const response = await env.GAME_ROOM.get(env.GAME_ROOM.idFromName(candidate)).fetch(
+      new Request(`https://room/claim?room=${candidate}`, { method: 'POST' }),
+    );
+    // Read the body even though the answer is not interesting: a response left
+    // undrained holds its request open, and an object with a request in flight
+    // never hibernates.
+    await response.json();
+  } catch {
+    // Nothing left to try; the room will still open for whoever gets a seat.
+  }
   return candidate;
 }

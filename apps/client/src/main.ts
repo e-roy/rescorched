@@ -176,14 +176,14 @@ function handleMessage(message: ServerMessage): void {
         /*
          * Only render this turn if it is still the latest one.
          *
-         * Playback has no queue: a second `events` frame arriving mid-flight
-         * restarts it, and the animation it interrupted still resolves — a beat
-         * LATER than the newer frame was handled. Without this check that late
-         * callback re-applied its own older snapshot over the newer one, so the
-         * client would go back a turn and sit there until something else
-         * arrived. With a computer player in the room that is the normal case
-         * rather than a rare one: the room takes the bot's turn 1.5s after
-         * yours, which lands inside the explosion you are still watching.
+         * `playEvents` resolves for every caller, including one whose turn was
+         * overtaken in the queue and never drawn — so a late callback would
+         * otherwise re-apply its own older snapshot on top of a newer one, and
+         * the client would go back a turn and sit there until something else
+         * arrived. That is the normal case rather than a rare one once a room
+         * has computer players in it, which is why the guard is here and not in
+         * the scene: the scene's job is to draw, and reconciling authoritative
+         * state is this file's.
          *
          * Identity rather than turn number, deliberately: a new round restarts
          * the count, so "newer" is not "larger".
@@ -216,9 +216,28 @@ function handleMessage(message: ServerMessage): void {
       // second one throws the player back to the title screen.
       if (ui.claimError(message.message)) return;
       ui.showToast(message.message);
-      if (message.code === 'room_full' || message.code === 'bad_protocol') {
+      if (
+        message.code === 'room_full' ||
+        message.code === 'bad_protocol' ||
+        message.code === 'room_not_found'
+      ) {
         ui.showTitleError(message.message);
         ui.show('title');
+      }
+      /*
+       * A room that is not there will not become there.
+       *
+       * The socket stays open after most refusals, because most of them are
+       * about one frame and the connection is still good for the next. This one
+       * is about the connection itself: there is no room on the other end of
+       * it, so leaving it up would leave the reconnect loop politely asking a
+       * phantom room to seat us for the rest of the session. Closed here rather
+       * than in `NetClient`, which does not know what any code means.
+       */
+      if (message.code === 'room_not_found') {
+        app.net?.close();
+        app.net = null;
+        app.snapshot = null;
       }
       return;
 
@@ -267,6 +286,15 @@ declare global {
       snapshot(): GameSnapshot | null;
       you(): string | null;
       roomCode(): string | null;
+      /**
+       * Turns the scene was handed faster than it could draw them.
+       *
+       * The board stays correct when this climbs — every frame carries the
+       * authoritative snapshot — so nothing a test can read from the game state
+       * notices it. What it costs is shots the player never sees, which is a
+       * real defect with no other symptom. See `BattleScene.dropped`.
+       */
+      droppedTurns(): number;
     };
   }
 }
@@ -275,4 +303,5 @@ window.__scorched = {
   snapshot: () => app.snapshot,
   you: () => app.you,
   roomCode: () => app.roomCode,
+  droppedTurns: () => battleScene()?.droppedTurns ?? 0,
 };

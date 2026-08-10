@@ -22,14 +22,14 @@ import { describe, expect, it } from 'vitest';
 import {
   blast,
   applyDamage,
+  damageToTankAt,
   detonate,
   NAPALM_DECAY,
-  TANK_DAMAGE_OFFSET,
   type DetonationEvent,
   type DetonationRules,
   type DetonationTarget,
 } from '../src/detonation.ts';
-import { hypot2 } from '../src/math.ts';
+import { DEFAULT_WORLD } from '../src/game.ts';
 import { makeRng, restoreRng } from '../src/rng.ts';
 import { simulateFlight } from '../src/physics.ts';
 import {
@@ -41,7 +41,7 @@ import {
   TERRAIN_STYLES,
   type Terrain,
 } from '../src/terrain.ts';
-import { damageAtDistance, requireWeapon, WEAPONS, type WeaponDef } from '../src/weapons.ts';
+import { requireWeapon, WEAPONS, type WeaponDef } from '../src/weapons.ts';
 
 const WIDTH = 480;
 const HEIGHT = 320;
@@ -193,13 +193,119 @@ describe('explode', () => {
 
     expect(explosions(events)).toHaveLength(1);
     expect(surfaceAt(target.terrain, 200)).toBeGreaterThan(200); // ground blown downward
-    expect(target.tanks[0]!.health).toBeLessThan(20); // a direct Baby Nuke is decisive
+
+    // Decisive means decisive: one direct Baby Nuke leaves a full-health tank
+    // on a sliver, and a second finishes it. Stated as "the second one kills"
+    // rather than as a health figure, so it is the tier's promise under test
+    // (`weapons.ts`: tier 2 destroys in one or two direct hits) and not the
+    // damage number copied out of the table.
+    const survivor = target.tanks[0]!;
+    expect(survivor.health).toBeGreaterThan(0);
+    expect(survivor.health).toBeLessThan(100 / 3);
+    fire(target, 'baby_nuke', 200, 200, null);
+    expect(survivor.health).toBe(0);
+    expect(survivor.alive).toBe(false);
   });
 
   it('leaves a tank outside the blast radius untouched', () => {
     const target = makeTarget(flatTerrain(), [testTank(200, 200), testTank(400, 200)]);
     fire(target, 'baby_nuke', 200, 200, null);
     expect(target.tanks[1]!.health).toBe(100);
+  });
+});
+
+/**
+ * How far past a tank's skin a blast still bites — the upper half of the pin on
+ * `TANK_HULL_RADIUS`, and the half that did not exist.
+ *
+ * `damageToTankAt` measures from the SKIN of the hull rather than from its
+ * centre, which is what makes a direct hit do the number printed in the shop.
+ * The side effect, stated deliberately in `detonation.ts`, is that every blast
+ * reaches one hull further than its own radius: "a blast that touches the tank
+ * has touched the tank". That side effect is the thing this measures, because
+ * it is the only observable consequence of the hull being too BIG — shrink the
+ * constant and direct hits go soft (pinned in `game-damage.test.ts`), grow it
+ * and nothing anywhere noticed except the golden hash.
+ *
+ * Measured before writing: with `TANK_HULL_RADIUS` at 8 or at 10 the entire sim
+ * suite was green apart from `determinism.test.ts`.
+ */
+describe('how far a blast reaches past a tank', () => {
+  /**
+   * The greatest distance from the hull's CENTRE at which this weapon still
+   * does something, found by bisection on the real damage function.
+   *
+   * Bisected rather than stepped so the answer is exact to a fraction of a
+   * pixel — a whole-pixel sweep would leave the constant free to move by one,
+   * which is precisely the size of change nothing else in the suite notices.
+   */
+  function reachOf(weapon: WeaponDef): number {
+    const tankX = 200;
+    const tankY = 200;
+    // Straight up from the hull centre, so the offset between a tank's feet and
+    // the point blasts are measured against cancels out of the geometry and
+    // what is left is the distance under test.
+    const damageAt = (distance: number): number =>
+      damageToTankAt(weapon, tankX, tankY - HULL_CENTRE_OFFSET - distance, tankX, tankY);
+
+    let bites = 0;
+    let clear = weapon.radius * 4 + 100;
+    expect(damageAt(bites), `${weapon.id} does nothing at point blank`).toBeGreaterThan(0);
+    expect(damageAt(clear), `${weapon.id} still bites from far outside its radius`).toBe(0);
+
+    for (let step = 0; step < 60; step += 1) {
+      const middle = (bites + clear) / 2;
+      if (damageAt(middle) > 0) bites = middle;
+      else clear = middle;
+    }
+    return clear;
+  }
+
+  /**
+   * Where the hull's centre sits above a tank's feet. Half a hull, and it is
+   * `game.ts` that decides so — `seatTanks` puts the hit circle at
+   * `y - tankRadius / 2`. Taken from there rather than from `detonation.ts`, so
+   * this test is comparing the two files rather than agreeing with one of them.
+   */
+  const HULL_CENTRE_OFFSET = DEFAULT_WORLD.tankRadius / 2;
+
+  it('reaches exactly one hull past its own radius, for every weapon that hurts', () => {
+    const armed = WEAPONS.filter((weapon) => weapon.damage > 0);
+    expect(armed.length).toBeGreaterThan(5);
+
+    for (const weapon of armed) {
+      // The claim: the blast stops biting the moment its edge leaves the skin
+      // of the hull, and not a pixel sooner or later. Both halves matter — a
+      // hull too small takes reach away from every weapon at once and makes a
+      // direct hit a near miss, a hull too big hands every weapon in the
+      // arsenal free range nothing in the shop text mentions.
+      expect(reachOf(weapon) - weapon.radius, `${weapon.id} reach past its radius`).toBeCloseTo(
+        DEFAULT_WORLD.tankRadius,
+        6,
+      );
+    }
+  });
+
+  it('is the same rule when a real blast goes off next to a real tank', () => {
+    // The same statement made through `blast()` on a live target, so it is the
+    // damage LEDGER that is being read and not the falloff curve on its own.
+    const weapon = requireWeapon('missile');
+    const gap = DEFAULT_WORLD.tankRadius + weapon.radius;
+    const feet = 200;
+
+    const justOutside = makeTarget(flatTerrain(), [testTank(200, feet)]);
+    fire(justOutside, weapon.id, 200 + gap, feet - DEFAULT_WORLD.tankRadius / 2, null);
+    expect(
+      justOutside.tanks[0]!.health,
+      'a blast whose edge stops on the skin of the hull still hurt',
+    ).toBe(100);
+
+    const justInside = makeTarget(flatTerrain(), [testTank(200, feet)]);
+    fire(justInside, weapon.id, 200 + gap - 4, feet - DEFAULT_WORLD.tankRadius / 2, null);
+    expect(
+      justInside.tanks[0]!.health,
+      'a blast four pixels inside the skin did nothing',
+    ).toBeLessThan(100);
   });
 });
 
@@ -965,8 +1071,11 @@ describe('napalm', () => {
         pool += 1;
         source = { x: event.x, y: event.y };
       } else if (event.type === 'damage' && source !== null) {
-        const distance = hypot2(tankX - source.x, tankY - TANK_DAMAGE_OFFSET - source.y);
-        const undecayed = damageAtDistance(weapon, distance);
+        // Through `damageToTankAt` rather than `damageAtDistance` on a distance
+        // computed here: the sim measures a blast from the SKIN of the hull, and
+        // a second copy of that geometry in this file would be a copy that can
+        // disagree with the one under test.
+        const undecayed = damageToTankAt(weapon, source.x, source.y, tankX, tankY);
         expect(undecayed).toBeGreaterThan(0);
         let expectedScale = 1;
         for (let i = 0; i < pool; i += 1) expectedScale *= NAPALM_DECAY;

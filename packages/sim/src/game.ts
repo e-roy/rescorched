@@ -242,18 +242,47 @@ export function createGame(config: GameConfig, players: readonly PlayerSeed[]): 
     seed: normalizeSeed(config.seed),
     round: 1,
     totalRounds,
-    phase: 'aiming',
+    // The armoury, not the battlefield. See `isArmouryBeforeRoundOne`.
+    phase: 'shopping',
     terrain,
     tanks,
     activeTank: 0,
-    turnNumber: 1,
+    // Turn numbers start at 1 (`roundStartTurn` of round 1), so 0 is the one
+    // value that means "no shell has been fired in this match". That is what
+    // makes the opening armoury derivable rather than stored.
+    turnNumber: 0,
     wind,
     rngState: rng.save(),
     winnerId: null,
-    pendingShoppers: [],
+    pendingShoppers: tanks.map((tank) => tank.id),
   };
   state.activeTank = firstShooter(state);
   return state;
+}
+
+/**
+ * Is the shop currently the pre-match armoury rather than an intermission?
+ *
+ * The original opens with the armoury: you spend your starting money BEFORE the
+ * first shell flies. Dropping straight into `aiming` meant round one was always
+ * fought with the free Baby Missile while 10000 sat idle in every bank, which
+ * is most of why a round felt like a grind — a Baby Missile needs four direct
+ * hits and nobody had anything else.
+ *
+ * Derived, not stored, for the reason at the top of this file: `turnNumber` is
+ * already persisted, it starts at 1 for round one's first shot, and nothing
+ * ever moves it backwards. So 0 means, and can only mean, "this match has not
+ * fired a shot yet" — and a `shopping` phase in that condition is the armoury.
+ * The between-rounds shop after round 1 sits at whatever turn that round ended
+ * on, which is at least `roundStartTurn`, which is at least 1.
+ *
+ * Two things read it and they need it for opposite reasons: `startNextRound`
+ * must NOT advance the round counter or throw away the terrain the player has
+ * been looking at, and `economy.roundsFought` must report 0 rounds fought
+ * rather than 1.
+ */
+export function isArmouryBeforeRoundOne(state: Pick<GameState, 'phase' | 'turnNumber'>): boolean {
+  return state.phase === 'shopping' && state.turnNumber === 0;
 }
 
 /** Wind is displayed as one decimal place; keep the state exactly that precise. */
@@ -992,6 +1021,10 @@ export function fire(state: GameState, playerId: string, input: FireInput): Reso
         shooterIndex,
         rng,
         DETONATION_RULES,
+        // The one thing a weapon is allowed to know about HOW it stopped. See
+        // `ImpactContext`: a Roller that struck a hull goes off on the hull
+        // instead of carrying on down the hill.
+        { onTank: trajectory.impact.kind === 'tank' },
       ) as GameEvent[]),
     );
   }
@@ -1260,8 +1293,19 @@ export function matchWinnerId(state: Pick<GameState, 'tanks'>): string | null {
 }
 
 /**
- * Start the next round: fresh terrain, everyone back to full health, inventory
- * and the scoreboard carried over. Called once every player has left the shop.
+ * Close the shop and start shooting.
+ *
+ * Two entrances, one exit. Between rounds it does what it says: fresh terrain,
+ * everyone back to full health, inventory and the scoreboard carried over. Out
+ * of the pre-match armoury (`isArmouryBeforeRoundOne`) it opens round one on
+ * the board `createGame` already generated and seated — nothing to re-roll,
+ * nothing to heal, and above all no round counter to advance, because the round
+ * about to be fought is the round the state already names.
+ *
+ * The opening branch draws NOTHING from the rng, which is the property that
+ * makes the armoury free of charge: a match where everybody buys and a match
+ * where nobody does reach round one with the same stream position, so the shop
+ * cannot change where the wind goes.
  */
 export function startNextRound(state: GameState): ResolveResult {
   if (state.phase !== 'shopping') {
@@ -1270,22 +1314,27 @@ export function startNextRound(state: GameState): ResolveResult {
 
   const next = cloneState(state);
   const rng = restoreRng(next.rngState);
+  const opening = isArmouryBeforeRoundOne(state);
 
-  next.round += 1;
   next.phase = 'aiming';
   next.pendingShoppers = [];
 
-  const terrainRng = rng.fork(`terrain:${next.round}`);
-  const style = terrainRng.pick(TERRAIN_STYLES);
-  next.terrain = generateTerrain(
-    { width: state.terrain.width, height: state.terrain.height, style },
-    terrainRng,
-  );
+  if (!opening) {
+    next.round += 1;
 
-  seatTanks(next.tanks, next.terrain, rng.fork(`placement:${next.round}`));
-  for (const tank of next.tanks) {
-    tank.health = DEFAULT_WORLD.maxHealth;
-    tank.alive = true;
+    const terrainRng = rng.fork(`terrain:${next.round}`);
+    const style = terrainRng.pick(TERRAIN_STYLES);
+    next.terrain = generateTerrain(
+      { width: state.terrain.width, height: state.terrain.height, style },
+      terrainRng,
+    );
+
+    seatTanks(next.tanks, next.terrain, rng.fork(`placement:${next.round}`));
+    for (const tank of next.tanks) {
+      tank.health = DEFAULT_WORLD.maxHealth;
+      tank.alive = true;
+    }
+    next.wind = roundWind(rng.range(-DEFAULT_WORLD.maxWind, DEFAULT_WORLD.maxWind));
   }
 
   // Normally exactly `roundStartTurn`; the `max` only bites for a hand-built
@@ -1293,7 +1342,6 @@ export function startNextRound(state: GameState): ResolveResult {
   // a stale shot from the previous round look current.
   next.turnNumber = Math.max(state.turnNumber + 1, roundStartTurn(next));
   next.activeTank = firstShooter(next);
-  next.wind = roundWind(rng.range(-DEFAULT_WORLD.maxWind, DEFAULT_WORLD.maxWind));
   next.rngState = rng.save();
 
   return {

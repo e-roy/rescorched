@@ -33,6 +33,7 @@ import { emptyTerrain } from '../src/terrain.ts';
 import { makeRng } from '../src/rng.ts';
 import { BABY_MISSILE } from '../src/weapons.ts';
 import { fromPersisted, toPersisted } from '../src/serialize.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -51,7 +52,7 @@ const players = (count: number): PlayerSeed[] =>
  */
 function stalemateGame(count: number, seed: string, totalRounds = 3): GameState {
   if (count > 4) throw new Error('the harmless geometry only holds for up to 4 tanks');
-  const base = createGame({ seed, totalRounds, width: WIDTH, height: HEIGHT }, players(count));
+  const base = openedGame({ seed, totalRounds, width: WIDTH, height: HEIGHT }, players(count));
   const terrain = emptyTerrain(WIDTH, HEIGHT);
   terrain.surface.fill(GROUND);
   return {

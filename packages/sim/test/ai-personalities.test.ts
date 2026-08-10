@@ -34,6 +34,11 @@
  * a better shot, and POOLSHARK's whole design is that its FIRST shot is bad —
  * `ai-poolshark.test.ts` measures it over ten turns, where it belongs.
  *
+ * That split is not a remark in a comment any more. It is `BOT_DIFFICULTY_LADDER`
+ * and `BOT_SPECIALISTS` in `ai.ts`, this file measures the first of them rung by
+ * rung, and the lobby's picker is built from both — so the ordering a player is
+ * shown is the ordering under test, and there is no second copy to go stale.
+ *
  * ---------------------------------------------------------------------------
  * What is asserted
  * ---------------------------------------------------------------------------
@@ -54,7 +59,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   applyBotShopping,
+  BOT_DIFFICULTY_LADDER,
   BOT_PERSONALITIES,
+  BOT_SPECIALISTS,
   choosePurchases,
   chooseShot,
   chooseShotDetailed,
@@ -62,10 +69,11 @@ import {
   chooseWeapon,
   type BotPersonality,
 } from '../src/ai.ts';
-import { createGame, DEFAULT_WORLD, predictShot, type GameState, type Tank } from '../src/game.ts';
+import { DEFAULT_WORLD, predictShot, type GameState, type Tank } from '../src/game.ts';
 import { hypot2 } from '../src/math.ts';
 import { TERRAIN_STYLES } from '../src/terrain.ts';
 import { requireWeapon, WEAPONS } from '../src/weapons.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -75,7 +83,7 @@ const GAMES: GameState[] = [];
 for (const style of TERRAIN_STYLES) {
   for (let seed = 0; seed < SEEDS; seed += 1) {
     GAMES.push(
-      createGame(
+      openedGame(
         { seed: `spread-${style}-${seed}`, terrainStyle: style, width: WIDTH, height: HEIGHT },
         [
           { id: 'a', name: 'A' },
@@ -179,8 +187,24 @@ function table(): string {
 const MIN_HIT_GAP = 0.15;
 
 describe('the difficulty ladder is real and in the right order', () => {
+  /*
+   * Read from `ai.ts` rather than written out here, and that is the whole point
+   * of the constant existing. The lobby prints "2 of 4" straight off this array,
+   * so the sentence a player reads and the ordering this file measures are the
+   * same object: moving an entry, or adding a fifth, fails below.
+   */
+  it('accounts for every personality exactly once, ranked or explicitly not', () => {
+    // A seventh personality added to the roster and left unclassified would show
+    // up in the lobby with no honest thing to say about it, so it fails here
+    // instead — this is the assertion that makes the picker's two groups a
+    // partition rather than two lists that happen to add up today.
+    const classified = [...BOT_DIFFICULTY_LADDER, ...BOT_SPECIALISTS] as BotPersonality[];
+    expect([...classified].sort()).toEqual([...BOT_PERSONALITIES].sort());
+    expect(new Set(classified).size, 'a personality is in both groups').toBe(classified.length);
+  });
+
   it('out-hits, rung by rung, by a margin a player would notice', () => {
-    const ladder: BotPersonality[] = ['moron', 'shooter', 'cyborg', 'annihilator'];
+    const ladder: readonly BotPersonality[] = BOT_DIFFICULTY_LADDER;
     for (let rung = 1; rung < ladder.length; rung += 1) {
       const better = ladder[rung] as BotPersonality;
       const worse = ladder[rung - 1] as BotPersonality;
@@ -195,7 +219,7 @@ describe('the difficulty ladder is real and in the right order', () => {
     // or wild; mean miss is the continuous version of the same claim, and the
     // two agreeing is what makes the ranking a ranking rather than an artefact
     // of where the blast radius happens to fall.
-    const ladder: BotPersonality[] = ['moron', 'shooter', 'cyborg', 'annihilator'];
+    const ladder: readonly BotPersonality[] = BOT_DIFFICULTY_LADDER;
     for (let rung = 1; rung < ladder.length; rung += 1) {
       const better = ladder[rung] as BotPersonality;
       const worse = ladder[rung - 1] as BotPersonality;
@@ -346,7 +370,7 @@ const WIND_MAPS: GameState[] = [];
 for (const style of TERRAIN_STYLES) {
   for (let seed = 0; seed < 12; seed += 1) {
     WIND_MAPS.push(
-      createGame(
+      openedGame(
         { seed: `wind-${style}-${seed}`, terrainStyle: style, width: WIDTH, height: HEIGHT },
         [
           { id: 'a', name: 'A' },
@@ -450,7 +474,7 @@ describe('the Shooter is blind to the wind, and that is what beats it', () => {
 const WARHEAD_PAIRS: { big: GameState; small: GameState }[] = [];
 for (const style of TERRAIN_STYLES) {
   for (let seed = 0; seed < 12; seed += 1) {
-    const base = createGame(
+    const base = openedGame(
       { seed: `warhead-${style}-${seed}`, terrainStyle: style, width: WIDTH, height: HEIGHT },
       [
         { id: 'a', name: 'A' },
@@ -583,7 +607,7 @@ describe('the self-preserving bots weigh their own blast', () => {
 
 /** A between-rounds shop with a given bankroll, one round already fought. */
 function shopping(personality: BotPersonality, money: number, round = 1): GameState {
-  const base = createGame({ seed: 'shop', width: WIDTH, height: HEIGHT }, [
+  const base = openedGame({ seed: 'shop', width: WIDTH, height: HEIGHT }, [
     { id: 'a', name: 'A', bot: personality },
     { id: 'b', name: 'B' },
   ]);
@@ -690,7 +714,7 @@ describe('a bot with money buys for its personality', () => {
 
 describe('a bot with a full armoury picks the right gun', () => {
   function armed(personality: BotPersonality, targetHealth: number): GameState {
-    const base = createGame({ seed: 'armoury', width: WIDTH, height: HEIGHT }, [
+    const base = openedGame({ seed: 'armoury', width: WIDTH, height: HEIGHT }, [
       { id: 'a', name: 'A', bot: personality },
       { id: 'b', name: 'B' },
     ]);
@@ -785,7 +809,7 @@ describe('a bot with a full armoury picks the right gun', () => {
 
   it('has the Annihilator shoot at whoever it can finish, not whoever is closest', () => {
     const wounded = (personality: BotPersonality): GameState => {
-      const base = createGame({ seed: 'finish-them', width: WIDTH, height: HEIGHT }, [
+      const base = openedGame({ seed: 'finish-them', width: WIDTH, height: HEIGHT }, [
         { id: 'a', name: 'A', bot: personality },
         { id: 'b', name: 'B' },
         { id: 'c', name: 'C' },
@@ -828,7 +852,7 @@ describe('a bot with a full armoury picks the right gun', () => {
      * quietly did something other than what it said.
      */
     const board = (seatBot: BotPersonality | null): GameState => {
-      const base = createGame({ seed: 'finish-them', width: WIDTH, height: HEIGHT }, [
+      const base = openedGame({ seed: 'finish-them', width: WIDTH, height: HEIGHT }, [
         seatBot === null ? { id: 'a', name: 'A' } : { id: 'a', name: 'A', bot: seatBot },
         { id: 'b', name: 'B' },
         { id: 'c', name: 'C' },

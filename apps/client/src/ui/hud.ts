@@ -11,7 +11,16 @@ import { BABY_MISSILE, getWeapon, PHYSICS, WEAPONS } from '@scorched/sim';
 import type { GameSnapshot, TankSnapshot } from '@scorched/protocol';
 import type { ConnectionStatus } from '../net.ts';
 import { el, must } from './dom.ts';
+import { blurbOf, describeSeat } from './bots.ts';
 import { ammo, clock, colorCss, hurtLevel, money, readWind, weaponName } from './format.ts';
+
+/**
+ * Which seats are computer players, by player id — carried in from the last
+ * lobby frame, because the snapshot does not say. Empty is a perfectly normal
+ * value: a match of nothing but people, or a spectator who walked in after the
+ * first shot and has not seen a lobby frame yet.
+ */
+export type BotSeats = ReadonlyMap<string, string>;
 
 export interface HudCallbacks {
   onAdjust(kind: 'angle' | 'power', delta: number): void;
@@ -153,11 +162,17 @@ export class HudView {
    * caller can re-broadcast rather than letting the two ends disagree about
    * what is loaded.
    */
-  render(snapshot: GameSnapshot, you: string, canFire: boolean, preferred: string): string {
+  render(
+    snapshot: GameSnapshot,
+    you: string,
+    canFire: boolean,
+    preferred: string,
+    bots: BotSeats = new Map(),
+  ): string {
     this.renderWind(snapshot.wind);
 
     const active = snapshot.tanks[snapshot.activeTank];
-    this.renderActive(active, you);
+    this.renderActive(active, you, bots);
 
     const yourTank = snapshot.tanks.find((tank) => tank.id === you);
     if (yourTank !== undefined) {
@@ -169,8 +184,8 @@ export class HudView {
     }
 
     this.fireButton.disabled = !canFire;
-    this.turnLine.textContent = this.describeTurn(snapshot, you, active);
-    this.renderPlayers(snapshot, you);
+    this.turnLine.textContent = this.describeTurn(snapshot, you, active, bots);
+    this.renderPlayers(snapshot, you, bots);
     return this.selectedWeapon;
   }
 
@@ -186,21 +201,29 @@ export class HudView {
     snapshot: GameSnapshot,
     you: string,
     active: TankSnapshot | undefined,
+    bots: BotSeats,
   ): string {
     if (snapshot.phase === 'resolving') return 'Shot away…';
     if (snapshot.phase === 'shopping') return 'Between rounds — visit the armoury.';
     if (snapshot.phase !== 'aiming' || active === undefined) return '';
     const heading = `Round ${snapshot.round} of ${snapshot.totalRounds}`;
-    return active.id === you
-      ? `${heading} — your shot. Arrows aim, Shift for big steps, Space fires.`
+    if (active.id === you) {
+      return `${heading} — your shot. Arrows aim, Shift for big steps, Space fires.`;
+    }
+    // "Thinking" rather than "waiting for": a computer player is not somebody
+    // who might have walked away from the keyboard, and the wait is a second.
+    return bots.has(active.id)
+      ? `${heading} — ${active.name} is thinking…`
       : `${heading} — waiting for ${active.name}…`;
   }
 
-  private renderActive(active: TankSnapshot | undefined, you: string): void {
+  private renderActive(active: TankSnapshot | undefined, you: string, bots: BotSeats): void {
     if (active === undefined) {
       this.activeName.textContent = '—';
       this.activeHealth.textContent = '';
       this.activeBox.classList.remove('onturn--you');
+      this.activeBox.classList.remove('onturn--bot');
+      this.activeBox.title = '';
       return;
     }
     this.activeSwatch.style.background = colorCss(active.colorIndex);
@@ -208,6 +231,10 @@ export class HudView {
     this.activeHealth.textContent = `${Math.max(0, Math.round(active.health))}%`;
     this.activeHealth.dataset['hurt'] = hurtLevel(active.health);
     this.activeBox.classList.toggle('onturn--you', active.id === you);
+
+    const personality = bots.get(active.id);
+    this.activeBox.classList.toggle('onturn--bot', personality !== undefined);
+    this.activeBox.title = personality === undefined ? '' : blurbOf(personality).long;
   }
 
   /**
@@ -229,7 +256,7 @@ export class HudView {
       : `Wind pushes shells ${readout.direction === 'left' ? 'left' : 'right'} at ${readout.magnitude} of ${PHYSICS.maxWind}.`;
   }
 
-  private renderPlayers(snapshot: GameSnapshot, you: string): void {
+  private renderPlayers(snapshot: GameSnapshot, you: string, bots: BotSeats): void {
     this.playersStrip.replaceChildren(
       ...snapshot.tanks.map((tank, index) => {
         const tag = el('div', { className: 'playertag', testId: `playertag-${tank.id}` });
@@ -245,6 +272,23 @@ export class HudView {
           text: tank.id === you ? `${tank.name} (you)` : tank.name,
         });
 
+        /*
+         * Which of these tanks is a machine, said in the one place a player is
+         * already looking to see who is left. Without it, a name like "Cyborg"
+         * is the only clue — and a bot's name is not a rule, so a room that ever
+         * lets a person be called Cyborg would make that clue a lie.
+         */
+        const personality = bots.get(tank.id);
+        const cpu =
+          personality === undefined
+            ? null
+            : el('span', {
+                className: 'playertag__cpu',
+                text: 'CPU',
+                title: `${describeSeat(personality)}. ${blurbOf(personality).long}`,
+              });
+        if (cpu !== null) tag.classList.add('playertag--bot');
+
         const bar = el('span', { className: 'playertag__health' });
         bar.dataset['hurt'] = hurtLevel(tank.health);
         const fill = el('span');
@@ -253,7 +297,9 @@ export class HudView {
 
         const cash = el('span', { className: 'playertag__cash', text: money(tank.money) });
 
-        tag.append(swatch, name, bar, cash);
+        tag.append(swatch, name);
+        if (cpu !== null) tag.append(cpu);
+        tag.append(bar, cash);
         return tag;
       }),
     );

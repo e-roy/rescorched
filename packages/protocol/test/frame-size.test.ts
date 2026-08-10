@@ -38,6 +38,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   createGame,
+  startNextRound,
+  type GameState,
   fire,
   toSnapshot,
   WEAPONS,
@@ -88,16 +90,40 @@ interface Turn {
   snapshot: GameSnapshot;
 }
 
+/**
+ * A fully-stocked board on this seed, ready to fire.
+ *
+ * Cached per seed because the sweep below asks for 189 turns across a handful of
+ * seeds, and building one costs a 1280-column terrain generation. `fire()`
+ * clones before it writes anything, so handing the same state to every weapon is
+ * safe — and it is the SAME board for every weapon, which is what makes the
+ * frame sizes comparable.
+ *
+ * Past the opening armoury: a match starts in `shopping` and `fire()` rightly
+ * refuses to resolve anything there.
+ */
+const BOARDS = new Map<number, GameState>();
+function boardFor(seed: number): GameState {
+  let board = BOARDS.get(seed);
+  if (board === undefined) {
+    const opened = startNextRound(
+      createGame({ seed, totalRounds: 3, width: 1280, height: 720 }, PLAYERS),
+    ).state;
+    board = {
+      ...opened,
+      tanks: opened.tanks.map((tank) => ({
+        ...tank,
+        inventory: Object.fromEntries(WEAPONS.map((weapon) => [weapon.id, 99])),
+      })),
+    };
+    BOARDS.set(seed, board);
+  }
+  return board;
+}
+
 /** Fire one weapon on a full-size map and return the frame the server would send. */
 function turnFor(weaponId: string, seed: number, angleDeg: number, power: number): Turn {
-  let state = createGame({ seed, totalRounds: 3, width: 1280, height: 720 }, PLAYERS);
-  state = {
-    ...state,
-    tanks: state.tanks.map((tank) => ({
-      ...tank,
-      inventory: Object.fromEntries(WEAPONS.map((weapon) => [weapon.id, 99])),
-    })),
-  };
+  const state = boardFor(seed);
 
   const shooter = state.tanks[state.activeTank];
   if (shooter === undefined) throw new Error('no active tank');

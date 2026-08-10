@@ -21,6 +21,14 @@
       unplayable turn, not a cosmetic complaint.
     -->
     <div id="hud" class="hud" hidden data-testid="hud">
+      <!--
+        The nudge buttons carry testids because they are the PRIMARY aiming
+        control for a mouse-only player, and until they had them no test in the
+        suite had ever clicked one: `helpers.setAim` drives aim by dispatching
+        synthetic KeyboardEvents at the window, so the entire keyboard path was
+        covered and the entire pointer path was not. `turret.spec.ts` clicks
+        them now and watches the barrel move.
+      -->
       <div class="hud__status">
         <!-- Power before Angle, which is the order the original prints them. -->
         <div class="dial" data-testid="dial-power">
@@ -29,6 +37,7 @@
             class="dial__step dial__step--coarse"
             data-action="power-down"
             data-coarse="1"
+            data-testid="dial-power-down-10"
             aria-label="Power down 10"
             title="Shift + Down"
           >
@@ -37,19 +46,27 @@
           <button
             class="dial__step"
             data-action="power-down"
+            data-testid="dial-power-down"
             aria-label="Power down 1"
             title="Down"
           >
             &lsaquo;
           </button>
           <output class="dial__value" id="hud-power" data-testid="hud-power">60</output>
-          <button class="dial__step" data-action="power-up" aria-label="Power up 1" title="Up">
+          <button
+            class="dial__step"
+            data-action="power-up"
+            data-testid="dial-power-up"
+            aria-label="Power up 1"
+            title="Up"
+          >
             &rsaquo;
           </button>
           <button
             class="dial__step dial__step--coarse"
             data-action="power-up"
             data-coarse="1"
+            data-testid="dial-power-up-10"
             aria-label="Power up 10"
             title="Shift + Up"
           >
@@ -63,6 +80,7 @@
             class="dial__step dial__step--coarse"
             data-action="angle-down"
             data-coarse="1"
+            data-testid="dial-angle-down-10"
             aria-label="Angle down 10"
             title="Shift + Left"
           >
@@ -71,6 +89,7 @@
           <button
             class="dial__step"
             data-action="angle-down"
+            data-testid="dial-angle-down"
             aria-label="Angle down 1"
             title="Left"
           >
@@ -78,13 +97,20 @@
           </button>
           <output class="dial__value" id="hud-angle" data-testid="hud-angle">45</output>
           <span class="dial__unit">&deg;</span>
-          <button class="dial__step" data-action="angle-up" aria-label="Angle up 1" title="Right">
+          <button
+            class="dial__step"
+            data-action="angle-up"
+            data-testid="dial-angle-up"
+            aria-label="Angle up 1"
+            title="Right"
+          >
             &rsaquo;
           </button>
           <button
             class="dial__step dial__step--coarse"
             data-action="angle-up"
             data-coarse="1"
+            data-testid="dial-angle-up-10"
             aria-label="Angle up 10"
             title="Shift + Right"
           >
@@ -134,9 +160,251 @@
       </div>
     </div>
 
-    <div id="game-root"></div>
+    <!--
+      The stage: the playfield and the menus that float over it, and NOTHING
+      else. This wrapper is the fix for a real bug rather than tidying.
 
-    <!-- Chat lives over the canvas so it never steals height from the playfield. -->
+      The overlay is `position: absolute; inset: 0`, so what it covers is
+      whatever box it is measured against. Against the viewport it covered the
+      chat bar too — and a lobby full of computer players is tall enough that
+      the Start button ended up underneath the chat form, so the click that this
+      whole feature exists to enable landed in a text box. Measured at 1280x720:
+      seven seats put Start at y=636 and it worked; eight put it at y=686 and
+      `elementFromPoint` came back with the chat.
+
+      With the HUD above and the chat below as siblings of the stage, the three
+      occupy disjoint boxes in the flex column and no z-index argument decides
+      anything. `solo-bot.spec.ts` hit-tests the Start button in a full room.
+    -->
+    <div id="stage" class="stage">
+      <div id="game-root"></div>
+
+      <!-- Menus: title / lobby / armoury / game over -->
+      <div id="overlay" class="overlay" data-testid="overlay">
+        <section class="panel panel--title" id="panel-title" data-testid="panel-title">
+          <div class="sunset" aria-hidden="true">
+            <div class="sunset__sun"></div>
+            <svg class="sunset__range" viewBox="0 0 1200 320" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="ridge-far" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#dfe4f4" />
+                  <stop offset="60%" stop-color="#a294c4" />
+                  <stop offset="100%" stop-color="#6d5b96" />
+                </linearGradient>
+                <linearGradient id="ridge-near" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#ffffff" />
+                  <stop offset="42%" stop-color="#eef1fa" />
+                  <stop offset="100%" stop-color="#a9b2d0" />
+                </linearGradient>
+              </defs>
+              <polygon
+                fill="url(#ridge-far)"
+                points="0,246 58,206 118,232 188,152 248,196 322,124 398,180 470,134 540,190 612,108 690,168 760,142 832,198 902,152 980,208 1060,168 1132,218 1200,192 1200,320 0,320"
+              />
+              <polygon
+                fill="url(#ridge-near)"
+                points="0,300 66,276 140,288 212,240 282,266 344,220 402,250 462,158 522,126 562,62 604,104 646,48 694,118 742,86 792,168 852,212 904,182 962,232 1022,200 1084,246 1142,222 1200,258 1200,320 0,320"
+              />
+              <polygon
+                fill="#ffffff"
+                opacity="0.6"
+                points="646,48 694,118 664,124 630,86 604,104 562,62 588,44 616,74"
+              />
+              <polygon
+                fill="#8d96bb"
+                opacity="0.45"
+                points="646,48 694,118 792,168 852,212 762,206 700,150"
+              />
+            </svg>
+          </div>
+
+          <div class="titlebar">
+            <h1 class="titlebar__name">Scorched Earth</h1>
+            <p class="titlebar__sub">The Mother of All Games</p>
+            <p class="titlebar__badge">&#42;&#42; Open Source Multiplayer Edition &#42;&#42;</p>
+          </div>
+
+          <div class="console" data-testid="title-console">
+            <label class="field">
+              <span>Your name</span>
+              <input
+                id="input-name"
+                data-testid="input-name"
+                maxlength="16"
+                value="Player"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </label>
+            <button class="btn btn--primary" id="btn-create" data-testid="btn-create">
+              Create room
+            </button>
+
+            <div class="console__rule"><span>or join</span></div>
+
+            <label class="field">
+              <span>Room code</span>
+              <input
+                class="field__code"
+                id="input-room"
+                data-testid="input-room"
+                maxlength="4"
+                placeholder="ABCD"
+                autocomplete="off"
+                spellcheck="false"
+                inputmode="latin"
+              />
+            </label>
+            <button class="btn" id="btn-join" data-testid="btn-join">Join room</button>
+
+            <p class="panel__error" id="title-error" data-testid="title-error" hidden></p>
+          </div>
+
+          <p class="titlebar__foot">
+            A web remake of the 1991 DOS original by Wendell Hicken. Open source, no accounts, room
+            codes only.
+          </p>
+        </section>
+
+        <section class="panel panel--lobby" id="panel-lobby" data-testid="panel-lobby" hidden>
+          <p class="lobby__eyebrow">Room code &mdash; read it out loud</p>
+          <div class="lobby__codebox">
+            <span class="lobby__code" id="lobby-code" data-testid="lobby-code">----</span>
+            <button class="btn btn--ghost" id="btn-copy" data-testid="btn-copy">Copy invite</button>
+          </div>
+          <p class="panel__hint" id="lobby-hint" data-testid="lobby-hint">
+            Two players minimum. Anyone with the code can walk in.
+          </p>
+
+          <ul class="playerlist" id="lobby-players" data-testid="lobby-players"></ul>
+          <p
+            class="lobby__spectators"
+            id="lobby-spectators"
+            data-testid="lobby-spectators"
+            hidden
+          ></p>
+
+          <!--
+          The whole reason one person can sit down and play.
+
+          The six computer players differ enormously, so the picker has to say so
+          BEFORE the match rather than after: the ranked four carry their rung in
+          the option text, the other two are grouped as "different, not harder",
+          and the line underneath carries the meter and what the chosen one
+          actually does. All of it is built in `ui/lobby.ts` from the sim's own
+          `BOT_DIFFICULTY_LADDER` and `BOT_SPECIALISTS`, so the order shown here
+          is the order a test in `packages/sim` measures.
+        -->
+          <div class="botbar" id="lobby-bots" data-testid="bot-controls">
+            <label class="botbar__pick">
+              <span class="visually-hidden">Computer player</span>
+              <select
+                class="botbar__select"
+                id="select-bot-personality"
+                data-testid="select-bot-personality"
+              ></select>
+            </label>
+            <button class="btn btn--ghost" id="btn-add-bot" data-testid="btn-add-bot">
+              Add computer
+            </button>
+          </div>
+          <p class="botbar__blurb" id="bot-blurb" data-testid="bot-blurb">
+            <span class="skill" id="bot-skill" aria-hidden="true"></span>
+            <span id="bot-blurb-text"></span>
+          </p>
+
+          <!--
+          The refusal sits directly under the control that earns it, and above
+          the actions rather than below them. It used to be the last element in
+          the panel, which in the one case that produces it — a room so full the
+          server says no — put it below the fold of a 720px window. A message
+          nobody can see is not a message.
+        -->
+          <p class="panel__error" id="lobby-error" data-testid="lobby-error" hidden></p>
+
+          <div class="panel__actions">
+            <button class="btn btn--primary" id="btn-start" data-testid="btn-start">
+              Start match
+            </button>
+            <button class="btn" id="btn-ready" data-testid="btn-ready" aria-pressed="false">
+              Ready
+            </button>
+            <button class="btn" id="btn-leave" data-testid="btn-leave">Leave</button>
+          </div>
+        </section>
+
+        <section class="panel panel--armoury" id="panel-shop" data-testid="panel-shop" hidden>
+          <header class="armoury__head">
+            <div>
+              <h2 class="panel__heading" id="shop-heading" data-testid="shop-heading">Armoury</h2>
+              <!--
+                Written by `ui/armoury.ts`, because this panel is two screens.
+                It opens a match — before a shot has been fired — and it opens
+                again between rounds, and the copy that was here said "Round
+                over" on both. The markup carries the between-rounds wording as
+                the fallback for a browser that never runs the script.
+              -->
+              <p class="panel__hint" id="shop-hint" data-testid="shop-hint">
+                Round over. Cash carries over, regrets do not.
+              </p>
+            </div>
+            <div class="armoury__cash">
+              <span>Cash</span>
+              <strong id="shop-money" data-testid="shop-money">$0</strong>
+            </div>
+          </header>
+
+          <ul class="armoury" id="shop-items" data-testid="shop-items"></ul>
+
+          <footer class="armoury__foot">
+            <span class="armoury__waiting" id="shop-waiting" data-testid="shop-waiting"></span>
+            <button class="btn btn--primary" id="btn-shop-done" data-testid="btn-shop-done">
+              Ready
+            </button>
+          </footer>
+        </section>
+
+        <section
+          class="panel panel--result"
+          id="panel-gameover"
+          data-testid="panel-gameover"
+          hidden
+        >
+          <h2 class="panel__heading">Match over</h2>
+          <p class="panel__winner" id="gameover-winner" data-testid="gameover-winner"></p>
+          <p class="panel__hint" id="gameover-rounds" data-testid="gameover-rounds"></p>
+          <ol class="standings" id="gameover-scores" data-testid="gameover-scores"></ol>
+          <div class="panel__actions">
+            <button class="btn btn--primary" id="btn-again" data-testid="btn-again">
+              Back to title
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <!--
+        The toast lives INSIDE the stage, and that is the whole of the fix for
+        "Reconnected." being painted across "Baby Nuke ×4".
+
+        It used to be `position: fixed; top: 16px`, measured against the window
+        — and the window's top 46 pixels are the status line, with the weapon
+        readout sitting dead centre where a centred toast lands. Anchored to the
+        bottom of the stage it is measured against the playfield instead, which
+        is the one box in the layout with nothing in it a player has to read.
+        Boxes that must not overlap are laid out so that they cannot, rather
+        than argued about with z-index — the same rule the stage itself exists
+        for.
+      -->
+      <div id="toast" class="toast" data-testid="toast" hidden></div>
+    </div>
+
+    <!--
+      Chat docks BELOW the stage, so it takes height from nothing that matters:
+      the canvas is FIT-scaled from a fixed 1280x720 world, so a strip of chrome
+      under it makes the drawing smaller and the map no smaller. It used to
+      float over the bottom-left of the playfield, where it sat on the terrain
+      and across the corner a tank can spawn in.
+    -->
     <div id="chat" class="chat" hidden data-testid="chat">
       <div
         class="chat__log"
@@ -161,163 +429,7 @@
       </form>
     </div>
 
-    <!-- Menus: title / lobby / armoury / game over -->
-    <div id="overlay" class="overlay" data-testid="overlay">
-      <section class="panel panel--title" id="panel-title" data-testid="panel-title">
-        <div class="sunset" aria-hidden="true">
-          <div class="sunset__sun"></div>
-          <svg class="sunset__range" viewBox="0 0 1200 320" preserveAspectRatio="none">
-            <defs>
-              <linearGradient id="ridge-far" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#dfe4f4" />
-                <stop offset="60%" stop-color="#a294c4" />
-                <stop offset="100%" stop-color="#6d5b96" />
-              </linearGradient>
-              <linearGradient id="ridge-near" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#ffffff" />
-                <stop offset="42%" stop-color="#eef1fa" />
-                <stop offset="100%" stop-color="#a9b2d0" />
-              </linearGradient>
-            </defs>
-            <polygon
-              fill="url(#ridge-far)"
-              points="0,246 58,206 118,232 188,152 248,196 322,124 398,180 470,134 540,190 612,108 690,168 760,142 832,198 902,152 980,208 1060,168 1132,218 1200,192 1200,320 0,320"
-            />
-            <polygon
-              fill="url(#ridge-near)"
-              points="0,300 66,276 140,288 212,240 282,266 344,220 402,250 462,158 522,126 562,62 604,104 646,48 694,118 742,86 792,168 852,212 904,182 962,232 1022,200 1084,246 1142,222 1200,258 1200,320 0,320"
-            />
-            <polygon
-              fill="#ffffff"
-              opacity="0.6"
-              points="646,48 694,118 664,124 630,86 604,104 562,62 588,44 616,74"
-            />
-            <polygon
-              fill="#8d96bb"
-              opacity="0.45"
-              points="646,48 694,118 792,168 852,212 762,206 700,150"
-            />
-          </svg>
-        </div>
-
-        <div class="titlebar">
-          <h1 class="titlebar__name">Scorched Earth</h1>
-          <p class="titlebar__sub">The Mother of All Games</p>
-          <p class="titlebar__badge">&#42;&#42; Open Source Multiplayer Edition &#42;&#42;</p>
-        </div>
-
-        <div class="console" data-testid="title-console">
-          <label class="field">
-            <span>Your name</span>
-            <input
-              id="input-name"
-              data-testid="input-name"
-              maxlength="16"
-              value="Player"
-              autocomplete="off"
-              spellcheck="false"
-            />
-          </label>
-          <button class="btn btn--primary" id="btn-create" data-testid="btn-create">
-            Create room
-          </button>
-
-          <div class="console__rule"><span>or join</span></div>
-
-          <label class="field">
-            <span>Room code</span>
-            <input
-              class="field__code"
-              id="input-room"
-              data-testid="input-room"
-              maxlength="4"
-              placeholder="ABCD"
-              autocomplete="off"
-              spellcheck="false"
-              inputmode="latin"
-            />
-          </label>
-          <button class="btn" id="btn-join" data-testid="btn-join">Join room</button>
-
-          <p class="panel__error" id="title-error" data-testid="title-error" hidden></p>
-        </div>
-
-        <p class="titlebar__foot">
-          A web remake of the 1991 DOS original by Wendell Hicken. Open source, no accounts, room
-          codes only.
-        </p>
-      </section>
-
-      <section class="panel panel--lobby" id="panel-lobby" data-testid="panel-lobby" hidden>
-        <p class="lobby__eyebrow">Room code &mdash; read it out loud</p>
-        <div class="lobby__codebox">
-          <span class="lobby__code" id="lobby-code" data-testid="lobby-code">----</span>
-          <button class="btn btn--ghost" id="btn-copy" data-testid="btn-copy">Copy invite</button>
-        </div>
-        <p class="panel__hint" id="lobby-hint" data-testid="lobby-hint">
-          Two players minimum. Anyone with the code can walk in.
-        </p>
-
-        <ul class="playerlist" id="lobby-players" data-testid="lobby-players"></ul>
-        <p
-          class="lobby__spectators"
-          id="lobby-spectators"
-          data-testid="lobby-spectators"
-          hidden
-        ></p>
-
-        <div class="panel__actions">
-          <button class="btn btn--primary" id="btn-start" data-testid="btn-start">
-            Start match
-          </button>
-          <button class="btn" id="btn-ready" data-testid="btn-ready" aria-pressed="false">
-            Ready
-          </button>
-          <button class="btn" id="btn-leave" data-testid="btn-leave">Leave</button>
-        </div>
-        <p class="panel__error" id="lobby-error" data-testid="lobby-error" hidden></p>
-      </section>
-
-      <section class="panel panel--armoury" id="panel-shop" data-testid="panel-shop" hidden>
-        <header class="armoury__head">
-          <div>
-            <h2 class="panel__heading">Armoury</h2>
-            <p class="panel__hint">
-              Round over. Cash carries over, regrets do not &mdash; and the shop only opens between
-              rounds.
-            </p>
-          </div>
-          <div class="armoury__cash">
-            <span>Cash</span>
-            <strong id="shop-money" data-testid="shop-money">$0</strong>
-          </div>
-        </header>
-
-        <ul class="armoury" id="shop-items" data-testid="shop-items"></ul>
-
-        <footer class="armoury__foot">
-          <span class="armoury__waiting" id="shop-waiting" data-testid="shop-waiting"></span>
-          <button class="btn btn--primary" id="btn-shop-done" data-testid="btn-shop-done">
-            Ready
-          </button>
-        </footer>
-      </section>
-
-      <section class="panel panel--result" id="panel-gameover" data-testid="panel-gameover" hidden>
-        <h2 class="panel__heading">Match over</h2>
-        <p class="panel__winner" id="gameover-winner" data-testid="gameover-winner"></p>
-        <p class="panel__hint" id="gameover-rounds" data-testid="gameover-rounds"></p>
-        <ol class="standings" id="gameover-scores" data-testid="gameover-scores"></ol>
-        <div class="panel__actions">
-          <button class="btn btn--primary" id="btn-again" data-testid="btn-again">
-            Back to title
-          </button>
-        </div>
-      </section>
-    </div>
-
     <div id="conn-banner" class="connbanner" data-testid="conn-banner" hidden></div>
-    <div id="toast" class="toast" data-testid="toast" hidden></div>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

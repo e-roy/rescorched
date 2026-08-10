@@ -32,6 +32,7 @@ import {
   type Terrain,
 } from '../src/terrain.ts';
 import { leaveShop } from '../src/economy.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -294,7 +295,10 @@ describe('placement is deterministic and repeats every round', () => {
     // Round two gets fresh terrain, so it gets the whole placement search
     // again. A round that only checked the first map would be half-tested.
     for (let seed = 0; seed < 10; seed += 1) {
-      let state: GameState = createGame(
+      // From `openedGame`, not `createGame`: the state has to be a
+      // BETWEEN-ROUNDS shop, and a shop on turn 0 is the pre-match armoury,
+      // which `startNextRound` opens in place without re-seating anything.
+      let state: GameState = openedGame(
         { seed: `round2-${seed}`, totalRounds: 3, width: WIDTH, height: HEIGHT },
         players(4),
       );

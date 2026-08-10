@@ -11,11 +11,11 @@ import { describe, expect, it } from 'vitest';
 import {
   BURIAL,
   burialDamage,
-  createGame,
   DEFAULT_WORLD,
   FALL,
   fallDamage,
   fire,
+  predictShot,
   settleTanks,
   type GameEvent,
   type GameState,
@@ -25,6 +25,7 @@ import {
 import { emptyTerrain, surfaceAt } from '../src/terrain.ts';
 import { simulateFlight } from '../src/physics.ts';
 import { requireWeapon } from '../src/weapons.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -35,7 +36,7 @@ const players = (count: number): PlayerSeed[] =>
 
 /** A match on dead-flat ground with no wind — every coordinate here is chosen. */
 function flatGame(count: number, seed = 'flat'): GameState {
-  const base = createGame({ seed, totalRounds: 3, width: WIDTH, height: HEIGHT }, players(count));
+  const base = openedGame({ seed, totalRounds: 3, width: WIDTH, height: HEIGHT }, players(count));
   const terrain = emptyTerrain(WIDTH, HEIGHT);
   terrain.surface.fill(GROUND);
   return {
@@ -215,6 +216,97 @@ describe('settling a tank the ground moved under', () => {
  * through the settle step. Each test asserts that `damage === 0` rather than
  * trusting the arsenal to stay that way.
  */
+/**
+ * A shell that hits a hull.
+ *
+ * This is the whole "a direct hit should hurt" claim, driven through `fire()`
+ * end to end — the aim is solved against the real physics, the shot is resolved
+ * by the real turn machine, and the damage is read off the real events.
+ *
+ * It is here rather than in `balance.test.ts` because it is the one place the
+ * two halves of the geometry meet: `physics.ts` decides where a shell STOPS
+ * against a tank's hit circle, and `detonation.ts` decides how far that point
+ * is from the tank. Those are two constants in two files (`tankRadius` and
+ * `TANK_HULL_RADIUS`) and nothing but a real shot can tell you they agree.
+ */
+describe('a shell caught on the hull', () => {
+  /** Aim tank 0 at tank 1 until a shot really lands on the other hull. */
+  function hullShot(weaponId: string): { events: GameEvent[]; victimIndex: number } {
+    const weapon = requireWeapon(weaponId);
+    const base = flatGame(2, `hull-${weaponId}`);
+    const armed: GameState = {
+      ...base,
+      activeTank: 0,
+      tanks: base.tanks.map((tank, index) => ({
+        ...tank,
+        inventory: index === 0 ? { [weapon.id]: 9 } : {},
+      })),
+    };
+
+    for (let angleDeg = 10; angleDeg <= 80; angleDeg += 1) {
+      for (let power = 20; power <= 100; power += 1) {
+        const flight = predictShot(armed, 0, angleDeg, power);
+        if (flight.impact.kind !== 'tank' || flight.impact.tankIndex !== 1) continue;
+        const result = fire(armed, (armed.tanks[0] as Tank).id, {
+          turnNumber: armed.turnNumber,
+          angleDeg,
+          power,
+          weapon: weapon.id,
+        });
+        return { events: result.events, victimIndex: 1 };
+      }
+    }
+    throw new Error(`no shot with ${weaponId} landed on the other tank`);
+  }
+
+  it("does the weapon's full damage, not a near miss's", () => {
+    /*
+     * The defect this pins: `physics.ts` stops a shell the moment it touches
+     * the target's hit circle, so the impact point of a direct hit sits a full
+     * hull radius from the point damage is measured against. Measuring the
+     * blast from the hull's CENTRE therefore charged every direct hit a near
+     * miss's falloff — on a Baby Missile (radius 18) exactly the 50% mark, so
+     * the free weapon did 13 a hit and needed eight hits for a kill.
+     *
+     * Asserted against the weapon's own `damage` cell, which is the promise
+     * the table makes, so it fails in BOTH directions: measure from the centre
+     * again and it halves, and let the hull credit grow past a hull and the
+     * rounding stops matching.
+     */
+    for (const weaponId of ['baby_missile', 'missile', 'baby_nuke']) {
+      const weapon = requireWeapon(weaponId);
+      const { events, victimIndex } = hullShot(weaponId);
+      // The FIRST damage event, which is the blast itself. A crater under a
+      // tank drops it, and `settleTanks` charges for the fall in a second event
+      // — real, deserved, and not what this test is measuring.
+      const blastDamage = events.find(
+        (event): event is Extract<GameEvent, { type: 'damage' }> =>
+          event.type === 'damage' && event.tankIndex === victimIndex,
+      )?.amount;
+      expect(blastDamage, `${weaponId} on the hull`).toBe(
+        Math.min(Math.round(weapon.damage), DEFAULT_WORLD.maxHealth),
+      );
+      // …and the fall is on top, never instead.
+      expect(damageOf(events, victimIndex)).toBeGreaterThanOrEqual(blastDamage as number);
+    }
+  });
+
+  it('takes a full-health tank most of the way down with one Missile', () => {
+    // The same measurement said as a player would say it. A Missile is the
+    // cheap workhorse and it has to feel like one.
+    const { events, victimIndex } = hullShot('missile');
+    const healthAfter = events
+      .filter(
+        (event): event is Extract<GameEvent, { type: 'damage' }> =>
+          event.type === 'damage' && event.tankIndex === victimIndex,
+      )
+      .map((event) => event.healthAfter)
+      .pop();
+    expect(healthAfter).toBeDefined();
+    expect(healthAfter as number).toBeLessThan(DEFAULT_WORLD.maxHealth / 2);
+  });
+});
+
 describe('moving the ground out from under someone, through the real fire path', () => {
   /**
    * Fire `weaponId` from x = 100 at whatever it hits, with the victim parked

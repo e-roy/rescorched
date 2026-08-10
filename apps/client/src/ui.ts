@@ -98,6 +98,17 @@ export class Ui {
   private screen: Screen = 'title';
   private snapshot: GameSnapshot | null = null;
   private you = '';
+  /**
+   * Which seats are computer players, by player id.
+   *
+   * The lobby frame is the only place the wire says so — `TankSnapshot`
+   * deliberately carries no `bot` field, because the sim's snapshot and the
+   * protocol's are pinned structurally identical and a personality is
+   * persistence rather than wire state (see `LobbyPlayer.bot` in the protocol).
+   * So the map is kept from the last lobby frame and read during the match, and
+   * that is why the HUD can badge a tank the snapshot says nothing about.
+   */
+  private botSeats: ReadonlyMap<string, string> = new Map();
   private lastResult: {
     winnerId: string | null;
     roundsPlayed: number;
@@ -125,6 +136,10 @@ export class Ui {
       onReady: (ready) => activeNet()?.send({ t: 'ready', ready }),
       onLeave: () => this.callbacks.onLeave(),
       onCopied: (message) => this.showToast(message, 'info'),
+      // Sent the same way `ready` is: a request, which the room is free to
+      // refuse. Nothing here decides whether there is a seat for it.
+      onAddBot: (personality) => activeNet()?.send({ t: 'addBot', personality }),
+      onRemoveBot: (playerId) => activeNet()?.send({ t: 'removeBot', playerId }),
     });
 
     this.armoury = new ArmouryView({
@@ -310,7 +325,16 @@ export class Ui {
 
     const isBattle = screen === 'battle';
     this.overlay.hidden = isBattle;
-    this.hudRoot.hidden = !(isBattle || screen === 'shop');
+    /*
+     * The HUD belongs to the battlefield and to nothing else.
+     *
+     * It used to be left up for the armoury as well, which was invisible either
+     * way: the overlay covered the whole window and painted over it. Now that
+     * the overlay is inset into the stage, "left up" would mean a strip of
+     * aiming dials and a dead FIRE button above a shopping screen — so this
+     * says what it always meant.
+     */
+    this.hudRoot.hidden = !isBattle;
 
     /*
      * Chat follows the room, not the battlefield.
@@ -343,6 +367,24 @@ export class Ui {
 
   showLobbyError(message: string): void {
     this.lobby.showError(message);
+  }
+
+  /**
+   * Offer a server refusal to whichever screen asked for it, and say whether it
+   * was taken.
+   *
+   * The lobby's computer-player controls are the only thing that claims one
+   * today, and the reason they must is `room_full`. That code means two
+   * different things: "this room has no seat for you", which belongs on the
+   * title screen because there is nothing to stay for, and "this room has no
+   * seat for another computer player", which must leave the host exactly where
+   * they are. The room cannot tell them apart — it answered the frame it was
+   * sent — but the panel that sent the frame can.
+   *
+   * Anything not claimed here is the caller's to report, unchanged.
+   */
+  claimError(message: string): boolean {
+    return this.screen === 'lobby' && this.lobby.consumeError(message);
   }
 
   showToast(message: string, tone: 'error' | 'info' = 'error'): void {
@@ -390,7 +432,7 @@ export class Ui {
       this.weaponAdopted = true;
     }
 
-    const effective = this.hud.render(snapshot, you, canFire, this.weapon);
+    const effective = this.hud.render(snapshot, you, canFire, this.weapon, this.botSeats);
     if (effective !== this.weapon) {
       // We ran dry mid-match and the rail fell back to the free weapon. Tell
       // the server, or it would keep believing an empty gun is loaded.
@@ -499,9 +541,15 @@ export class Ui {
         }
         return;
 
-      case 'lobby':
+      case 'lobby': {
         this.lastResult = null;
+        const seats = new Map<string, string>();
+        for (const player of message.players) {
+          if (player.bot != null) seats.set(player.id, player.bot);
+        }
+        this.botSeats = seats;
         return;
+      }
 
       case 'turnTimer':
         this.setTimer({

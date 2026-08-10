@@ -51,6 +51,18 @@ const MAX_DECALS = 220;
  */
 const MERGE_FRACTION = 0.45;
 
+/**
+ * How far the scorch reaches, as a fraction of the blast that made it.
+ *
+ * `SCORCH_RIM` is the outer edge of the burn and `SCORCH_FLOOR` the dark bowl
+ * inside it. Both are at or inside 1, which is the point: `applyCrater` removes
+ * ground out to exactly the blast radius, so anything past 1 is paint on ground
+ * that is still there — and a wide band of half-dark paint around a hole is
+ * read as a soft glow no matter how hard its edge is. See `paintTerrain`.
+ */
+const SCORCH_RIM = 1;
+const SCORCH_FLOOR = 0.78;
+
 /** Add a scar, merging it into a neighbouring one where they are the same hole. */
 export function addDecal(decals: ScorchDecal[], next: ScorchDecal): void {
   for (let i = 0; i < decals.length; i += 1) {
@@ -106,14 +118,27 @@ export function paintTerrain(
     for (const decal of decals) {
       const y = surfaceAt(surface, decal.x, height);
       if (decal.burnt) {
-        // Scaled tightly to the blast. At 1.45x a Nuke's scar reached 130 px
-        // and stopped reading as a crater — it read as a shadow lying over the
-        // hill, because the darkening had wandered far past the ground the
-        // heightmap actually lost.
+        /*
+         * The burn stops where the hole does.
+         *
+         * `reference/README.md` is explicit that the original has "hard edges,
+         * no soft glow, no blur", and these two discs are the only thing on
+         * screen that can break it. There is no gradient here and never was —
+         * what read as an airbrushed bruise was geometry: an outer disc at
+         * 1.25x the blast laid a wide band of darkening over shoulders the
+         * heightmap had not touched, and the eye reads a big soft-coloured
+         * surround as a halo whatever its edge is doing.
+         *
+         * At 1.0 the outer disc is a RIM — a couple of pixels of burn around
+         * the lip — and everything darker than the ground is inside the hole
+         * the crater actually made. It was 1.45 before it was 1.25, and both
+         * were moves in this direction; this is the end of that road, because
+         * the blast radius is exactly the ground `applyCrater` removes.
+         */
         context.fillStyle = toCss(palette.scorchOuter);
-        fillDisc(context, decal.x, y, decal.radius * 1.25);
+        fillDisc(context, decal.x, y, decal.radius * SCORCH_RIM);
         context.fillStyle = toCss(palette.scorchInner);
-        fillDisc(context, decal.x, y, decal.radius * 0.85);
+        fillDisc(context, decal.x, y, decal.radius * SCORCH_FLOOR);
       } else {
         // Fresh earth: a lighter patch, so a Dirt Clod is visibly *added*
         // ground rather than a change in the silhouette nobody notices.
@@ -149,19 +174,22 @@ export function paintTerrain(
       );
       continue;
     }
+    // Kept inside the rim for the same reason the discs are: a burnt crust line
+    // running a third of a radius out past the hole is a smudge on ground that
+    // was never removed.
     strokeSurface(
       context,
       surface,
-      decal.x - decal.radius * 1.35,
-      decal.x + decal.radius * 1.35,
+      decal.x - decal.radius * SCORCH_RIM,
+      decal.x + decal.radius * SCORCH_RIM,
       palette.scorchCrust,
       2,
     );
     strokeSurface(
       context,
       surface,
-      decal.x - decal.radius * 0.9,
-      decal.x + decal.radius * 0.9,
+      decal.x - decal.radius * SCORCH_FLOOR,
+      decal.x + decal.radius * SCORCH_FLOOR,
       palette.scorchInner,
       3,
     );
@@ -244,7 +272,10 @@ function paintDebris(
   palette: RoundPalette,
   seed: number,
 ): void {
-  const count = Math.round(Math.min(34, 8 + decal.radius * 0.5));
+  // Fewer, and thrown less far, than they were. Ejecta scattered out to 2.8
+  // radii is the other half of what made a fresh crater read as an airbrushed
+  // bruise: a wide stipple of dark specks over untouched ground shades it.
+  const count = Math.round(Math.min(24, 6 + decal.radius * 0.34));
   const rng = new VisualRng(mixSeed(seed, Math.round(decal.x), Math.round(decal.radius)));
 
   // Two tones, alternating.
@@ -259,7 +290,7 @@ function paintDebris(
 
   for (let i = 0; i < count; i += 1) {
     const side = rng.chance(0.5) ? 1 : -1;
-    const x = Math.round(decal.x + side * rng.range(decal.radius * 0.9, decal.radius * 2.8));
+    const x = Math.round(decal.x + side * rng.range(decal.radius * 0.95, decal.radius * 1.8));
     if (x < 0 || x >= surface.length) continue;
     const y = Math.round(surfaceAt(surface, x, height) + rng.range(0, 7));
     const size = rng.int(1, 3);

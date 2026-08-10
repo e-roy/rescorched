@@ -42,6 +42,7 @@ import { fromPersisted, toPersisted, toSnapshot } from '../src/serialize.ts';
 import { restoreRng } from '../src/rng.ts';
 import { emptyTerrain, type Terrain } from '../src/terrain.ts';
 import { getWeapon, WEAPONS } from '../src/weapons.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -53,7 +54,7 @@ const seats = (count: number, bots: Partial<Record<number, BotPersonality>> = {}
   });
 
 function duel(seed: string, personality: BotPersonality): GameState {
-  return createGame({ seed, width: WIDTH, height: HEIGHT }, [
+  return openedGame({ seed, width: WIDTH, height: HEIGHT }, [
     { id: 'p0', name: 'P0', bot: personality },
     { id: 'p1', name: 'P1' },
   ]);
@@ -149,7 +150,7 @@ describe('the decision is a pure function of the state', () => {
    */
   it('is not simply constant across seats and turns', () => {
     for (const personality of BOT_PERSONALITIES) {
-      const base = createGame({ seed: 'variety', width: WIDTH, height: HEIGHT }, seats(4));
+      const base = openedGame({ seed: 'variety', width: WIDTH, height: HEIGHT }, seats(4));
       const decisions = new Set<string>();
       for (let seat = 0; seat < 4; seat += 1) {
         for (const turnNumber of [1, 2, 3, 4, 5]) {
@@ -252,7 +253,7 @@ function generatedGame(seed: number, count: number): GameState {
   const key = `${seed}:${count}`;
   let game = GENERATED.get(key);
   if (game === undefined) {
-    game = createGame({ seed: `battered-${seed}`, width: WIDTH, height: HEIGHT }, seats(count));
+    game = openedGame({ seed: `battered-${seed}`, width: WIDTH, height: HEIGHT }, seats(count));
     GENERATED.set(key, game);
   }
   return game;
@@ -382,7 +383,7 @@ interface Scenario {
 }
 
 function scenarios(): Scenario[] {
-  const base = createGame({ seed: 'hostile', width: WIDTH, height: HEIGHT }, seats(4));
+  const base = openedGame({ seed: 'hostile', width: WIDTH, height: HEIGHT }, seats(4));
   const put = (over: Partial<GameState>): GameState => ({ ...base, ...over });
   const tanksAt = (positions: { x: number; y: number; alive?: boolean }[]): Tank[] =>
     positions.map((p, index) => ({
@@ -492,7 +493,7 @@ function scenarios(): Scenario[] {
     },
     {
       name: 'sixteen tanks, everybody alive',
-      state: createGame({ seed: 'crowd', width: WIDTH, height: HEIGHT }, seats(16)),
+      state: openedGame({ seed: 'crowd', width: WIDTH, height: HEIGHT }, seats(16)),
       shooter: 7,
     },
     {

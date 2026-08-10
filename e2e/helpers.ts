@@ -98,11 +98,60 @@ export async function rejoinRoom(session: PlayerSession, roomCode: string): Prom
   await expect(session.page.getByTestId('overlay')).toBeHidden({ timeout: 20_000 });
 }
 
-export async function startMatch(host: PlayerSession): Promise<void> {
+/**
+ * Walk into a running room and wait for the authoritative state, whatever the
+ * match happens to be doing.
+ *
+ * Unlike `rejoinRoom` this makes no claim about which SCREEN comes up. A match
+ * that has reached the end of a round is sitting in the shop, and a joiner is
+ * quite correctly shown the shop rather than the battlefield — so a test that
+ * only needs "this client and the server agree about the board" must not also
+ * demand the battlefield.
+ */
+export async function watchRoom(
+  session: PlayerSession,
+  roomCode: string,
+): Promise<GameSnapshotLike> {
+  await session.page.getByTestId('input-room').fill(roomCode);
+  await session.page.getByTestId('btn-join').click();
+  return waitForSnapshot(session.page);
+}
+
+/**
+ * Press Start and take everybody out of the opening armoury.
+ *
+ * A match no longer drops straight onto the battlefield: it opens in the
+ * armoury, where each player spends their starting money before the first shell
+ * flies. Every human seat has to press Ready before round one begins, and the
+ * LAST one to press it is what opens the round — so this takes every session in
+ * the room, not just the host.
+ *
+ * Computer players shop and leave on their own, which is why they are not
+ * listed here and why a room of one person plus bots still only needs the one
+ * Ready.
+ */
+export async function startMatch(host: PlayerSession, ...others: PlayerSession[]): Promise<void> {
   const start = host.page.getByTestId('btn-start');
   await expect(start).toBeEnabled();
   await start.click();
-  await expect(host.page.getByTestId('hud')).toBeVisible();
+
+  const everyone = [host, ...others];
+  for (const session of everyone) {
+    await expect(session.page.getByTestId('panel-shop')).toBeVisible({ timeout: 20_000 });
+  }
+  for (const session of everyone) {
+    await leaveArmoury(session);
+  }
+  for (const session of everyone) {
+    await expect(session.page.getByTestId('hud')).toBeVisible({ timeout: 20_000 });
+  }
+}
+
+/** Press Ready in the shop. Used at the armoury and between rounds alike. */
+export async function leaveArmoury(session: PlayerSession): Promise<void> {
+  const done = session.page.getByTestId('btn-shop-done');
+  await expect(done).toBeVisible({ timeout: 20_000 });
+  await done.click({ timeout: 10_000 });
 }
 
 /** Read the last authoritative snapshot this client received. */
@@ -313,7 +362,7 @@ export function predictShot(
   angleDeg: number,
   power: number,
   weaponId: string,
-): { kind: string; x: number; y: number; surface: number[] } {
+): { kind: string; x: number; y: number; pathLength: number; apexY: number; surface: number[] } {
   const shooter = snapshot.tanks[shooterIndex];
   if (shooter === undefined) throw new Error(`No tank at index ${shooterIndex}`);
 
@@ -334,10 +383,30 @@ export function predictShot(
     applyCrater(terrain, flight.impact.x, flight.impact.y, requireWeapon(weaponId).radius);
   }
 
+  /*
+   * How far the shell travels along its arc, which is how long it is IN THE AIR:
+   * the scene paces a flight by exactly this quantity. The screenshot harness
+   * needs it to pick a shot that is still up when the shutter opens — see
+   * `screenshot.spec.ts`.
+   */
+  let pathLength = 0;
+  /** Highest point the shell reaches. Negative means it left the top of the world. */
+  let apexY = Number.POSITIVE_INFINITY;
+  for (let point = 0; point < flight.length; point += 1) {
+    apexY = Math.min(apexY, flight.points[point * 2 + 1] as number);
+    if (point === 0) continue;
+    const dx = (flight.points[point * 2] as number) - (flight.points[(point - 1) * 2] as number);
+    const dy =
+      (flight.points[point * 2 + 1] as number) - (flight.points[(point - 1) * 2 + 1] as number);
+    pathLength += Math.sqrt(dx * dx + dy * dy);
+  }
+
   return {
     kind: flight.impact.kind,
     x: flight.impact.x,
     y: flight.impact.y,
+    pathLength,
+    apexY,
     surface: Array.from(terrain.surface),
   };
 }
@@ -406,6 +475,74 @@ export async function cheat(
     },
     { roomCode, sessionId, frame, version: PROTOCOL_VERSION },
   );
+}
+
+export interface Placement {
+  /** Is the whole control inside the window, or is part of it below the fold? */
+  readonly onScreen: boolean;
+  readonly rect: { top: number; bottom: number; left: number; right: number };
+  readonly viewport: { width: number; height: number };
+  /**
+   * What `document.elementFromPoint` reports at the top, middle and bottom of
+   * the control: `self` when the control (or its own text) is what a click
+   * would land on, otherwise a description of whatever is covering it.
+   */
+  readonly hits: string[];
+}
+
+/**
+ * Where a control actually is, and what a click on it would actually hit.
+ *
+ * Playwright's own `toBeVisible` means "in the document, with a non-zero box" —
+ * it is satisfied by an element scrolled a hundred pixels past the bottom of the
+ * window and by one sitting under an opaque bar. Both of those shipped. Its
+ * `click()` hides them too, because it scrolls the element into view first,
+ * which a person clicking does not.
+ *
+ * So this asks the page the two questions that actually matter, the same way a
+ * reviewer with devtools would.
+ */
+export async function placementOf(page: Page, testId: string): Promise<Placement> {
+  return page.evaluate((id) => {
+    const element = document.querySelector(`[data-testid="${id}"]`);
+    if (element === null) throw new Error(`No element with data-testid="${id}"`);
+    const rect = element.getBoundingClientRect();
+
+    const describe = (node: Element | null): string => {
+      if (node === null) return 'nothing';
+      if (node === element || element.contains(node)) return 'self';
+      const owner = node.closest('[data-testid]');
+      return owner === null
+        ? `${node.tagName.toLowerCase()}.${node.className}`
+        : `${owner.getAttribute('data-testid')}`;
+    };
+
+    // Middle of the control's width, at its top edge, centre and bottom edge —
+    // avoiding the corners, which a border radius legitimately rounds away.
+    const x = rect.left + rect.width / 2;
+    const ys = [rect.top + 2, rect.top + rect.height / 2, rect.bottom - 2];
+
+    return {
+      onScreen:
+        rect.top >= 0 &&
+        rect.left >= 0 &&
+        rect.bottom <= window.innerHeight &&
+        rect.right <= window.innerWidth,
+      rect: { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right },
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      hits: ys.map((y) => describe(document.elementFromPoint(x, y))),
+    };
+  }, testId);
+}
+
+/** `placementOf` as an assertion: on screen, and nothing on top of it. */
+export async function expectClickable(page: Page, testId: string): Promise<void> {
+  const placement = await placementOf(page, testId);
+  const report = `${testId} at y=${placement.rect.top.toFixed(0)}..${placement.rect.bottom.toFixed(
+    0,
+  )} in a ${placement.viewport.height}px window; hit test ${placement.hits.join(', ')}`;
+  expect(placement.onScreen, `${report} — part of it is off screen`).toBe(true);
+  expect(placement.hits, `${report} — something is covering it`).toEqual(['self', 'self', 'self']);
 }
 
 /** A stable fingerprint of the terrain, for "both players see the same crater". */

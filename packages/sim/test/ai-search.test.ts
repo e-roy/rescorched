@@ -51,10 +51,11 @@ import {
   type BotPersonality,
   type SearchPlan,
 } from '../src/ai.ts';
-import { createGame, DEFAULT_WORLD, predictShot, type GameState, type Tank } from '../src/game.ts';
+import { DEFAULT_WORLD, predictShot, type GameState, type Tank } from '../src/game.ts';
 import { hypot2 } from '../src/math.ts';
 import { TERRAIN_STYLES } from '../src/terrain.ts';
 import { requireWeapon, WEAPONS } from '../src/weapons.ts';
+import { openedGame } from './opening.ts';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -63,7 +64,7 @@ const DUELS: GameState[] = [];
 for (const style of TERRAIN_STYLES) {
   for (let seed = 0; seed < 20; seed += 1) {
     DUELS.push(
-      createGame(
+      openedGame(
         { seed: `spread-${style}-${seed}`, terrainStyle: style, width: WIDTH, height: HEIGHT },
         [
           { id: 'a', name: 'A' },
@@ -84,7 +85,7 @@ for (const style of TERRAIN_STYLES) {
  * cannot be shown to be connected to anything.
  */
 const CROWDS: GameState[] = [0, 1, 2].map((seed) => {
-  const base = createGame(
+  const base = openedGame(
     { seed: `crowd-${seed}`, width: WIDTH, height: HEIGHT },
     Array.from({ length: 16 }, (_, index) => ({ id: `c${index}`, name: `C${index}` })),
   );
@@ -372,7 +373,7 @@ describe('the elevation ladder covers the band it is given', () => {
 const POINT_BLANK: GameState[] = [];
 for (const style of TERRAIN_STYLES) {
   for (let seed = 0; seed < 12; seed += 1) {
-    const base = createGame(
+    const base = openedGame(
       { seed: `pb-${style}-${seed}`, terrainStyle: style, width: WIDTH, height: HEIGHT },
       [
         { id: 'a', name: 'A' },

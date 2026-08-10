@@ -10,19 +10,20 @@
  * Why the human here is a raw socket rather than the game's own UI
  * ---------------------------------------------------------------------------
  *
- * The lobby has no "add a computer player" button yet — that is a separate,
- * later piece of client work — so there is no way to drive `addBot` by clicking
- * anything. The frame has to be sent by hand.
+ * The lobby now HAS the button, and `solo-bot.spec.ts` is the test that clicks
+ * it: create a room, pick a personality, add it, start, play a turn, watch the
+ * machine play one back. That is the product claim, and it belongs there.
  *
- * That is not a shortcut around the product: it is the same thing
- * `helpers.cheat` does, and every frame below goes through the real protocol
+ * This file stayed a raw socket on purpose, because it is making a different
+ * claim. It needs the exact frames in order — every `state` before every
+ * `events` — so a bot's shot can be re-flown through `@scorched/sim` and
+ * compared against the server's heightmap column for column, which is the
+ * determinism argument and cannot be made by reading the DOM. The driver is the
+ * same thing `helpers.cheat` does: every frame goes through the real protocol
  * parser on the way in and the real `parseServerMessage` on the way back, so
  * nothing here is trusted that a client would not be. And the REAL client is
  * still in the test: it joins the finished bot match as a spectator, renders
  * it, and is asserted to agree with the server column for column.
- *
- * When the lobby grows the button, the driver below should be deleted and this
- * file rewritten to click it.
  */
 
 import { expect, test, type Page } from '@playwright/test';
@@ -32,8 +33,7 @@ import {
   consoleErrors,
   openPlayer,
   predictShot,
-  readSnapshot,
-  rejoinRoom,
+  watchRoom,
   terrainFingerprint,
 } from './helpers.ts';
 
@@ -126,6 +126,16 @@ async function playSoloVersusBot(
         activeTank: number;
         tanks: { id: string }[];
       };
+
+      // A match opens in the ARMOURY, not on the battlefield. The computer
+      // player shopped and left on the way through `start`; this driver stands
+      // in for the human, so it presses Ready and that is what opens round one.
+      if (snapshot.phase === 'shopping') {
+        const cursor = frames.length;
+        send({ t: 'shopDone' });
+        const opened = await waitFor((f) => f['t'] === 'events', cursor, 'round one to open');
+        snapshot = opened['snapshot'] as typeof snapshot;
+      }
 
       // Play until the human has fired `shots` times and the turn is back with
       // the human — so nothing is left pending when the socket closes.
@@ -267,8 +277,12 @@ test.describe('one human, one computer player', () => {
      * raw driver cannot claim on its own.
      */
     const watcher = await openPlayer(browser, 'Watcher');
-    await rejoinRoom(watcher, roomCode);
-    const seen = await readSnapshot(watcher.page);
+    // `watchRoom`, not `rejoinRoom`: with a hit now worth several times what it
+    // used to be, the driver's two shots plus the Annihilator's replies can
+    // finish the round, and a room in the shop shows a joiner the shop. What
+    // this test is about is whether the client agrees with the server about the
+    // board, which is true on either screen.
+    const seen = await watchRoom(watcher, roomCode);
 
     expect(seen.turnNumber).toBe(last.turnNumber);
     expect(seen.terrain.surface).toEqual(last.terrain.surface);

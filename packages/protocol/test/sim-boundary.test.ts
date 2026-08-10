@@ -153,7 +153,11 @@ const PLAYERS = [
  * full-width board and reaches none of them.
  */
 function playMatch(seed: number): { events: GameEvent[]; states: GameState[] } {
-  let state = createGame({ seed, totalRounds: 2, width: 400, height: 300 }, PLAYERS);
+  // Past the opening armoury — see `startNextRound`; a fresh match is in
+  // `shopping` and cannot resolve a shot.
+  let state = startNextRound(
+    createGame({ seed, totalRounds: 2, width: 400, height: 300 }, PLAYERS),
+  ).state;
   const events: GameEvent[] = [];
   const states: GameState[] = [state];
 
@@ -336,7 +340,9 @@ describe('the sim fits through the wire', () => {
   });
 
   it('carries a turn built the way the room builds one, with no casts anywhere', () => {
-    const state = createGame({ seed: 5, totalRounds: 2, width: 400, height: 300 }, PLAYERS);
+    const state = startNextRound(
+      createGame({ seed: 5, totalRounds: 2, width: 400, height: 300 }, PLAYERS),
+    ).state;
     const shooter = state.tanks[state.activeTank];
     expect(shooter).toBeDefined();
     if (shooter === undefined) return;
