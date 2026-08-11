@@ -85,6 +85,34 @@ if (workspaceYaml === null) {
     }
   }
 
+  /*
+   * Overrides raise a transitive dependency past a security advisory, and they
+   * are the sanctioned answer to `pnpm audit` here. They are also the obvious
+   * place to smuggle a floating range back in: an override of `^7.29.0` would
+   * quietly restore "whatever is newest" resolution for a package nobody
+   * declared and nobody reviews, which is precisely what the exact pins and the
+   * quarantine exist to stop.
+   *
+   * So the right-hand side must be an exact version, every time.
+   */
+  const overrideBlock = /^overrides:\s*$((?:\n[ \t]+.+)*)/m.exec(withoutComments);
+  if (overrideBlock !== null) {
+    const entries = [
+      ...overrideBlock[1].matchAll(/^\s+(?:'([^']+)'|"([^"]+)"|([^\s:]+))\s*:\s*(\S+)/gm),
+    ];
+    for (const entry of entries) {
+      const target = entry[1] ?? entry[2] ?? entry[3];
+      const version = entry[4].replace(/^['"]|['"]$/g, '');
+      if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+        fail(
+          `pnpm-workspace.yaml overrides \`${target}\` to "${version}", which is not an exact ` +
+            'version. An override is still an installed dependency — pin it exactly.',
+        );
+      }
+    }
+    notes.push(`overrides, all exactly pinned: ${entries.length}`);
+  }
+
   // Lifecycle-script allowlist stays small and reviewed. pnpm expresses this
   // two ways — the `onlyBuiltDependencies` list and the `allowBuilds` map —
   // and both are checked, because either one can widen what gets to run.

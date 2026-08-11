@@ -47,3 +47,29 @@ onlyBuiltDependencies:
 allowBuilds:
   esbuild: true
   workerd: true
+
+# ---------------------------------------------------------------------------
+# Transitive versions raised to clear a security advisory.
+#
+# These are the ONLY sanctioned way to answer `pnpm audit` in this repo. The
+# alternative — an ignore list, or auditing `--prod` only — would make the
+# warning go away without making the machine safer, and both packages below run
+# on developer laptops and CI runners, which is exactly where a compromised
+# build dependency does its damage. That the deployed Worker does not contain
+# them is not the point.
+#
+# Each entry names the vulnerable RANGE on the left, so only the versions that
+# are actually affected get moved and nothing else in the tree is disturbed.
+# Each right-hand side is an exact pin that is already past the 7-day
+# quarantine — the guard above is not bent to accommodate a fix.
+#
+# Remove an entry once every dependency that pulls the package has moved past
+# it on its own; `pnpm why <name>` says whether that has happened.
+overrides:
+  # GHSA-2v37-7h3g-55p8 — custom generators can loop forever at size zero.
+  # Reaches us through vite -> postcss -> nanoid, i.e. the client build.
+  'nanoid@<3.3.17': 3.3.17
+  # GHSA-4cwx-7wf7-3272 — cross-user information disclosure and a parse-time
+  # crash via degenerate private cache directives. Reaches us through
+  # miniflare, i.e. `wrangler dev` and the in-workerd test runner.
+  'undici@<7.29.0': 7.29.0
