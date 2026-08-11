@@ -93,12 +93,38 @@ are deliberately strict:
 Fork it, then:
 
 ```bash
-pnpm build
-pnpm --filter @scorched/server exec wrangler deploy
+pnpm --filter @scorched/server exec wrangler login
+pnpm deploy
 ```
 
-You need a Cloudflare Workers Paid plan ($5/month) for Durable Objects. Hibernation
-means a turn-based game consumes almost no duration between moves.
+`pnpm deploy` builds the client first — the Worker serves `apps/client/dist` as
+static assets, so deploying without building ships a Worker with no game
+attached — then creates the Worker and registers the `GameRoom` Durable Object.
+
+**This runs on the Workers Free plan.** SQLite-backed Durable Objects have been
+free-tier since April 2025, and `new_sqlite_classes` in `wrangler.jsonc` is that
+kind. The free allowances that matter here are 100,000 requests a day, 10 ms of
+CPU per invocation, and 100,000 Durable Object row writes a day. For scale: the
+most expensive thing the server does on a turn is a computer player choosing its
+shot, measured at 2.2 ms worst case against that 10 ms ceiling — see
+`packages/sim/test/ai-performance.test.ts`, which asserts it.
+
+Key-value-backed Durable Objects are still Paid-only, but this game does not use
+them. Hibernation means a turn-based room consumes almost no duration between
+moves either way.
+
+### Deploying from CI
+
+`.github/workflows/ci.yml` deploys on every push to `main`, but only after lint,
+typecheck, the unit and in-workerd suites, `pnpm audit` and the full Playwright
+run have all passed. Add a `CLOUDFLARE_API_TOKEN` repository secret (the "Edit
+Cloudflare Workers" token template covers it) and nothing else is required —
+there is no Cloudflare-side connection to configure, because the flow is one
+way: Actions holds a token and calls Cloudflare.
+
+If you would rather use Cloudflare's own Workers Builds, disable this job first.
+Running both means every push deploys twice, and Workers Builds will not run the
+test suite as a gate.
 
 ## Credits
 

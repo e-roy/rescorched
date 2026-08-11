@@ -117,8 +117,23 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+
+      # Build the client BEFORE deploying: wrangler.jsonc serves
+      # `../client/dist` as static assets, so deploying without this ships a
+      # Worker with no game attached to it.
       - run: pnpm build
-      - uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          workingDirectory: apps/server
+
+      # Deployed with the workspace's own pinned wrangler rather than with
+      # cloudflare/wrangler-action. The action installs a wrangler of its own
+      # choosing, which would sidestep the exact-version pinning and the 7-day
+      # quarantine that the rest of this repo is strict about — and it is one
+      # more thing that can drift. `pnpm exec` uses the version in the lockfile,
+      # which is the same one every test ran against.
+      - name: Deploy to Cloudflare
+        run: pnpm --filter @scorched/server exec wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Only needed if the token can see more than one account. Harmless
+          # when unset, and a clear error rather than a wrong guess when it is
+          # needed and missing.
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
