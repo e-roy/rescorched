@@ -11,6 +11,7 @@ import { expect } from '@playwright/test';
 import { PROTOCOL_VERSION } from '@scorched/protocol';
 import {
   applyCrater,
+  BABY_MISSILE,
   DEFAULT_WORLD,
   deserializeTerrain,
   requireWeapon,
@@ -345,6 +346,69 @@ export function findLandingShot(
     }
   }
   return fallback;
+}
+
+/**
+ * An angle and power that lands on dirt and cannot hurt anybody.
+ *
+ * `findLandingShot` above prefers terrain but takes no interest in what is
+ * standing next to it, so the shot it returns is free to wound the opponent —
+ * or the shooter, which is where this was first noticed: a solved "landing"
+ * shot regularly came back with the firing tank down 20-odd health. For a test
+ * that only wants a crater that is fine. For a test whose NEXT assertion needs
+ * the round to still be running it is not, because a round ends the moment a
+ * tank dies and a round that has ended has no next turn.
+ *
+ * So this asks for a landing spot no part of the detonation can reach. Two
+ * reaches have to clear, and both are taken from the arsenal rather than
+ * written down here:
+ *
+ *   - `radius + tankRadius` is how far the blast reaches a hull, because
+ *     `damageToTankAt` measures from the hull's skin rather than its centre;
+ *   - one more `radius` for the crater, so the ground under a tank cannot move
+ *     either and nobody can be dropped or buried into taking damage.
+ *
+ * Measured horizontally, which is the stronger test of the two available: the
+ * true distance from the impact to a tank is never smaller than the difference
+ * in their columns.
+ *
+ * Returns the quietest shot it can find, or null if this map has nowhere quiet
+ * enough — which callers should treat as a failure rather than fall back from,
+ * since a fallback is exactly the map luck this exists to remove. Swept over
+ * 600 seats of freshly generated two-player rounds it came back null zero times
+ * and the worst clearance it settled for was 258 px, against a bar of 45.
+ */
+export function findHarmlessShot(
+  snapshot: GameSnapshotLike,
+  shooterIndex: number,
+): { angleDeg: number; power: number } | null {
+  const weapon = requireWeapon(BABY_MISSILE);
+  const needed = weapon.radius * 2 + DEFAULT_WORLD.tankRadius;
+
+  let best: { angleDeg: number; power: number } | null = null;
+  let bestClearance = needed;
+
+  for (let angleDeg = 20; angleDeg <= 160; angleDeg += 5) {
+    for (let power = 40; power <= 95; power += 5) {
+      const predicted = predictShot(snapshot, shooterIndex, angleDeg, power, weapon.id);
+      if (predicted.kind !== 'terrain') continue;
+
+      let clearance = Number.POSITIVE_INFINITY;
+      for (const tank of snapshot.tanks) {
+        if (!tank.alive) continue;
+        const gap = Math.abs(predicted.x - tank.x);
+        if (gap < clearance) clearance = gap;
+      }
+      // Strictly better, so whatever comes back has beaten the bar rather than
+      // merely tied it.
+      if (clearance > bestClearance) {
+        bestClearance = clearance;
+        best = { angleDeg, power };
+      }
+    }
+  }
+
+  return best;
 }
 
 /**

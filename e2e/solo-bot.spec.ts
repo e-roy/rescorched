@@ -32,6 +32,7 @@ import {
   consoleErrors,
   createRoom,
   expectClickable,
+  findHarmlessShot,
   findLandingShot,
   fire,
   openPlayer,
@@ -169,12 +170,18 @@ test.describe('one person, one computer player, no second browser', () => {
 
     /*
      * Solved against the shared sim rather than guessed, for the reason
-     * `helpers.findLandingShot` exists: a hardcoded aim is a map-luck test. A
-     * shot that lands on dirt also keeps the round alive, which is what the next
-     * assertion needs.
+     * `helpers.findHarmlessShot` exists: a hardcoded aim is a map-luck test.
+     *
+     * Harmless rather than merely landing, because the next assertion is that
+     * the computer player takes a turn BACK — and it only gets one if the round
+     * is still running. A shot that lands on dirt next to a tank still hurts
+     * it, so "keeps the round alive" was resting on how many Baby Missiles a
+     * tank can absorb rather than on nobody being hit. It still carves a crater,
+     * which is what the fingerprint below compares.
      */
-    const aim = findLandingShot(mine, seat) ?? { angleDeg: 45, power: 70 };
-    await setAim(page, aim.angleDeg, aim.power);
+    const aim = findHarmlessShot(mine, seat);
+    expect(aim, 'no shot on this map lands clear of every tank').not.toBeNull();
+    await setAim(page, aim!.angleDeg, aim!.power);
     await fire(page);
 
     const afterOurs = await waitForTurnAfter(page, mine.turnNumber);
@@ -191,8 +198,22 @@ test.describe('one person, one computer player, no second browser', () => {
      * it does on a Durable Object alarm — so this is the claim a solo player
      * actually cares about: the game keeps going.
      */
-    const afterTheirs = await waitForTurnAfter(page, afterOurs.turnNumber);
-    expect(afterTheirs.turnNumber).toBeGreaterThan(afterOurs.turnNumber);
+    /*
+     * Anchored on the turn we fired FROM, not on what the previous wait
+     * happened to see.
+     *
+     * `waitForTurnAfter` latches on the first sighting past its argument, and
+     * the two frames here can arrive close together — so a slow read can return
+     * the BOT's turn as `afterOurs`. Chaining off that then waits for a third
+     * turn, which only the human can cause, and the human is this test. That is
+     * a 30-second hang rather than a failure, and it is exactly the shape of the
+     * deadlock that took CI down in the rewind test below.
+     *
+     * Asking for "two past where we started" is immune to which of the two the
+     * earlier read caught.
+     */
+    const afterTheirs = await waitForTurnAfter(page, mine.turnNumber + 1);
+    expect(afterTheirs.turnNumber).toBeGreaterThanOrEqual(mine.turnNumber + 2);
 
     expect(consoleErrors(page), 'client console errors').toEqual([]);
     await solo.context.close();
@@ -604,21 +625,96 @@ test.describe('one person, one computer player, no second browser', () => {
      * animation finishes. A second `events` frame arriving mid-flight restarts
      * playback — but the animation it interrupted still resolves, a beat AFTER
      * the newer frame was handled, and its callback would then re-apply its own
-     * older snapshot on top. The board goes back a turn and stays there, because
-     * the newer playback's own callback is now the one that looks stale.
+     * older snapshot on top. The board goes back a turn and stays there for the
+     * length of the newer animation, because the newer playback's own callback
+     * is now the one that looks stale.
      *
      * `main.ts` guards it with an identity check. Left to the wire's own timing
-     * the guard is untestable: the room takes the bot's turn 1.5s after yours,
-     * which is usually just after your explosion has finished, and a
-     * `waitForFunction` on the turn number latches on the first sighting and
-     * never looks again — so it reports the rewind as a pass.
+     * the guard is untestable: the room takes the bot's turn a playback and a
+     * pause after yours, which is usually just after your explosion has
+     * finished. So the timing is made deterministic instead — the socket is
+     * intercepted and the first turn's frame is HELD until the second one
+     * exists, then released 200 ms ahead of it, putting the bot's shot squarely
+     * inside the animation of ours on every run.
      *
-     * So the timing is made deterministic instead. The socket is intercepted and
-     * the first turn's frame is HELD until the second one exists, then released
-     * 200ms ahead of it — putting the bot's shot squarely inside the animation
-     * of ours, every run.
+     * ---------------------------------------------------------------------
+     * Two ways that harness used to hang the page it was testing
+     * ---------------------------------------------------------------------
+     *
+     * Both were reproduced before this rewrite, and both end the same way: a
+     * wait burning its full timeout while the socket is healthy and the server
+     * is idle — on every retry, on CI, and never on a laptop.
+     *
+     *  1. NOTHING RELEASED WHAT WAS HELD except the arrival of a second `events`
+     *     frame. There is no rule that one ever arrives — the room falls silent
+     *     whenever the next move is the human's — so a held frame could sit
+     *     there forever with the page frozen behind it.
+     *
+     *     Demonstrated by arming the old harness on a ROUND-ENDING shot: the
+     *     killing turn's frame was held, no successor ever came (the room went
+     *     quiet waiting for Ready), and the page sat on `turn=4 phase=aiming`
+     *     with the dead tank still drawn alive until the wait timed out.
+     *     Reproduced twice out of two.
+     *
+     *     An earlier draft of this comment credited a different demonstration —
+     *     arming one frame earlier, on the frame that opens round one — and that
+     *     one does NOT hold: two `events` frames do arrive there, and it pairs
+     *     in about 600 ms. The mechanism is real; that particular reproduction
+     *     was not, and a confident sentence nobody re-ran is precisely the
+     *     defect CLAUDE.md warns about.
+     *
+     *     The harness now releases on a DEADLINE as well, so no sequence of
+     *     server frames can strand anything.
+     *
+     *  2. READING THE TWO TURN NUMBERS OFF THE CLIENT was a race in itself.
+     *     `waitForTurnAfter` polls, so it reports whatever the page happens to
+     *     be holding when it next looks — and the two frames are deliberately
+     *     only 200 ms apart. Miss the first and it returns the SECOND turn,
+     *     after which waiting for "one more than that" waits for a turn nobody
+     *     is going to play: the room is waiting for the human, and the human is
+     *     this test. Locally the margin was ~85 ms of the 200; compressing the
+     *     gap to 20 ms reproduced it three times out of three. So the numbers
+     *     now come from the frames themselves, in the harness, and the client is
+     *     only ever asked "have you reached this turn yet" — a question that
+     *     cannot be missed by arriving late.
+     *
+     * What holds the assertion up is that the ROUND cannot end on this
+     * exchange, because a round that ends has no next turn to race against the
+     * first. Both halves of that are arranged rather than hoped for: see the
+     * Moron and the harmless shot below.
      */
+
+    /** How far into the first turn's animation the second turn is delivered. */
     const RELEASE_GAP_MS = 200;
+    /**
+     * Longest the harness will hold a frame waiting for a partner.
+     *
+     * This is a safety net and not a schedule: the second turn lands about a
+     * second after the first, so a run that reaches this has already failed at
+     * something. What it buys is that the failure is a named, bounded one
+     * rather than a frozen page.
+     */
+    const HOLD_LIMIT_MS = 20_000;
+    /** …and how long this test waits for the harness to say anything at all. */
+    const STAGING_LIMIT_MS = 25_000;
+
+    /** The part of an `events` frame this test reasons about. */
+    interface Turn {
+      /** `snapshot.turnNumber` — the board the frame settles on. */
+      readonly turnNumber: number;
+      readonly health: readonly number[];
+    }
+
+    /** What the harness managed to stage, reported once it has stood down. */
+    interface Staged {
+      /**
+       * `paired` is the race this test exists for. The other two are the ways
+       * it could not be produced, and both are reported rather than waited out.
+       */
+      readonly mode: 'paired' | 'expired' | 'silent';
+      readonly first: Turn | null;
+      readonly second: Turn | null;
+    }
 
     const solo = await openPlayer(browser, 'Solo');
     const page = solo.page;
@@ -629,11 +725,17 @@ test.describe('one person, one computer player, no second browser', () => {
      * Rescheduling is armed only for OUR shot.
      *
      * Turn order is drawn from the seed, so the computer player fires first
-     * about half the time — and holding that frame back for a partner that
-     * never arrives (the room is now waiting for the human) deadlocks the test
-     * rather than exercising anything.
+     * about half the time, and holding that frame back would be holding it
+     * against the human's own move — which is not the race under test.
      */
     let armed = false;
+    let first: Turn | null = null;
+    let second: Turn | null = null;
+
+    let publish!: (staged: Staged) => void;
+    const staged = new Promise<Staged>((resolve) => {
+      publish = resolve;
+    });
 
     await page.routeWebSocket(/\/api\/rooms\/[A-Za-z]+\/ws/, (client) => {
       intercepted.push(client.url());
@@ -643,39 +745,90 @@ test.describe('one person, one computer player, no second browser', () => {
 
       let phase: 'before' | 'holding' | 'releasing' | 'after' = 'before';
       let queue: (string | Buffer)[] = [];
+      let limit: ReturnType<typeof setTimeout> | null = null;
+
+      /** The turn a frame carries, or null if the frame is not a turn. */
+      const turnOf = (frame: string | Buffer): Turn | null => {
+        let parsed: {
+          t?: string;
+          snapshot?: { turnNumber?: number; tanks?: { health: number }[] };
+        };
+        try {
+          parsed = JSON.parse(frame.toString()) as typeof parsed;
+        } catch {
+          return null;
+        }
+        const snapshot = parsed.snapshot;
+        if (parsed.t !== 'events' || snapshot === undefined) return null;
+        return {
+          turnNumber: snapshot.turnNumber ?? -1,
+          health: (snapshot.tanks ?? []).map((tank) => tank.health),
+        };
+      };
+
+      /**
+       * Hand everything back, in arrival order, and stop interfering.
+       *
+       * Every path out of the hold comes through here, which is the property
+       * that matters: the page ends up with every frame the server sent it, on
+       * a bounded delay, whatever the server did or did not go on to say.
+       */
+      const standDown = (mode: Staged['mode']): void => {
+        if (limit !== null) {
+          clearTimeout(limit);
+          limit = null;
+        }
+        const pending = queue;
+        queue = [];
+        phase = 'after';
+        for (const frame of pending) {
+          // The page can be gone by the time a deadline fires; an exception out
+          // of a timer would take the whole run with it.
+          try {
+            client.send(frame);
+          } catch {
+            break;
+          }
+        }
+        publish({ mode, first, second });
+      };
 
       server.onMessage((message) => {
-        const isTurn = message.toString().includes('"t":"events"');
+        const turn = turnOf(message);
 
         if (!armed || phase === 'after') {
           client.send(message);
           return;
         }
         if (phase === 'before') {
-          if (!isTurn) {
+          if (turn === null) {
             client.send(message);
             return;
           }
-          phase = 'holding';
+          first = turn;
           queue = [message];
+          phase = 'holding';
+          limit = setTimeout(() => standDown('expired'), HOLD_LIMIT_MS);
           return;
         }
 
         queue.push(message);
-        if (phase === 'releasing' || !isTurn) return;
+        if (phase === 'releasing' || turn === null) return;
 
         // `message` is the SECOND turn. Everything before it goes now; it and
-        // anything after it goes a beat later, inside the first animation.
-        const second = queue.length - 1;
-        const early = queue.slice(0, second);
-        queue = queue.slice(second);
+        // anything that arrives during the gap go a beat later, inside the
+        // first animation.
+        second = turn;
+        if (limit !== null) {
+          clearTimeout(limit);
+          limit = null;
+        }
+        const boundary = queue.length - 1;
+        const early = queue.slice(0, boundary);
+        queue = queue.slice(boundary);
         phase = 'releasing';
         for (const frame of early) client.send(frame);
-        setTimeout(() => {
-          for (const frame of queue) client.send(frame);
-          queue = [];
-          phase = 'after';
-        }, RELEASE_GAP_MS);
+        setTimeout(() => standDown('paired'), RELEASE_GAP_MS);
       });
     });
 
@@ -691,8 +844,16 @@ test.describe('one person, one computer player, no second browser', () => {
     await page.getByTestId('input-name').fill(solo.name);
 
     await createRoom(solo);
-    // The Moron aims at nothing in particular, which is what this test wants:
-    // it is very unlikely to end the round on its first shot.
+    /*
+     * The Moron, and it is load-bearing rather than flavour.
+     *
+     * Its `weaponTierCap` is 0 and the only tier-0 gun in the arsenal is the
+     * free Baby Missile, so whatever it buys, what it FIRES does 30 at ground
+     * zero against 100 health. It cannot finish a full-health tank in one shot,
+     * which is what guarantees there is a turn after ours for its frame to
+     * carry. `expect(theirs.turnNumber)` below is where that stops being an
+     * assumption.
+     */
     await addBot(page, 'moron');
     await startMatch(solo);
     await waitForSnapshot(page);
@@ -701,29 +862,91 @@ test.describe('one person, one computer player, no second browser', () => {
     const mine = await readSnapshot(page);
     const you = await readSelf(page);
     const seat = mine.tanks.findIndex((tank) => tank.id === you);
-    const aim = findLandingShot(mine, seat) ?? { angleDeg: 45, power: 70 };
-    await setAim(page, aim.angleDeg, aim.power);
+
+    /*
+     * Our half of "the round survives this exchange".
+     *
+     * `findLandingShot`, which this used to call, only promises a crater — the
+     * shot it picks is free to land next to a tank, and in a sample of runs it
+     * took 23 health off the SHOOTER. That is not lethal with a Baby Missile
+     * either, but it makes the claim above depend on arithmetic across two
+     * shots instead of on nobody being touched at all. `findHarmlessShot` picks
+     * a landing spot outside the reach of both the blast and its crater, so the
+     * board's health column is untouched by our turn.
+     */
+    const aim = findHarmlessShot(mine, seat);
+    expect(aim, 'no shot on this map lands clear of every tank').not.toBeNull();
+    await setAim(page, aim!.angleDeg, aim!.power);
 
     armed = true;
     await fire(page);
 
-    const ours = await waitForTurnAfter(page, mine.turnNumber);
-    const theirs = await waitForTurnAfter(page, ours.turnNumber);
+    /*
+     * Whatever happens next, this resolves: the harness reports on its own
+     * deadline, and this waits a little past it so that a harness that somehow
+     * never saw a frame is also a message rather than a hung test.
+     */
+    const race = await Promise.race([
+      staged,
+      new Promise<Staged>((resolve) => {
+        setTimeout(() => resolve({ mode: 'silent', first, second }), STAGING_LIMIT_MS);
+      }),
+    ]);
+
     expect(intercepted, 'the socket was never routed — nothing was rescheduled').toHaveLength(1);
+    expect(
+      race.mode,
+      race.mode === 'silent'
+        ? 'our shot never came back as a turn at all'
+        : 'the computer player never answered, so no second frame was there to race',
+    ).toBe('paired');
+
+    const ours = race.first as Turn;
+    const theirs = race.second as Turn;
+
+    // The two preconditions, stated as assertions because everything below is
+    // meaningless without them: our shot hurt nobody, and the round is still
+    // running afterwards — a round that ended would leave both frames sitting
+    // on the same turn number and nothing to notice a rewind with.
+    expect(ours.health, 'the shot chosen to touch nobody took health off somebody').toEqual(
+      mine.tanks.map((tank) => tank.health),
+    );
+    expect(
+      theirs.turnNumber,
+      'the exchange did not advance the board, so there was no newer turn to go back from',
+    ).toBeGreaterThan(ours.turnNumber);
+
+    /*
+     * Read as "have you reached this turn yet", never as "catch it going past".
+     * The frames are 200 ms apart on purpose and a poll that has to see the
+     * first one before the second arrives is the race that used to hang this
+     * test on CI.
+     */
+    await page.waitForFunction(
+      (turnNumber) => {
+        const handle = (
+          window as unknown as { __scorched?: { snapshot(): { turnNumber: number } | null } }
+        ).__scorched;
+        const seen = handle?.snapshot()?.turnNumber;
+        return typeof seen === 'number' && seen >= turnNumber;
+      },
+      theirs.turnNumber,
+      { timeout: 30_000 },
+    );
 
     /*
      * Both animations are still running at this point — the turn counter moves
      * when the frame ARRIVES, not when the explosion finishes. The rewind
-     * happens when the first one lands, so the assertion is what the board says
-     * once everything has settled, sampled the whole way there rather than
-     * peeked at once.
+     * happens when the first one lands, and lasts as long as the second one
+     * takes to play, so the assertion is sampled the whole way there rather
+     * than peeked at once.
      */
     const rewound = await page.evaluate(async (floor: number) => {
       const handle = (
         window as unknown as { __scorched?: { snapshot(): { turnNumber: number } | null } }
       ).__scorched;
       const seen: number[] = [];
-      for (let sample = 0; sample < 60; sample += 1) {
+      for (let sample = 0; sample < 80; sample += 1) {
         const turnNumber = handle?.snapshot()?.turnNumber;
         if (typeof turnNumber === 'number') seen.push(turnNumber);
         await new Promise((resolve) => setTimeout(resolve, 50));
