@@ -1,6 +1,7 @@
-# Scorched Earth (web)
+# Rescorched
 
-An open-source multiplayer remake of [Scorched Earth](<https://en.wikipedia.org/wiki/Scorched_Earth_(video_game)>),
+**Rescorched** is an open-source multiplayer homage to
+[Scorched Earth](<https://en.wikipedia.org/wiki/Scorched_Earth_(video_game)>),
 the 1991 DOS artillery game — destructible terrain, ballistics with wind, a deep
 arsenal, a between-rounds armoury, and turn-based multiplayer that survives a
 dropped connection.

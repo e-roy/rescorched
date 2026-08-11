@@ -1,9 +1,9 @@
 {
-  "name": "scorched-earth-web",
+  "name": "rescorched",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Open-source multiplayer web remake of Scorched Earth (1991)",
+  "description": "Rescorched — open-source multiplayer homage to Scorched Earth (1991)",
   "license": "MIT",
   "packageManager": "pnpm@11.18.0",
   "engines": {
