@@ -95,12 +95,28 @@ if (workspaceYaml === null) {
    *
    * So the right-hand side must be an exact version, every time.
    */
-  const overrideBlock = /^overrides:\s*$((?:\n[ \t]+.+)*)/m.exec(withoutComments);
-  if (overrideBlock !== null) {
-    const entries = [
-      ...overrideBlock[1].matchAll(/^\s+(?:'([^']+)'|"([^"]+)"|([^\s:]+))\s*:\s*(\S+)/gm),
-    ];
-    for (const entry of entries) {
+  /*
+   * Scanned line by line rather than with one regex over the block.
+   *
+   * The regex version was `^overrides:\s*$((?:\n[ \t]+.+)*)`, which stops at the
+   * first BLANK line — so the moment somebody spaced the entries apart to
+   * document them, it silently checked only the first one and reported a count
+   * nobody cross-checked. A guard that quietly narrows its own scope is worse
+   * than no guard, because the passing output looks the same.
+   */
+  const lines = withoutComments.split('\n');
+  const start = lines.findIndex((line) => /^overrides:[ \t]*$/.test(line));
+  if (start >= 0) {
+    let checked = 0;
+    for (let i = start + 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (line.trim() === '') continue; // blank lines separate documented entries
+      if (!/^[ \t]/.test(line)) break; // dedent ends the block
+
+      const entry = /^[ \t]+(?:'([^']+)'|"([^"]+)"|([^\s:]+))[ \t]*:[ \t]*(\S+)/.exec(line);
+      if (entry === null) continue;
+
+      checked += 1;
       const target = entry[1] ?? entry[2] ?? entry[3];
       const version = entry[4].replace(/^['"]|['"]$/g, '');
       if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
@@ -110,7 +126,7 @@ if (workspaceYaml === null) {
         );
       }
     }
-    notes.push(`overrides, all exactly pinned: ${entries.length}`);
+    notes.push(`overrides, all exactly pinned: ${checked}`);
   }
 
   // Lifecycle-script allowlist stays small and reviewed. pnpm expresses this

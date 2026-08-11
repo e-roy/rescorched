@@ -63,13 +63,38 @@ allowBuilds:
 # Each right-hand side is an exact pin that is already past the 7-day
 # quarantine — the guard above is not bent to accommodate a fix.
 #
-# Remove an entry once every dependency that pulls the package has moved past
-# it on its own; `pnpm why <name>` says whether that has happened.
+# Before adding an entry, check whether UPGRADING would do the job instead: an
+# override is a version this repo now owns and has to remember to drop, and a
+# dependency that has already fixed itself upstream is strictly better. Both
+# entries below were checked that way, and they are NOT the same case — the
+# distinction matters for knowing when each can go.
 overrides:
   # GHSA-2v37-7h3g-55p8 — custom generators can loop forever at size zero.
   # Reaches us through vite -> postcss -> nanoid, i.e. the client build.
+  #
+  # NOT a range problem. postcss asks for `nanoid: ^3.3.16`, which already
+  # allows the patched 3.3.17, and we are on the newest postcss there is. What
+  # pins it is the LOCKFILE, and pnpm offers no surgical way to move a package
+  # nothing in this workspace declares: with the override removed, both a plain
+  # `pnpm install` and `pnpm update nanoid -r --depth Infinity` leave 3.3.16 in
+  # place and the advisory comes straight back. The only alternative is deleting
+  # the lockfile and re-resolving the whole tree, which is a far bigger change
+  # than the one patch bump being asked for.
+  #
+  # So this one becomes removable as soon as anything causes a legitimate
+  # re-resolution of postcss's subtree. Check with `pnpm why nanoid`.
   'nanoid@<3.3.17': 3.3.17
+
   # GHSA-4cwx-7wf7-3272 — cross-user information disclosure and a parse-time
   # crash via degenerate private cache directives. Reaches us through
   # miniflare, i.e. `wrangler dev` and the in-workerd test runner.
+  #
+  # Genuinely forced, and no upgrade at any level helps. miniflare pins
+  # `undici: 7.28.0` EXACTLY rather than by range, and every miniflare published
+  # in the 90 days to 2026-08-11 does the same — the newest 5.x alpha and the
+  # whole 4.x line alike. No version of wrangler or @cloudflare/vitest-pool-
+  # workers reaches a patched undici, because there is not one to reach.
+  #
+  # So this one waits on Cloudflare. Re-check with:
+  #   npm view miniflare@latest dependencies.undici
   'undici@<7.29.0': 7.29.0
