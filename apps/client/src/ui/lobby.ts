@@ -15,7 +15,7 @@
  * the frame and show the refusal — see `expectServerReply`.
  */
 
-import type { BotPersonality, LobbyPlayer, Spectator } from '@scorched/protocol';
+import type { BotPersonality, LobbyPlayer, RoomVisibility, Spectator } from '@scorched/protocol';
 import { isBotPersonality } from '@scorched/sim';
 import { el, must } from './dom.ts';
 import { colorCss, listNames } from './format.ts';
@@ -39,6 +39,8 @@ export interface LobbyCallbacks {
   onAddBot(personality: BotPersonality): void;
   /** Ask the room to free a seat a computer player is in. It may say no. */
   onRemoveBot(playerId: string): void;
+  /** Ask the room to list itself publicly, or stop. Host only — the room enforces it. */
+  onVisibility(visibility: RoomVisibility): void;
 }
 
 /** Two is the floor the server enforces; the button says so before it refuses. */
@@ -58,7 +60,12 @@ const DEFAULT_PERSONALITY: BotPersonality = 'shooter';
 export class LobbyView {
   private readonly callbacks: LobbyCallbacks;
 
+  private readonly panel = must<HTMLElement>('#panel-lobby');
+  private readonly eyebrow = must<HTMLParagraphElement>('#lobby-eyebrow');
   private readonly codeOut = must<HTMLSpanElement>('#lobby-code');
+  private readonly privateButton = must<HTMLButtonElement>('#btn-visibility-private');
+  private readonly publicButton = must<HTMLButtonElement>('#btn-visibility-public');
+  private readonly visibilityNote = must<HTMLParagraphElement>('#lobby-visibility-note');
   private readonly list = must<HTMLUListElement>('#lobby-players');
   private readonly hint = must<HTMLParagraphElement>('#lobby-hint');
   private readonly spectatorLine = must<HTMLParagraphElement>('#lobby-spectators');
@@ -76,6 +83,8 @@ export class LobbyView {
 
   private roomCode = '';
   private ready = false;
+  /** The room's own word on it, from the last lobby frame. Never set optimistically. */
+  private visibility: RoomVisibility = 'private';
 
   /**
    * Bot frames sent whose answer has not come back yet.
@@ -105,6 +114,14 @@ export class LobbyView {
       void this.copyInvite();
     });
 
+    /*
+     * The switch sends a request and then waits for the room to repaint it.
+     * Flipping it locally first would mean a guest's click — which the room
+     * refuses — showed a public room for a moment that never was.
+     */
+    this.privateButton.addEventListener('click', () => this.requestVisibility('private'));
+    this.publicButton.addEventListener('click', () => this.requestVisibility('public'));
+
     // How much of the list fits is a function of the window, so the answer is
     // re-measured when the window changes rather than only when the room does.
     window.addEventListener('resize', () => this.paintOverflow());
@@ -116,6 +133,45 @@ export class LobbyView {
       this.expectServerReply();
       this.callbacks.onAddBot(this.chosenPersonality());
     });
+  }
+
+  private requestVisibility(next: RoomVisibility): void {
+    if (next === this.visibility) return;
+    this.errorLine.hidden = true;
+    this.callbacks.onVisibility(next);
+  }
+
+  /**
+   * The Private / Public switch, and the sentence under it.
+   *
+   * Guests see the same switch, disabled, rather than no switch: whether a room
+   * is listed is something everybody in it should know — a public lobby is one
+   * strangers can walk into mid-conversation.
+   */
+  private paintVisibility(visibility: RoomVisibility, youAreHost: boolean): void {
+    this.visibility = visibility;
+    this.panel.dataset['visibility'] = visibility;
+
+    for (const [button, value] of [
+      [this.privateButton, 'private'],
+      [this.publicButton, 'public'],
+    ] as const) {
+      button.setAttribute('aria-pressed', visibility === value ? 'true' : 'false');
+      button.disabled = !youAreHost;
+      button.title = youAreHost
+        ? value === 'public'
+          ? 'List this room in Public rooms'
+          : 'Take this room out of Public rooms'
+        : 'Only the host can change this';
+    }
+
+    const isPublic = visibility === 'public';
+    this.eyebrow.textContent = isPublic
+      ? 'Public room — listed for anyone to join'
+      : 'Room code — read it out loud';
+    this.visibilityNote.textContent = isPublic
+      ? 'Listed in Public rooms. Anyone can find it and walk in.'
+      : 'Invite only. Share the code or the invite link.';
   }
 
   // ------------------------------------------------------- computer players
@@ -273,6 +329,7 @@ export class LobbyView {
     players: readonly LobbyPlayer[],
     hostId: string | null,
     you: string,
+    visibility: RoomVisibility,
   ): void {
     this.roomCode = roomCode;
     this.codeOut.textContent = roomCode;
@@ -288,6 +345,7 @@ export class LobbyView {
     }
 
     const youAreHost = hostId === null || hostId === you;
+    this.paintVisibility(visibility, youAreHost);
     this.list.replaceChildren(
       ...players.map((player) => this.row(player, hostId, you, youAreHost)),
     );
@@ -308,7 +366,11 @@ export class LobbyView {
       missing > 0
         ? youAreHost
           ? `Waiting for ${missing} more ${missing === 1 ? 'player' : 'players'} — add a computer player below, or read out the code.`
-          : `Waiting for ${missing} more ${missing === 1 ? 'player' : 'players'}. Anyone with the code can walk in.`
+          : `Waiting for ${missing} more ${missing === 1 ? 'player' : 'players'}. ${
+              visibility === 'public'
+                ? 'Anyone browsing public rooms can walk in.'
+                : 'Anyone with the code can walk in.'
+            }`
         : youAreHost
           ? `${players.length} in. Start when you are happy with the room.`
           : `${players.length} in. Only the host can start the match.`;

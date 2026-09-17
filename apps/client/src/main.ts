@@ -63,11 +63,14 @@ function queueAimBroadcast(angleDeg: number, power: number, weapon: string): voi
 }
 
 const ui = new Ui({
-  onCreateRoom: (name) => {
+  onCreateRoom: (name, visibility) => {
     ui.clearTitleError();
-    void createRoom()
+    void createRoom(visibility)
       .then((roomCode) => join(name, roomCode))
       .catch((error: unknown) => {
+        // Wherever the click came from — the console or the public rooms card —
+        // the refusal belongs on the title screen's own error line.
+        ui.show('title');
         ui.showTitleError(error instanceof Error ? error.message : 'Could not create a room');
       });
   },
@@ -156,7 +159,13 @@ function handleMessage(message: ServerMessage): void {
 
     case 'lobby':
       if (app.snapshot === null) ui.show('lobby');
-      ui.renderLobby(message.roomCode, message.players, message.hostId, app.you ?? '');
+      ui.renderLobby(
+        message.roomCode,
+        message.players,
+        message.hostId,
+        app.you ?? '',
+        message.visibility ?? 'private',
+      );
       return;
 
     case 'state':

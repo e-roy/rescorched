@@ -98,7 +98,7 @@ Additional rules:
 | WebSockets | DO **WebSocket Hibernation API** | Mandatory — this is what keeps turn-based games nearly free. Use `state.acceptWebSocket()`, not the legacy `accept()` |
 | Persistence | SQLite inside the Durable Object (`ctx.storage.sql`) | Match state, replays. No external DB at launch |
 | Static hosting | Workers Static Assets | Serves the built Vite client; asset requests are unmetered |
-| Matchmaking | Room codes first (create/join by code) | Public lobby list later via a singleton "lobby" DO |
+| Matchmaking | Room codes (create/join by code) plus a public room browser | Public list is a singleton `RoomDirectory` DO: rooms push versioned listings, the directory re-checks stale rows against the room on read |
 | Auth | Anonymous session IDs (crypto-random, cookie) | No accounts at launch. If accounts later: revisit deliberately |
 | Rate limiting / abuse | Per-IP limits in the Worker + Turnstile on room creation (later, if needed) | |
 | Deploy tool | Wrangler CLI (`wrangler.jsonc`) | `pnpm deploy` → `wrangler deploy`. Forkers deploy their own instance the same way |

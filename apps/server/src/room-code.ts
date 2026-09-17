@@ -5,6 +5,8 @@
  * entropy is correct here. The sim's seeded RNG is for *game* randomness.
  */
 
+import type { RoomVisibility } from '@scorched/protocol';
+
 // I and O are excluded: they read as 1 and 0 when someone types a code in.
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 export const ROOM_CODE_LENGTH = 4;
@@ -71,10 +73,16 @@ export const ROOM_CODE_ATTEMPTS = 5;
  * it measures the dice, not the code. Handing in a generator that returns an
  * occupied code first forces the collision every run, so deleting the probe
  * turns the test red. See `test/room-code.test.ts`.
+ *
+ * `visibility` is handed to the claim, so a public room is public from the
+ * moment its code exists rather than from some later frame that could be lost.
+ * It only takes effect on a code that is actually claimed: the shared-room
+ * fallback below leaves an occupied room's own choice alone.
  */
 export async function allocateRoomCode(
   env: Env,
   generate: () => string = generateRoomCode,
+  visibility: RoomVisibility = 'private',
 ): Promise<string> {
   let candidate = generate();
   for (let attempt = 0; attempt < ROOM_CODE_ATTEMPTS; attempt += 1) {
@@ -82,7 +90,9 @@ export async function allocateRoomCode(
     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(candidate));
     try {
       const response = await stub.fetch(
-        new Request(`https://room/claim?room=${candidate}`, { method: 'POST' }),
+        new Request(`https://room/claim?room=${candidate}&visibility=${visibility}`, {
+          method: 'POST',
+        }),
       );
       if (!response.ok) continue;
       const summary = (await response.json()) as { claimed?: boolean };
@@ -102,7 +112,9 @@ export async function allocateRoomCode(
    */
   try {
     const response = await env.GAME_ROOM.get(env.GAME_ROOM.idFromName(candidate)).fetch(
-      new Request(`https://room/claim?room=${candidate}`, { method: 'POST' }),
+      new Request(`https://room/claim?room=${candidate}&visibility=${visibility}`, {
+        method: 'POST',
+      }),
     );
     // Read the body even though the answer is not interesting: a response left
     // undrained holds its request open, and an object with a request in flight

@@ -10,9 +10,12 @@ import {
   MAX_MESSAGE_BYTES,
   MAX_NONCE,
   MAX_PLAYERS_PER_ROOM,
+  MAX_PUBLIC_ROOMS_LISTED,
   MAX_SERVER_MESSAGE_BYTES,
   packSurface,
   parseClientMessage,
+  parseCreateRoomRequest,
+  parsePublicRoomList,
   parseServerMessage,
   PROTOCOL_VERSION,
   ServerMessageSchema,
@@ -87,6 +90,8 @@ const CLIENT_MESSAGES: ClientMessage[] = [
   { t: 'addBot' },
   { t: 'addBot', personality: 'annihilator' },
   { t: 'removeBot', playerId: 'bot-1' },
+  { t: 'setVisibility', visibility: 'public' },
+  { t: 'setVisibility', visibility: 'private' },
   { t: 'aim', angleDeg: 45, power: 60, weapon: 'baby_missile' },
   { t: 'fire', turnNumber: 3, angleDeg: 90, power: 100, weapon: 'nuke' },
   { t: 'buy', weapon: 'missile', quantity: 2 },
@@ -125,6 +130,14 @@ const SERVER_MESSAGES: ServerMessage[] = [
       },
       { id: 's2', name: 'Bob', ready: false, connected: true, colorIndex: 2, bot: null },
     ],
+  },
+  // A public room says so; the frame above, without the field, is an older server.
+  {
+    t: 'lobby',
+    roomCode: 'WXYZ',
+    hostId: 's1',
+    visibility: 'public',
+    players: [{ id: 's1', name: 'Alice', ready: false, connected: true, colorIndex: 0 }],
   },
   { t: 'state', snapshot: SNAPSHOT },
   { t: 'events', turnNumber: 1, snapshot: SNAPSHOT, events: EVENTS },
@@ -899,5 +912,62 @@ describe('computer players on the wire', () => {
     const parsed = parseClientMessage('{"t":"ready","ready":true,"bot":"annihilator"}');
     expect(parsed.ok).toBe(true);
     if (parsed.ok) expect(Object.hasOwn(parsed.value, 'bot')).toBe(false);
+  });
+});
+
+describe('the public room browser on the wire', () => {
+  const ROOM = {
+    roomCode: 'ABCD',
+    hostName: 'Alice',
+    players: 3,
+    bots: 1,
+    maxPlayers: 8,
+    status: 'lobby' as const,
+  };
+
+  it('reads a listing a server would send', () => {
+    const parsed = parsePublicRoomList(JSON.stringify({ rooms: [ROOM] }));
+    expect(parsed.ok, parsed.ok ? '' : parsed.error).toBe(true);
+    if (parsed.ok) expect(parsed.value.rooms).toEqual([ROOM]);
+  });
+
+  it('bounds a listing, so a hostile one cannot hand the page a thousand rows', () => {
+    const rooms = Array.from({ length: MAX_PUBLIC_ROOMS_LISTED + 1 }, () => ROOM);
+    expect(parsePublicRoomList(JSON.stringify({ rooms })).ok).toBe(false);
+    expect(
+      parsePublicRoomList(JSON.stringify({ rooms: rooms.slice(0, MAX_PUBLIC_ROOMS_LISTED) })).ok,
+    ).toBe(true);
+  });
+
+  it('refuses a room that cannot exist, or a name that would not be a name', () => {
+    const bad = [
+      { ...ROOM, bots: 4 },
+      { ...ROOM, players: MAX_PLAYERS_PER_ROOM + 1 },
+      { ...ROOM, hostName: 'Ali\u202Ece' },
+      { ...ROOM, roomCode: 'abcd' },
+      { ...ROOM, status: 'finished' },
+    ];
+    for (const room of bad) {
+      expect(parsePublicRoomList(JSON.stringify({ rooms: [room] })).ok, JSON.stringify(room)).toBe(
+        false,
+      );
+    }
+  });
+
+  it('treats an empty create request as private, and refuses one it cannot read', () => {
+    expect(parseCreateRoomRequest('')).toEqual({ ok: true, value: {} });
+    expect(parseCreateRoomRequest('{"visibility":"public"}')).toEqual({
+      ok: true,
+      value: { visibility: 'public' },
+    });
+    expect(parseCreateRoomRequest('{"visibility":"everyone"}').ok).toBe(false);
+    expect(parseCreateRoomRequest('[').ok).toBe(false);
+    const huge = parseCreateRoomRequest(JSON.stringify({ pad: 'x'.repeat(1000) }));
+    expect(huge.ok === false && huge.code).toBe('too_large');
+  });
+
+  it('does not let a client name a visibility the server has never heard of', () => {
+    expect(parseClientMessage('{"t":"setVisibility","visibility":"unlisted"}').ok).toBe(false);
+    expect(parseClientMessage('{"t":"setVisibility"}').ok).toBe(false);
   });
 });

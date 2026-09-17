@@ -22,6 +22,11 @@ pnpm dev
 Then open http://127.0.0.1:8787, click **Create room**, and share the four-letter
 code with someone else (or a second browser window).
 
+Or tick **List it in Public rooms** before creating: the title screen shows every
+visitor the public rooms open right now, so anybody can walk into your lobby
+without a code. Everyone in a lobby can chat while they wait for the host to
+start.
+
 ## How it is put together
 
 The interesting decision is that **the simulation is one pure, deterministic
@@ -45,7 +50,7 @@ packages/
   config/     shared TypeScript config
 apps/
   client/     Phaser 3 rendering + plain-DOM menus. No game rules.
-  server/     Cloudflare Worker + GameRoom Durable Object
+  server/     Cloudflare Worker + GameRoom and RoomDirectory Durable Objects
 e2e/          Playwright, against a real wrangler dev
 ```
 

@@ -636,6 +636,21 @@ export const BOT_PERSONALITIES = [
 export const BotPersonalitySchema = z.enum(BOT_PERSONALITIES);
 export type BotPersonality = z.infer<typeof BotPersonalitySchema>;
 
+/**
+ * Who can find a room.
+ *
+ * `private` is the room as it has always been: it exists for whoever was handed
+ * the four letters. `public` additionally lists it in the room browser, so a
+ * stranger can walk into the lobby without anybody reading a code out loud.
+ *
+ * Visibility decides who can FIND a room, never who can ENTER one. A private
+ * code works for anyone who types it, exactly as before, and a public room is
+ * entered by the same `hello` as any other. There is no second door to guard.
+ */
+export const ROOM_VISIBILITIES = ['private', 'public'] as const;
+export const RoomVisibilitySchema = z.enum(ROOM_VISIBILITIES);
+export type RoomVisibility = z.infer<typeof RoomVisibilitySchema>;
+
 // ---------------------------------------------------------------------------
 // Client → Server
 //
@@ -673,6 +688,12 @@ export const ClientMessageSchema = z.discriminatedUnion('t', [
   }),
   /** Free a seat a computer player is sitting in. Host only, lobby only. */
   z.object({ t: z.literal('removeBot'), playerId: PlayerIdSchema }),
+  /**
+   * List the room in the public browser, or take it out. Host only, any phase —
+   * the server enforces it. Like `addBot`, a new member of the CLIENT union
+   * only, so it did not bump `PROTOCOL_VERSION`: nothing older can send it.
+   */
+  z.object({ t: z.literal('setVisibility'), visibility: RoomVisibilitySchema }),
   z.object({
     t: z.literal('aim'),
     angleDeg: AngleSchema,
@@ -807,6 +828,12 @@ export const ServerMessageSchema = z.discriminatedUnion('t', [
     roomCode: RoomCodeSchema,
     players: z.array(LobbyPlayerSchema).max(MAX_PLAYERS_PER_ROOM),
     hostId: PlayerIdSchema.nullable(),
+    /**
+     * Whether the room is listed in the public browser. Optional for the same
+     * reason `LobbyPlayer.bot` is: an older client parses the frame unchanged
+     * and simply draws no switch. Absent means private.
+     */
+    visibility: RoomVisibilitySchema.optional(),
   }),
   z.object({
     t: z.literal('state'),
@@ -880,6 +907,79 @@ export const ServerMessageSchema = z.discriminatedUnion('t', [
   z.object({ t: z.literal('pong'), nonce: NonceSchema }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;
+
+// ---------------------------------------------------------------------------
+// The public room browser (HTTP, not WebSocket)
+//
+// Not a socket frame, but still the wire: the Worker writes it and the client
+// reads it, so its shape is written down here and nowhere else. The same two
+// rules apply — every string, count and array is bounded.
+// ---------------------------------------------------------------------------
+
+/** Rooms in one listing. A browser page, not an index of the world. */
+export const MAX_PUBLIC_ROOMS_LISTED = 50;
+/** The largest `POST /api/rooms` body the Worker will read. `{"visibility":"private"}` is 24. */
+export const MAX_CREATE_ROOM_BODY_BYTES = 256;
+
+/** How a listed room is doing: still gathering people, or already fighting. */
+export const PublicRoomStatusSchema = z.enum(['lobby', 'playing']);
+export type PublicRoomStatus = z.infer<typeof PublicRoomStatusSchema>;
+
+const SeatCountSchema = z.number().int().min(0).max(MAX_PLAYERS_PER_ROOM);
+
+export const PublicRoomSchema = z
+  .object({
+    roomCode: RoomCodeSchema,
+    /** Who is running it. The browser names a room by its host. */
+    hostName: PlayerNameSchema,
+    /** Seats taken, computer players included. */
+    players: SeatCountSchema,
+    /** How many of those seats are computer players. */
+    bots: SeatCountSchema,
+    maxPlayers: z.number().int().min(1).max(MAX_PLAYERS_PER_ROOM),
+    status: PublicRoomStatusSchema,
+  })
+  .refine((room) => room.bots <= room.players, 'A room cannot have more bots than seats');
+export type PublicRoom = z.infer<typeof PublicRoomSchema>;
+
+export const PublicRoomListSchema = z.object({
+  rooms: z.array(PublicRoomSchema).max(MAX_PUBLIC_ROOMS_LISTED),
+});
+export type PublicRoomList = z.infer<typeof PublicRoomListSchema>;
+
+export const CreateRoomRequestSchema = z.object({
+  /** Absent means private — every client older than the browser sends no body at all. */
+  visibility: RoomVisibilitySchema.optional(),
+});
+export type CreateRoomRequest = z.infer<typeof CreateRoomRequestSchema>;
+
+/**
+ * Parse a `POST /api/rooms` body. Never throws.
+ *
+ * An EMPTY body is a valid request for a private room, because that is what
+ * every client before the browser sent and what a `curl -X POST` sends.
+ */
+export function parseCreateRoomRequest(raw: string): ParseResult<CreateRoomRequest> {
+  if (raw.trim() === '') return { ok: true, value: {} };
+  const json = parseJson(raw, MAX_CREATE_ROOM_BODY_BYTES);
+  if (!json.ok) return json;
+  const result = CreateRoomRequestSchema.safeParse(json.value);
+  if (!result.success) {
+    return { ok: false, code: 'bad_message', error: formatZodError(result.error) };
+  }
+  return { ok: true, value: result.data };
+}
+
+/** Parse a room listing on the client. Never throws. */
+export function parsePublicRoomList(raw: string): ParseResult<PublicRoomList> {
+  const json = parseJson(raw, MAX_SERVER_MESSAGE_BYTES);
+  if (!json.ok) return json;
+  const result = PublicRoomListSchema.safeParse(json.value);
+  if (!result.success) {
+    return { ok: false, code: 'bad_message', error: formatZodError(result.error) };
+  }
+  return { ok: true, value: result.data };
+}
 
 // ---------------------------------------------------------------------------
 // Parse / serialise helpers
