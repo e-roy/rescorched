@@ -72,8 +72,14 @@ overrides:
   # GHSA-2v37-7h3g-55p8 — custom generators can loop forever at size zero.
   # Reaches us through vite -> postcss -> nanoid, i.e. the client build.
   #
+  # The advisory's affected range MOVED after this entry was first written: it
+  # named `<3.3.17`, which 3.3.17 cleared, and now names `<3.3.18`. So the pin
+  # stopped clearing it without a single change in this repo, and CI went red
+  # on a branch that had not touched a dependency. Raised to 3.3.18, the newest
+  # release already past the quarantine (3.3.19 was not, on 2026-09-17).
+  #
   # NOT a range problem. postcss asks for `nanoid: ^3.3.16`, which already
-  # allows the patched 3.3.17, and we are on the newest postcss there is. What
+  # allows the patched version, and we are on the newest postcss there is. What
   # pins it is the LOCKFILE, and pnpm offers no surgical way to move a package
   # nothing in this workspace declares: with the override removed, both a plain
   # `pnpm install` and `pnpm update nanoid -r --depth Infinity` leave 3.3.16 in
@@ -83,7 +89,7 @@ overrides:
   #
   # So this one becomes removable as soon as anything causes a legitimate
   # re-resolution of postcss's subtree. Check with `pnpm why nanoid`.
-  'nanoid@<3.3.17': 3.3.17
+  'nanoid@<3.3.18': 3.3.18
 
   # GHSA-4cwx-7wf7-3272 — cross-user information disclosure and a parse-time
   # crash via degenerate private cache directives. Reaches us through
@@ -98,3 +104,21 @@ overrides:
   # So this one waits on Cloudflare. Re-check with:
   #   npm view miniflare@latest dependencies.undici
   'undici@<7.29.0': 7.29.0
+
+  # GHSA-rgj7-g3m4-5g8c — sharp bundles a libheif affected by
+  # GHSA-g89c-p67h-r497 and GHSA-2jg2-4ch7-h545. Reaches us through miniflare,
+  # i.e. `wrangler dev` and the in-workerd test runner. Nothing in this repo
+  # decodes an image with it; see the top of this block for why that is not the
+  # point.
+  #
+  # Forced, the same way undici was: miniflare pins `sharp: 0.35.2` EXACTLY.
+  # The first miniflare to move is 5.20260916.0-alpha, which pins 0.35.4 and
+  # ships with wrangler 4.133.0 — both published 2026-09-16, inside the
+  # quarantine. Every miniflare old enough to install still pins 0.35.2, so
+  # upgrading is not yet available and this override is the only fix that
+  # respects the guard.
+  #
+  # Removable once wrangler 4.133.0 or later is past the quarantine (from
+  # 2026-09-23) and the toolchain is upgraded to it. Re-check with:
+  #   npm view miniflare@latest dependencies.sharp
+  'sharp@<0.35.4': 0.35.4
