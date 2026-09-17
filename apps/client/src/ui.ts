@@ -14,10 +14,17 @@
  */
 
 import { BABY_MISSILE } from '@scorched/sim';
-import type { GameSnapshot, LobbyPlayer, ServerMessage, Standing } from '@scorched/protocol';
+import type {
+  GameSnapshot,
+  LobbyPlayer,
+  RoomVisibility,
+  ServerMessage,
+  Standing,
+} from '@scorched/protocol';
 import { activeNet, subscribeNet, type ConnectionStatus } from './net.ts';
 import { must, el } from './ui/dom.ts';
 import { ArmouryView } from './ui/armoury.ts';
+import { RoomsView } from './ui/rooms.ts';
 import { ChatView } from './ui/chat.ts';
 import { HudView, carriedWeapons } from './ui/hud.ts';
 import { LobbyView } from './ui/lobby.ts';
@@ -26,7 +33,7 @@ import { colorCss } from './ui/format.ts';
 export type Screen = 'title' | 'lobby' | 'battle' | 'shop' | 'gameover';
 
 export interface UiCallbacks {
-  onCreateRoom(name: string): void;
+  onCreateRoom(name: string, visibility: RoomVisibility): void;
   onJoinRoom(name: string, roomCode: string): void;
   onStart(): void;
   onLeave(): void;
@@ -71,6 +78,8 @@ export class Ui {
   private readonly nameInput = must<HTMLInputElement>('#input-name');
   private readonly roomInput = must<HTMLInputElement>('#input-room');
   private readonly titleError = must<HTMLParagraphElement>('#title-error');
+  private readonly publicInput = must<HTMLInputElement>('#input-public');
+  private readonly lobbyChatSlot = must<HTMLDivElement>('#lobby-chat-slot');
 
   private readonly gameoverWinner = must<HTMLParagraphElement>('#gameover-winner');
   private readonly gameoverRounds = must<HTMLParagraphElement>('#gameover-rounds');
@@ -83,6 +92,7 @@ export class Ui {
   private readonly lobby: LobbyView;
   private readonly armoury: ArmouryView;
   private readonly chat: ChatView;
+  private readonly rooms: RoomsView;
 
   private angle = 45;
   private power = 60;
@@ -109,6 +119,19 @@ export class Ui {
    * that is why the HUD can badge a tank the snapshot says nothing about.
    */
   private botSeats: ReadonlyMap<string, string> = new Map();
+  /**
+   * Seat colours from the last lobby frame, so a chat line in the lobby can be
+   * coloured like its speaker before there is a tank to take the colour from.
+   */
+  private lobbyColors: ReadonlyMap<string, number> = new Map();
+  /**
+   * The people seated as of the last lobby frame, for "Bob joined the room".
+   * Null until the first lobby frame of a connection, so arriving in a room does
+   * not announce everybody who was already sitting in it.
+   */
+  private lobbyRoster: ReadonlyMap<string, string> | null = null;
+  /** Which room the chat log belongs to. Walking into a different room starts a clean one. */
+  private chatRoom: string | null = null;
   private lastResult: {
     winnerId: string | null;
     roundsPlayed: number;
@@ -140,6 +163,7 @@ export class Ui {
       // refuse. Nothing here decides whether there is a seat for it.
       onAddBot: (personality) => activeNet()?.send({ t: 'addBot', personality }),
       onRemoveBot: (playerId) => activeNet()?.send({ t: 'removeBot', playerId }),
+      onVisibility: (visibility) => activeNet()?.send({ t: 'setVisibility', visibility }),
     });
 
     this.armoury = new ArmouryView({
@@ -149,6 +173,13 @@ export class Ui {
 
     this.chat = new ChatView({
       onSend: (text) => activeNet()?.send({ t: 'chat', text }),
+    });
+
+    // Public rooms live on the title screen, beside the console. Joining one
+    // uses the name typed there, exactly as a typed-in code does.
+    this.rooms = new RoomsView({
+      onJoin: (roomCode) => this.callbacks.onJoinRoom(this.playerName(), roomCode),
+      onCreatePublic: () => this.callbacks.onCreateRoom(this.playerName(), 'public'),
     });
 
     this.wireTitle();
@@ -163,7 +194,7 @@ export class Ui {
 
   private wireTitle(): void {
     must<HTMLButtonElement>('#btn-create').addEventListener('click', () => {
-      this.callbacks.onCreateRoom(this.playerName());
+      this.callbacks.onCreateRoom(this.playerName(), this.chosenVisibility());
     });
 
     must<HTMLButtonElement>('#btn-join').addEventListener('click', () => this.submitJoin());
@@ -175,7 +206,9 @@ export class Ui {
       if (event.key === 'Enter') this.submitJoin();
     });
     this.nameInput.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') this.callbacks.onCreateRoom(this.playerName());
+      if (event.key === 'Enter') {
+        this.callbacks.onCreateRoom(this.playerName(), this.chosenVisibility());
+      }
     });
 
     must<HTMLButtonElement>('#btn-shop-done').addEventListener('click', () =>
@@ -194,6 +227,10 @@ export class Ui {
 
   private playerName(): string {
     return this.nameInput.value.trim() || 'Player';
+  }
+
+  private chosenVisibility(): RoomVisibility {
+    return this.publicInput.checked ? 'public' : 'private';
   }
 
   private submitJoin(): void {
@@ -344,15 +381,22 @@ export class Ui {
      * talk to yet) and in the armoury, whose panel is wide enough to sit on top
      * of it.
      */
+    this.chat.dock(screen === 'lobby' ? this.lobbyChatSlot : null);
     this.chat.setVisible(isBattle || screen === 'lobby' || screen === 'gameover');
 
     for (const [key, panel] of Object.entries(this.panels)) {
       panel.hidden = key !== screen;
     }
 
+    // The public rooms card polls while the title screen is up, and never otherwise.
+    if (screen === 'title') this.rooms.start();
+    else this.rooms.stop();
+
     if (screen === 'title') {
       this.connBanner.hidden = true;
       this.setTimer(null);
+      this.lobbyRoster = null;
+      this.chatRoom = null;
     }
   }
 
@@ -404,9 +448,10 @@ export class Ui {
     players: readonly LobbyPlayer[],
     hostId: string | null,
     you: string,
+    visibility: RoomVisibility,
   ): void {
     this.you = you;
-    this.lobby.render(roomCode, players, hostId, you);
+    this.lobby.render(roomCode, players, hostId, you, visibility);
   }
 
   // -------------------------------------------------------------------- hud
@@ -536,6 +581,12 @@ export class Ui {
         // A fresh seat means a fresh loadout: take the server's word again.
         this.weaponAdopted = false;
         this.lastResult = null;
+        // A fresh connection: the next lobby frame is a baseline, not news.
+        this.lobbyRoster = null;
+        if (this.chatRoom !== message.roomCode) {
+          this.chat.clear();
+          this.chatRoom = message.roomCode;
+        }
         if (message.role === 'spectator') {
           this.showToast('The room was full — you are watching.', 'info');
         }
@@ -544,10 +595,16 @@ export class Ui {
       case 'lobby': {
         this.lastResult = null;
         const seats = new Map<string, string>();
+        const colors = new Map<string, number>();
+        const people = new Map<string, string>();
         for (const player of message.players) {
+          colors.set(player.id, player.colorIndex);
           if (player.bot != null) seats.set(player.id, player.bot);
+          else people.set(player.id, player.name);
         }
         this.botSeats = seats;
+        this.lobbyColors = colors;
+        this.announceArrivals(people);
         return;
       }
 
@@ -562,10 +619,11 @@ export class Ui {
 
       case 'chat': {
         const tank = this.snapshot?.tanks.find((candidate) => candidate.id === message.playerId);
+        const colorIndex = tank?.colorIndex ?? this.lobbyColors.get(message.playerId);
         this.chat.said(
           message.name,
           message.text,
-          tank === undefined ? null : colorCss(tank.colorIndex),
+          colorIndex === undefined ? null : colorCss(colorIndex),
         );
         return;
       }
@@ -611,6 +669,27 @@ export class Ui {
 
       default:
         return;
+    }
+  }
+
+  /**
+   * "Bob joined the room." / "Bob left the room."
+   *
+   * Worked out by comparing two lobby frames, because the room sends the seat
+   * list rather than a stream of arrivals. People only: a computer player
+   * appearing is the host's own click, and the seat list already shows it.
+   * During a match a dropped player keeps their seat, so nobody is announced
+   * as leaving a match they are expected back in.
+   */
+  private announceArrivals(people: ReadonlyMap<string, string>): void {
+    const previous = this.lobbyRoster;
+    this.lobbyRoster = people;
+    if (previous === null) return;
+    for (const [id, name] of people) {
+      if (!previous.has(id) && id !== this.you) this.chat.system(`${name} joined the room.`);
+    }
+    for (const [id, name] of previous) {
+      if (!people.has(id)) this.chat.system(`${name} left the room.`);
     }
   }
 

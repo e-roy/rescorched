@@ -224,67 +224,179 @@
             <p class="titlebar__badge">&#42;&#42; Open Source Multiplayer Edition &#42;&#42;</p>
           </div>
 
-          <div class="console" data-testid="title-console">
-            <label class="field">
-              <span>Your name</span>
-              <input
-                id="input-name"
-                data-testid="input-name"
-                maxlength="16"
-                value="Player"
-                autocomplete="off"
-                spellcheck="false"
-              />
-            </label>
-            <button class="btn btn--primary" id="btn-create" data-testid="btn-create">
-              Create room
-            </button>
+          <!--
+            The deck: everything a person can DO from the title screen, side by
+            side. Make your own game on the left; walk into somebody else's on
+            the right. Either is one click from arriving.
+          -->
+          <div class="deck">
+            <div class="console" data-testid="title-console">
+              <label class="field">
+                <span>Your name</span>
+                <input
+                  id="input-name"
+                  data-testid="input-name"
+                  maxlength="16"
+                  value="Player"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </label>
+              <!--
+                Unticked by default: a room is for the people you invite unless
+                you say otherwise. Ticking it lists the room in Public rooms the
+                moment it exists.
+              -->
+              <label class="check" for="input-public">
+                <input type="checkbox" id="input-public" data-testid="input-public" />
+                <span class="check__box" aria-hidden="true"></span>
+                <span class="check__text">List it in <strong>Public rooms</strong></span>
+              </label>
+              <button class="btn btn--primary" id="btn-create" data-testid="btn-create">
+                Create room
+              </button>
 
-            <div class="console__rule"><span>or join</span></div>
+              <div class="console__rule"><span>or join by code</span></div>
 
-            <label class="field">
-              <span>Room code</span>
-              <input
-                class="field__code"
-                id="input-room"
-                data-testid="input-room"
-                maxlength="4"
-                placeholder="ABCD"
-                autocomplete="off"
-                spellcheck="false"
-                inputmode="latin"
-              />
-            </label>
-            <button class="btn" id="btn-join" data-testid="btn-join">Join room</button>
+              <label class="field">
+                <span>Room code</span>
+                <input
+                  class="field__code"
+                  id="input-room"
+                  data-testid="input-room"
+                  maxlength="4"
+                  placeholder="ABCD"
+                  autocomplete="off"
+                  spellcheck="false"
+                  inputmode="latin"
+                />
+              </label>
+              <button class="btn" id="btn-join" data-testid="btn-join">Join room</button>
 
-            <p class="panel__error" id="title-error" data-testid="title-error" hidden></p>
+              <p class="panel__error" id="title-error" data-testid="title-error" hidden></p>
+            </div>
+
+            <!--
+              Public rooms, live. Built by `ui/rooms.ts` from GET /api/rooms/public:
+              a count, the first few rooms worth joining, and the rest on request.
+            -->
+            <section
+              class="lobbies"
+              id="title-rooms"
+              data-testid="title-rooms"
+              data-state="loading"
+              aria-labelledby="title-rooms-heading"
+            >
+              <header class="lobbies__head">
+                <h2 class="lobbies__heading" id="title-rooms-heading">Public rooms</h2>
+                <span
+                  class="lobbies__live"
+                  id="title-rooms-live"
+                  data-testid="title-rooms-live"
+                ></span>
+              </header>
+              <p
+                class="lobbies__summary"
+                id="title-rooms-summary"
+                data-testid="title-rooms-summary"
+              >
+                Looking for games&hellip;
+              </p>
+
+              <ul class="roomlist" id="title-rooms-list" data-testid="title-rooms-list" hidden></ul>
+              <button
+                type="button"
+                class="lobbies__more"
+                id="btn-rooms-more"
+                data-testid="btn-rooms-more"
+                aria-expanded="false"
+                aria-controls="title-rooms-list"
+                hidden
+              >
+                Show all rooms
+              </button>
+
+              <div
+                class="lobbies__empty"
+                id="title-rooms-empty"
+                data-testid="title-rooms-empty"
+                hidden
+              >
+                <p>Be the first. A public room shows up here for everybody who opens the game.</p>
+                <button class="btn btn--ghost" id="btn-rooms-create" data-testid="btn-rooms-create">
+                  Host a public room
+                </button>
+              </div>
+              <p
+                class="panel__error"
+                id="title-rooms-error"
+                data-testid="title-rooms-error"
+                hidden
+              ></p>
+            </section>
           </div>
 
           <p class="titlebar__foot">
-            A web remake of the 1991 DOS original by Wendell Hicken. Open source, no accounts, room
-            codes only.
+            A web remake of the 1991 DOS original by Wendell Hicken. Open source, no accounts.
           </p>
         </section>
 
         <section class="panel panel--lobby" id="panel-lobby" data-testid="panel-lobby" hidden>
-          <p class="lobby__eyebrow">Room code &mdash; read it out loud</p>
-          <div class="lobby__codebox">
-            <span class="lobby__code" id="lobby-code" data-testid="lobby-code">----</span>
-            <button class="btn btn--ghost" id="btn-copy" data-testid="btn-copy">Copy invite</button>
-          </div>
-          <p class="panel__hint" id="lobby-hint" data-testid="lobby-hint">
-            Two players minimum. Anyone with the code can walk in.
-          </p>
+          <div class="lobby__main">
+            <p class="lobby__eyebrow" id="lobby-eyebrow" data-testid="lobby-eyebrow">
+              Room code &mdash; read it out loud
+            </p>
+            <div class="lobby__codebox">
+              <span class="lobby__code" id="lobby-code" data-testid="lobby-code">----</span>
+              <button class="btn btn--ghost" id="btn-copy" data-testid="btn-copy">
+                Copy invite
+              </button>
+            </div>
 
-          <ul class="playerlist" id="lobby-players" data-testid="lobby-players"></ul>
-          <p
-            class="lobby__spectators"
-            id="lobby-spectators"
-            data-testid="lobby-spectators"
-            hidden
-          ></p>
+            <!--
+            Who can find this room. The room's own answer, repainted from every
+            lobby frame; the host can flip it, everybody else sees it.
+          -->
+            <div class="visibility" id="lobby-visibility" data-testid="lobby-visibility">
+              <div class="seg" role="group" aria-label="Who can find this room">
+                <button
+                  type="button"
+                  class="seg__btn"
+                  id="btn-visibility-private"
+                  data-testid="btn-visibility-private"
+                  aria-pressed="true"
+                >
+                  Private
+                </button>
+                <button
+                  type="button"
+                  class="seg__btn seg__btn--public"
+                  id="btn-visibility-public"
+                  data-testid="btn-visibility-public"
+                  aria-pressed="false"
+                >
+                  Public
+                </button>
+              </div>
+              <p
+                class="visibility__note"
+                id="lobby-visibility-note"
+                data-testid="lobby-visibility-note"
+              ></p>
+            </div>
+            <p class="panel__hint" id="lobby-hint" data-testid="lobby-hint">
+              Two players minimum. Anyone with the code can walk in.
+            </p>
 
-          <!--
+            <ul class="playerlist" id="lobby-players" data-testid="lobby-players"></ul>
+            <p
+              class="lobby__spectators"
+              id="lobby-spectators"
+              data-testid="lobby-spectators"
+              hidden
+            ></p>
+
+            <!--
           The whole reason one person can sit down and play.
 
           The six computer players differ enormously, so the picker has to say so
@@ -295,42 +407,53 @@
           `BOT_DIFFICULTY_LADDER` and `BOT_SPECIALISTS`, so the order shown here
           is the order a test in `packages/sim` measures.
         -->
-          <div class="botbar" id="lobby-bots" data-testid="bot-controls">
-            <label class="botbar__pick">
-              <span class="visually-hidden">Computer player</span>
-              <select
-                class="botbar__select"
-                id="select-bot-personality"
-                data-testid="select-bot-personality"
-              ></select>
-            </label>
-            <button class="btn btn--ghost" id="btn-add-bot" data-testid="btn-add-bot">
-              Add computer
-            </button>
-          </div>
-          <p class="botbar__blurb" id="bot-blurb" data-testid="bot-blurb">
-            <span class="skill" id="bot-skill" aria-hidden="true"></span>
-            <span id="bot-blurb-text"></span>
-          </p>
+            <div class="botbar" id="lobby-bots" data-testid="bot-controls">
+              <label class="botbar__pick">
+                <span class="visually-hidden">Computer player</span>
+                <select
+                  class="botbar__select"
+                  id="select-bot-personality"
+                  data-testid="select-bot-personality"
+                ></select>
+              </label>
+              <button class="btn btn--ghost" id="btn-add-bot" data-testid="btn-add-bot">
+                Add computer
+              </button>
+            </div>
+            <p class="botbar__blurb" id="bot-blurb" data-testid="bot-blurb">
+              <span class="skill" id="bot-skill" aria-hidden="true"></span>
+              <span id="bot-blurb-text"></span>
+            </p>
 
-          <!--
+            <!--
           The refusal sits directly under the control that earns it, and above
           the actions rather than below them. It used to be the last element in
           the panel, which in the one case that produces it — a room so full the
           server says no — put it below the fold of a 720px window. A message
           nobody can see is not a message.
         -->
-          <p class="panel__error" id="lobby-error" data-testid="lobby-error" hidden></p>
+            <p class="panel__error" id="lobby-error" data-testid="lobby-error" hidden></p>
 
-          <div class="panel__actions">
-            <button class="btn btn--primary" id="btn-start" data-testid="btn-start">
-              Start match
-            </button>
-            <button class="btn" id="btn-ready" data-testid="btn-ready" aria-pressed="false">
-              Ready
-            </button>
-            <button class="btn" id="btn-leave" data-testid="btn-leave">Leave</button>
+            <div class="panel__actions">
+              <button class="btn btn--primary" id="btn-start" data-testid="btn-start">
+                Start match
+              </button>
+              <button class="btn" id="btn-ready" data-testid="btn-ready" aria-pressed="false">
+                Ready
+              </button>
+              <button class="btn" id="btn-leave" data-testid="btn-leave">Leave</button>
+            </div>
           </div>
+
+          <!--
+            Lobby chat. The one chat element in the page is moved in here while
+            the lobby is up (see `ChatView.dock`), so strangers from the public
+            browser have somewhere the size of a conversation to have one.
+          -->
+          <aside class="lobby__side" data-testid="lobby-chat">
+            <p class="lobby__eyebrow">Lobby chat</p>
+            <div class="lobby__chatslot" id="lobby-chat-slot"></div>
+          </aside>
         </section>
 
         <section class="panel panel--armoury" id="panel-shop" data-testid="panel-shop" hidden>

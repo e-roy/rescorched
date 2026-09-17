@@ -762,6 +762,61 @@ body {
   color: var(--accent);
 }
 
+/*
+ * Docked in the lobby panel (`ChatView.dock`): a real conversation area rather
+ * than a comms strip. The log takes whatever height the panel has left, and
+ * says what it is for while nobody has spoken.
+ */
+.chat.chat--docked {
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 8px;
+  padding: 0;
+  background: none;
+  border-top: 0;
+  font-size: 13px;
+}
+
+.chat--docked .chat__log {
+  flex: 1 1 auto;
+  min-height: 150px;
+  max-height: none;
+  padding: 10px 12px;
+  gap: 5px;
+  background: #06080f;
+  border: 1px solid var(--panel-edge);
+  border-radius: 3px;
+  text-shadow: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--panel-edge-hot) transparent;
+}
+
+.chat--docked .chat__log:empty {
+  display: flex;
+}
+
+.chat--docked .chat__log:empty::before {
+  content: 'Nobody has said anything yet. Say hello \2014  everyone in the room reads this, spectators too.';
+  margin: auto 0;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+.chat--docked .chat__form {
+  width: 100%;
+  opacity: 1;
+}
+
+.chat--docked .chat__input,
+.chat--docked .chat__send {
+  padding: 8px 10px;
+  font-size: 13px;
+  background: #06080f;
+}
+
 /* ============================================================== overlay == */
 
 /*
@@ -1008,16 +1063,40 @@ body {
 }
 
 /*
- * The console column, standing in for the original's stack of grey Motif
- * buttons down the left edge.
+ * The deck: the console on the left and public rooms on the right, framing the
+ * sun rather than sitting on it. Both hang from the same top edge, so the
+ * rooms card can grow downward when expanded without the console moving.
+ *
+ * `top` and `bottom` make the deck's height definite, which is what lets the
+ * expanded rooms list scroll inside its card instead of running off the bottom
+ * of the window. The deck itself takes no clicks — only its two cards do — so
+ * the empty middle never shields anything underneath.
  */
-.console {
+.deck {
   position: absolute;
-  top: 50%;
+  top: clamp(176px, 27vh, 240px);
+  bottom: 36px;
   left: clamp(16px, 5vw, 84px);
-  transform: translateY(-46%);
-  width: min(300px, 42vw);
-  padding: 18px;
+  right: clamp(16px, 5vw, 84px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.deck > * {
+  max-height: 100%;
+  pointer-events: auto;
+}
+
+/*
+ * The console column, standing in for the original's stack of grey Motif
+ * buttons down the left edge — and its twin on the right, the public rooms.
+ */
+.console,
+.lobbies {
   background: linear-gradient(180deg, rgba(28, 31, 44, 0.9) 0%, rgba(12, 14, 24, 0.9) 100%);
   border: 1px solid rgba(255, 255, 255, 0.34);
   border-radius: 5px;
@@ -1025,7 +1104,13 @@ body {
     inset 0 1px 0 rgba(255, 255, 255, 0.3),
     inset 0 -1px 0 rgba(0, 0, 0, 0.6),
     0 18px 44px rgba(0, 0, 0, 0.45);
-  z-index: 3;
+}
+
+.console {
+  flex: 0 0 auto;
+  width: min(300px, 42vw);
+  padding: 18px;
+  overflow-y: auto;
 }
 
 .console__rule {
@@ -1049,6 +1134,64 @@ body {
 
 .console .btn {
   width: 100%;
+}
+
+/* A checkbox drawn to match the console rather than the browser's default. */
+.check {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 2px 0 12px;
+  font-size: 12px;
+  color: var(--ink-dim);
+  cursor: pointer;
+  user-select: none;
+}
+
+.check input {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.check__box {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  background: #06080f;
+  border: 1px solid var(--panel-edge-hot);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.check input:checked + .check__box {
+  background: var(--accent-cool);
+  border-color: var(--accent-cool);
+}
+
+.check input:checked + .check__box::after {
+  content: '\2713';
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: #03161a;
+}
+
+.check input:focus-visible + .check__box {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.check strong {
+  color: var(--ink);
 }
 
 /* -------------------------------------------------------------- controls */
@@ -1159,12 +1302,113 @@ body {
  * seat count. Before this, eight seats pushed `lobby-error` to y=737 in a 720px
  * window — present, non-zero, and invisible.
  */
+/*
+ * Two columns: the room on the left, its conversation on the right. The grid
+ * row is `minmax(0, 1fr)` for the same reason the overlay's is — a definite
+ * row is what lets `max-height: 100%` actually cap the panel, and so what lets
+ * the seat list (not the Start button) be the part that scrolls in a full room.
+ */
 .panel--lobby {
-  width: min(470px, 100%);
+  width: min(880px, 100%);
   max-height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(250px, 330px);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 24px;
+  min-height: 0;
+}
+
+.panel--lobby[hidden] {
+  display: none;
+}
+
+.lobby__main {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+}
+
+.lobby__side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding-left: 24px;
+  border-left: 1px solid var(--panel-edge);
+}
+
+.lobby__chatslot {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel--lobby[data-visibility='public'] .lobby__main .lobby__eyebrow {
+  color: var(--accent-cool);
+}
+
+/* -- who can find the room -- */
+
+.visibility {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.seg {
+  display: inline-flex;
+  flex: 0 0 auto;
+  border: 1px solid var(--panel-edge-hot);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.seg__btn {
+  padding: 6px 12px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  background: #06080f;
+  border: 0;
+  cursor: pointer;
+}
+
+.seg__btn + .seg__btn {
+  border-left: 1px solid var(--panel-edge-hot);
+}
+
+.seg__btn:hover:not(:disabled):not([aria-pressed='true']) {
+  color: var(--accent);
+}
+
+.seg__btn[aria-pressed='true'] {
+  color: #1a0d00;
+  background: var(--accent);
+}
+
+.seg__btn--public[aria-pressed='true'] {
+  color: #03161a;
+  background: var(--accent-cool);
+}
+
+.seg__btn:disabled {
+  cursor: not-allowed;
+}
+
+.seg__btn:disabled:not([aria-pressed='true']) {
+  opacity: 0.45;
+}
+
+.visibility__note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--ink-dim);
 }
 
 .lobby__eyebrow {
@@ -1450,6 +1694,232 @@ body {
   color: var(--warn);
   border: 1px solid rgba(255, 196, 0, 0.5);
   border-radius: 2px;
+}
+
+/* -------------------------------------------------- public rooms card */
+
+.lobbies {
+  flex: 0 1 auto;
+  width: min(360px, 40vw);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 16px 18px 18px;
+}
+
+.lobbies__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lobbies__heading {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+
+/* The "is anybody playing?" light. Grey until there is somebody to find. */
+.lobbies__live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.lobbies__live:empty {
+  display: none;
+}
+
+.lobbies__live::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+
+.lobbies[data-state='rooms'] .lobbies__live {
+  color: var(--ok);
+}
+
+.lobbies[data-state='rooms'] .lobbies__live::before {
+  background: var(--ok);
+  animation: live-pulse 2s ease-out infinite;
+}
+
+@keyframes live-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.6);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(76, 175, 80, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(76, 175, 80, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lobbies[data-state='rooms'] .lobbies__live::before {
+    animation: none;
+  }
+}
+
+.lobbies__summary {
+  margin: 8px 0 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-dim);
+}
+
+.lobbies__more {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding: 7px 10px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--accent-cool);
+  background: transparent;
+  border: 1px dashed rgba(77, 225, 232, 0.45);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.lobbies__more:hover {
+  background: rgba(77, 225, 232, 0.08);
+}
+
+.lobbies__more[hidden] {
+  display: none;
+}
+
+.lobbies__empty {
+  padding: 14px;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: center;
+  color: var(--ink-dim);
+  border: 1px dashed var(--panel-edge-hot);
+  border-radius: 3px;
+}
+
+.lobbies__empty p {
+  margin: 0 0 10px;
+}
+
+.lobbies__empty[hidden] {
+  display: none;
+}
+
+/* One room, one line of intent: who, how full, and the button. */
+.roomlist {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--panel-edge-hot) transparent;
+}
+
+.roomlist[hidden] {
+  display: none;
+}
+
+.roomlist li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: #06080f;
+  border: 1px solid var(--panel-edge);
+  border-radius: 3px;
+}
+
+.roomlist li[data-status='playing'] {
+  border-style: dashed;
+}
+
+.roomlist__info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.roomlist__title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.roomlist__host {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.roomlist__code {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+}
+
+.roomlist__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11px;
+  white-space: nowrap;
+  color: var(--ink-dim);
+}
+
+.roomlist__tag {
+  padding: 1px 5px;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ok);
+  border: 1px solid rgba(76, 175, 80, 0.5);
+  border-radius: 2px;
+}
+
+.roomlist li[data-status='full'] .roomlist__tag {
+  color: var(--warn);
+  border-color: rgba(255, 196, 0, 0.5);
+}
+
+.roomlist li[data-status='playing'] .roomlist__tag {
+  color: var(--accent-cool);
+  border-color: rgba(77, 225, 232, 0.5);
+}
+
+.roomlist .btn {
+  flex: none;
+  min-width: 68px;
+  padding: 7px 12px;
+  font-size: 12px;
 }
 
 /* -------------------------------------------------------------- armoury */
@@ -1836,11 +2306,17 @@ body:has(#conn-banner:not([hidden])) .chat {
     margin-left: 0;
   }
 
-  .console {
+  .deck {
     position: static;
-    transform: none;
-    width: min(340px, 100%);
-    margin: 0 auto;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 16px;
+    width: min(360px, 100%);
+  }
+
+  .console,
+  .lobbies {
+    width: 100%;
   }
 
   .panel--title {
@@ -1853,5 +2329,21 @@ body:has(#conn-banner:not([hidden])) .chat {
 
   .chat {
     display: none;
+  }
+
+  /* Docked in the lobby the chat is the conversation, not chrome over a map. */
+  .chat.chat--docked:not([hidden]) {
+    display: flex;
+  }
+
+  .panel--lobby {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+  }
+
+  .lobby__side {
+    padding: 16px 0 0;
+    border-left: 0;
+    border-top: 1px solid var(--panel-edge);
   }
 }

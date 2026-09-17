@@ -28,6 +28,8 @@ import {
   PROTOCOL_VERSION,
   ServerErrorCodeSchema,
   type ClientMessage,
+  type PublicRoom,
+  type RoomVisibility,
   type ServerErrorCode,
   type ServerMessage,
 } from '@scorched/protocol';
@@ -56,6 +58,7 @@ import {
 } from '@scorched/sim';
 
 import { estimatePlaybackMs } from './playback.ts';
+import { directoryStub, type Listing, type ListingReport } from './room-directory.ts';
 import { generateSessionId, seedFromRoom } from './room-code.ts';
 
 /**
@@ -282,7 +285,16 @@ interface RoomMeta {
    * indistinguishable from one that is simply quiet.
    */
   opened?: boolean;
+  /**
+   * Whether the room browser lists this room. Absent means private, which is
+   * what every room was before the browser existed. Set by the claim that
+   * created the room and afterwards only by the host — see `setVisibility`.
+   */
+  visibility?: RoomVisibility;
 }
+
+/** What this room last told the directory. See `refreshListing`. */
+const NO_LISTING: Listing = { version: 0, entry: null };
 
 /**
  * A deliberately tiny mirror of the parts of the game state the *room* needs to
@@ -340,6 +352,7 @@ function clockFor(phase: GamePhase): number | null {
 export class GameRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
   private readonly sql: SqlStorage;
+  private readonly env: Env;
 
   /**
    * In-memory only, and deliberately so — see `consumeRateLimit`. This is the
@@ -347,8 +360,9 @@ export class GameRoom implements DurableObject {
    */
   private readonly rateBuckets = new Map<string, RateBucket>();
 
-  constructor(ctx: DurableObjectState, _env: Env) {
+  constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
+    this.env = env;
     this.sql = ctx.storage.sql;
 
     // Runs on every wake-up, including after hibernation. Cheap and idempotent.
@@ -428,6 +442,7 @@ export class GameRoom implements DurableObject {
         spectators: this.countSpectators(),
         inProgress: this.matchInProgress(),
         phase: this.readTurnInfo().phase,
+        visibility: meta.visibility ?? 'private',
       });
     }
 
@@ -448,9 +463,29 @@ export class GameRoom implements DurableObject {
       const occupied = this.readPlayers().length > 0 || this.matchInProgress();
       if (!occupied) {
         const roomCode = url.searchParams.get('room') ?? meta.roomCode;
-        this.writeMeta({ ...meta, roomCode, opened: true });
+        // A reclaimed code is a new room, and a new room is whatever its
+        // creator asked for — not whatever the last room on this code was.
+        const visibility: RoomVisibility =
+          url.searchParams.get('visibility') === 'public' ? 'public' : 'private';
+        this.writeMeta({ ...meta, roomCode, opened: true, visibility });
       }
       return Response.json({ claimed: !occupied });
+    }
+
+    /*
+     * The directory re-checking a listing it has stopped trusting.
+     *
+     * Answered from the live sockets, and the answer is RECORDED before it is
+     * returned. That second half is what keeps the room's idea of what it last
+     * reported equal to what the directory now holds; without it, a listing the
+     * directory corrected here would never be pushed again, because as far as
+     * this room's own record knew, nothing had changed.
+     *
+     * Internal only, like `/claim`: the Worker does not route to it.
+     */
+    if (url.pathname.endsWith('/listing')) {
+      this.refreshListing();
+      return Response.json(this.readKv<Listing>('listing', NO_LISTING));
     }
 
     return new Response('Not found', { status: 404 });
@@ -540,6 +575,7 @@ export class GameRoom implements DurableObject {
 
     this.promoteHostIfNeeded(left ? 'host_left' : 'host_disconnected', ws);
     this.broadcastLobby(ws);
+    await this.syncListing(ws);
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
@@ -705,11 +741,15 @@ export class GameRoom implements DurableObject {
         return;
 
       case 'addBot':
-        this.handleAddBot(ws, joined, message.personality ?? DEFAULT_BOT_PERSONALITY);
+        await this.handleAddBot(ws, joined, message.personality ?? DEFAULT_BOT_PERSONALITY);
         return;
 
       case 'removeBot':
-        this.handleRemoveBot(ws, joined, message.playerId);
+        await this.handleRemoveBot(ws, joined, message.playerId);
+        return;
+
+      case 'setVisibility':
+        await this.handleSetVisibility(ws, joined, message.visibility);
         return;
 
       case 'aim': {
@@ -839,6 +879,7 @@ export class GameRoom implements DurableObject {
       // arrives with it is the real deadline rather than a stopped one.
       await this.restartClockIfStopped();
       this.sendLiveState(ws);
+      await this.syncListing();
       return;
     }
 
@@ -896,6 +937,7 @@ export class GameRoom implements DurableObject {
     // A finished match is still worth seeing: whoever walks in next gets the
     // final board rather than an empty screen.
     this.sendLiveState(ws);
+    await this.syncListing();
   }
 
   /**
@@ -910,11 +952,11 @@ export class GameRoom implements DurableObject {
    * existing error codes rather than new ones; nothing here is a new KIND of
    * refusal.
    */
-  private handleAddBot(
+  private async handleAddBot(
     ws: WebSocket,
     attachment: JoinedAttachment,
     personality: BotPersonality,
-  ): void {
+  ): Promise<void> {
     if (this.rejectSpectator(ws, attachment)) return;
 
     const meta = this.readMeta();
@@ -944,10 +986,15 @@ export class GameRoom implements DurableObject {
     });
     this.writePlayers(players);
     this.broadcastLobby();
+    await this.syncListing();
   }
 
   /** Free a seat a computer player is sitting in. Host only, lobby only. */
-  private handleRemoveBot(ws: WebSocket, attachment: JoinedAttachment, playerId: string): void {
+  private async handleRemoveBot(
+    ws: WebSocket,
+    attachment: JoinedAttachment,
+    playerId: string,
+  ): Promise<void> {
     if (this.rejectSpectator(ws, attachment)) return;
 
     const meta = this.readMeta();
@@ -972,6 +1019,36 @@ export class GameRoom implements DurableObject {
 
     this.writePlayers(players.filter((player) => player.id !== playerId));
     this.broadcastLobby();
+    await this.syncListing();
+  }
+
+  /**
+   * List the room in the public browser, or take it out of it.
+   *
+   * Host only, for the same reason as `start`: who can walk in is a decision
+   * about the room everybody is sitting in. Any phase, though — unlike seats,
+   * visibility changes nothing about a match already dealt, and a host who
+   * wants spectators for a match in progress should be able to open the doors.
+   *
+   * Setting the value it already has costs nothing: no write, no broadcast.
+   */
+  private async handleSetVisibility(
+    ws: WebSocket,
+    attachment: JoinedAttachment,
+    visibility: RoomVisibility,
+  ): Promise<void> {
+    if (this.rejectSpectator(ws, attachment)) return;
+
+    const meta = this.readMeta();
+    if (meta.hostId !== null && meta.hostId !== attachment.playerId) {
+      this.sendError(ws, 'not_host', 'Only the host can change who can find this room');
+      return;
+    }
+    if ((meta.visibility ?? 'private') === visibility) return;
+
+    this.writeMeta({ ...meta, visibility });
+    this.broadcastLobby();
+    await this.syncListing();
   }
 
   private async handleStart(ws: WebSocket, attachment: JoinedAttachment): Promise<void> {
@@ -1030,6 +1107,8 @@ export class GameRoom implements DurableObject {
     await this.commitState(settled.state, { timeoutStreak: 0, expiredTurn: null });
     this.broadcast({ t: 'state', snapshot: toSnapshot(settled.state) });
     this.broadcastTurnTimer(settled.state);
+    // Listed rooms say "in play" now, so a browser stops offering seats in it.
+    await this.syncListing();
   }
 
   private async handleFire(
@@ -1281,6 +1360,7 @@ export class GameRoom implements DurableObject {
     await this.ctx.storage.deleteAlarm();
     this.broadcast({ t: 'error', code: 'room_closed', message: 'The match was abandoned' });
     this.broadcastLobby();
+    await this.syncListing();
   }
 
   /**
@@ -1412,7 +1492,11 @@ export class GameRoom implements DurableObject {
     });
     this.broadcastTurnTimer(settled.state);
 
-    if (settled.state.phase === 'gameover') this.broadcastMatchResult(settled.state);
+    if (settled.state.phase === 'gameover') {
+      this.broadcastMatchResult(settled.state);
+      // A finished match is a lobby again: whoever walks in takes a seat.
+      await this.syncListing();
+    }
   }
 
   private broadcastTurnTimer(state: GameState, target?: WebSocket): void {
@@ -1637,6 +1721,86 @@ export class GameRoom implements DurableObject {
   }
 
   // -------------------------------------------------------------------------
+  // The public room browser.
+  // -------------------------------------------------------------------------
+
+  /**
+   * What the room browser should say about this room right now, or null for
+   * "do not list it".
+   *
+   * Decided from the sockets the room is actually holding, not from the seat
+   * list, because a seat outlives its connection: a match whose people have all
+   * closed their tabs still has every seat in storage, and listing it would send
+   * a stranger into a room with nobody in it. A room is listed while at least
+   * one PERSON is connected to a seat in it — computer players and spectators
+   * alone do not count. `except` is a socket that is closing as this runs.
+   */
+  private listingEntry(except?: WebSocket): PublicRoom | null {
+    const meta = this.readMeta();
+    if (meta.visibility !== 'public' || meta.roomCode === '') return null;
+
+    const connected = this.connectedPlayerIds(except);
+    const players = this.readPlayers();
+    const present = players.filter((player) => player.bot === null && connected.has(player.id));
+    const host = present.find((player) => player.id === meta.hostId) ?? present[0];
+    if (host === undefined) return null;
+
+    return {
+      roomCode: meta.roomCode,
+      hostName: host.name,
+      players: players.length,
+      bots: players.filter((player) => player.bot !== null).length,
+      maxPlayers: MAX_PLAYERS,
+      status: this.matchInProgress() ? 'playing' : 'lobby',
+    };
+  }
+
+  /**
+   * Record this room's listing if it changed, and return the report to send.
+   *
+   * Runs on every seat change, and most seat changes change nothing a browser
+   * shows (a private room's always come back null), so the usual cost is one
+   * point read and no write. The version is bumped in the SAME synchronous step
+   * as the record, which is what lets the directory order two reports that race
+   * each other there.
+   */
+  private refreshListing(except?: WebSocket): ListingReport | null {
+    const stored = this.readKv<Listing>('listing', NO_LISTING);
+    const entry = this.listingEntry(except);
+    if (JSON.stringify(entry) === JSON.stringify(stored.entry)) return null;
+
+    const next: Listing = { version: stored.version + 1, entry };
+    this.writeKv('listing', next);
+    const roomCode = entry?.roomCode ?? stored.entry?.roomCode ?? this.readMeta().roomCode;
+    return { roomCode, ...next };
+  }
+
+  /**
+   * Tell the directory, if there is anything to tell it.
+   *
+   * Never throws. The listing is a convenience, and a directory that is slow or
+   * down must not cost anybody a seat or a turn. A report lost here is recovered
+   * by the directory's own re-check — see `RoomDirectory`.
+   */
+  private async syncListing(except?: WebSocket): Promise<void> {
+    const report = this.refreshListing(except);
+    if (report === null) return;
+    try {
+      const response = await directoryStub(this.env).fetch(
+        new Request('https://directory/report', {
+          method: 'POST',
+          body: JSON.stringify(report),
+        }),
+      );
+      // Drained: an unread body holds the request open, and an object with a
+      // request in flight cannot hibernate.
+      await response.text();
+    } catch (error) {
+      console.error('GameRoom could not update the room directory', error);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Broadcast helpers.
   // -------------------------------------------------------------------------
 
@@ -1718,6 +1882,7 @@ export class GameRoom implements DurableObject {
         t: 'lobby',
         roomCode: meta.roomCode || 'AAAA',
         hostId: meta.hostId,
+        visibility: meta.visibility ?? 'private',
         players: players.map((player) => ({
           id: player.id,
           name: player.name,

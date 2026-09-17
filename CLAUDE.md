@@ -30,7 +30,7 @@ players to disagree about who died.
 | `packages/sim`      | terrain, physics, weapons, detonation, turn machine, economy, seeded RNG | anything platform-specific      |
 | `packages/protocol` | Zod schema for every WebSocket message, both directions                  | game rules                      |
 | `packages/config`   | shared tsconfig                                                          | code                            |
-| `apps/server`       | Worker routes + the `GameRoom` Durable Object                            | game rules (they belong in sim) |
+| `apps/server`       | Worker routes, `GameRoom` DO, `RoomDirectory` DO (public room list)      | game rules (they belong in sim) |
 | `apps/client`       | Phaser rendering, DOM menus, input, socket                               | game rules (they belong in sim) |
 | `e2e`               | Playwright against a real `wrangler dev`                                 | unit tests                      |
 | `scripts`           | dependency-free maintenance scripts                                      | build steps                     |

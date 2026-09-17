@@ -20,6 +20,11 @@
         "name": "GAME_ROOM",
         "class_name": "GameRoom",
       },
+      // One instance, by name: the list of public rooms the browser reads.
+      {
+        "name": "ROOM_DIRECTORY",
+        "class_name": "RoomDirectory",
+      },
     ],
   },
 
@@ -28,6 +33,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["GameRoom"],
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["RoomDirectory"],
     },
   ],
 

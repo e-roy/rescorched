@@ -541,6 +541,64 @@ export async function cheat(
   );
 }
 
+/**
+ * Open `count` public rooms from inside this page, and hold them open.
+ *
+ * Raw sockets rather than more browser contexts, and that is not an
+ * optimisation. A page that is not the front one is a page Chrome may freeze,
+ * and a frozen page's socket closes with "going away" — which frees the seat,
+ * empties the room and takes it off the public list. A test that wanted several
+ * rooms listed for a minute therefore watched them wink out one by one, and the
+ * server was right to do it: a room everybody has left is not a room to send
+ * somebody into.
+ *
+ * The sockets are parked on `window`, so they live as long as the page does and
+ * die with it — no cleanup, and nothing for a later test to inherit.
+ */
+export async function hostPublicRooms(page: Page, count: number): Promise<string[]> {
+  return page.evaluate(
+    async ({ count: howMany, version }) => {
+      const held = ((window as unknown as { __heldRooms?: WebSocket[] }).__heldRooms ??= []);
+      const codes: string[] = [];
+
+      for (let index = 0; index < howMany; index += 1) {
+        const created = await fetch('/api/rooms', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ visibility: 'public' }),
+        });
+        const { roomCode } = (await created.json()) as { roomCode: string };
+
+        const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const socket = new WebSocket(`${scheme}//${location.host}/api/rooms/${roomCode}/ws`);
+        await new Promise<void>((resolve, reject) => {
+          const failed = setTimeout(() => reject(new Error(`${roomCode} never opened`)), 10_000);
+          socket.addEventListener('open', () => {
+            socket.send(
+              JSON.stringify({ t: 'hello', protocol: version, name: `Host ${index + 1}` }),
+            );
+          });
+          // The welcome is the room agreeing it has somebody in it, which is
+          // what makes it listable. Resolving on 'open' would race the listing.
+          socket.addEventListener('message', () => {
+            clearTimeout(failed);
+            resolve();
+          });
+          socket.addEventListener('error', () => {
+            clearTimeout(failed);
+            reject(new Error(`${roomCode} refused a socket`));
+          });
+        });
+
+        held.push(socket);
+        codes.push(roomCode);
+      }
+      return codes;
+    },
+    { count, version: PROTOCOL_VERSION },
+  );
+}
+
 export interface Placement {
   /** Is the whole control inside the window, or is part of it below the fold? */
   readonly onScreen: boolean;

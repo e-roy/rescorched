@@ -23,6 +23,7 @@ import {
   waitForOurTurn,
   waitForSnapshot,
   waitForTurnAfter,
+  hostPublicRooms,
   type GameSnapshotLike,
 } from './helpers.ts';
 
@@ -128,6 +129,64 @@ test.describe('visual capture', () => {
     await joinRoom(bob, roomCode);
     await stabilise(alice.page);
     await capture(alice.page, '02-lobby');
+    await alice.context.close();
+    await bob.context.close();
+  });
+
+  /*
+   * Public rooms, from both ends: the title screen a stranger opens — with more
+   * rooms than the card shows, so the collapsed and expanded states are both on
+   * record — and the lobby they walk into, with the conversation that is the
+   * point of meeting there.
+   */
+  test('public rooms: the title screen, and a lobby that talks', async ({ browser }) => {
+    test.setTimeout(120_000);
+
+    // One real host, because the lobby half of this capture needs two people
+    // talking; the rest are held open from Bob's own page (`hostPublicRooms`),
+    // which is also what stops them winking out while the shutter waits.
+    const alice = await openPlayer(browser, 'Alice');
+    await alice.page.getByTestId('input-public').check();
+    const roomCode = await createRoom(alice);
+    // A computer player, so the card has a CPU count to show.
+    await alice.page.getByTestId('btn-add-bot').click();
+    await expect(alice.page.getByTestId('lobby-players').locator('li')).toHaveCount(2);
+
+    const bob = await openPlayer(browser, 'Bob');
+    const held = await hostPublicRooms(bob.page, 4);
+    await expect
+      .poll(
+        async () => {
+          return Number(
+            (await bob.page.getByTestId('title-rooms-list').getAttribute('data-total')) ?? '0',
+          );
+        },
+        { timeout: 40_000 },
+      )
+      .toBeGreaterThanOrEqual(held.length + 1);
+    await stabilise(bob.page);
+    await capture(bob.page, '01b-title-public-rooms');
+
+    await bob.page.getByTestId('btn-rooms-more').click();
+    await expect(bob.page.getByTestId(`public-room-${roomCode}`)).toBeVisible();
+    await stabilise(bob.page);
+    await capture(bob.page, '01c-title-public-rooms-expanded');
+
+    await bob.page.getByTestId(`btn-join-${roomCode}`).click();
+    await expect(bob.page.getByTestId('lobby-code')).toHaveText(roomCode, { timeout: 15_000 });
+
+    await bob.page.getByTestId('chat-input').fill('hi! first time playing this');
+    await bob.page.getByTestId('chat-send').click();
+    await expect(alice.page.getByTestId('chat-log')).toContainText('first time playing');
+    await alice.page.getByTestId('chat-input').fill('welcome — mind the wind, it is brutal');
+    await alice.page.getByTestId('chat-send').click();
+    await expect(bob.page.getByTestId('chat-log')).toContainText('mind the wind');
+
+    await stabilise(alice.page);
+    await capture(alice.page, '02f-public-lobby-host');
+    await stabilise(bob.page);
+    await capture(bob.page, '02g-public-lobby-guest');
+
     await alice.context.close();
     await bob.context.close();
   });

@@ -1,14 +1,19 @@
 /**
  * Worker entry point.
  *
- * Two jobs only: hand out room codes, and route WebSocket upgrades to the right
- * Durable Object. Everything else is a static asset served by Workers Static
- * Assets (unmetered), or game logic inside the DO.
+ * Three jobs only: hand out room codes, route WebSocket upgrades to the right
+ * Durable Object, and serve the public room list. Everything else is a static
+ * asset served by Workers Static Assets (unmetered), or game logic inside the
+ * DO.
  */
 
-import { allocateRoomCode, isValidRoomCode } from './room-code.ts';
+import { MAX_CREATE_ROOM_BODY_BYTES, parseCreateRoomRequest } from '@scorched/protocol';
+import { readBoundedText } from './http.ts';
+import { directoryStub } from './room-directory.ts';
+import { allocateRoomCode, generateRoomCode, isValidRoomCode } from './room-code.ts';
 
 export { GameRoom } from './game-room.ts';
+export { RoomDirectory } from './room-directory.ts';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' } as const;
 
@@ -16,10 +21,30 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // POST /api/rooms  →  { roomCode }
+    // POST /api/rooms  { visibility? }  →  { roomCode }
     if (url.pathname === '/api/rooms' && request.method === 'POST') {
-      const roomCode = await allocateRoomCode(env);
+      const body = await readBoundedText(request, MAX_CREATE_ROOM_BODY_BYTES);
+      if (body === null) return new Response('Request body too large', { status: 413 });
+      const parsed = parseCreateRoomRequest(body);
+      if (!parsed.ok) return new Response(parsed.error, { status: 400 });
+
+      const roomCode = await allocateRoomCode(
+        env,
+        generateRoomCode,
+        parsed.value.visibility ?? 'private',
+      );
       return new Response(JSON.stringify({ roomCode }), { headers: JSON_HEADERS });
+    }
+
+    // GET /api/rooms/public  →  { rooms: PublicRoom[] }
+    if (url.pathname === '/api/rooms/public' && request.method === 'GET') {
+      const listed = await directoryStub(env).fetch(new Request('https://directory/list'));
+      // Never cached: a listing is a picture of who is sitting in a lobby right
+      // now, and a stale one is a Join button for a room that already started.
+      return new Response(listed.body, {
+        status: listed.status,
+        headers: { ...JSON_HEADERS, 'cache-control': 'no-store' },
+      });
     }
 
     // GET /api/rooms/:code/ws     → WebSocket upgrade into the room

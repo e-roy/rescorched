@@ -9,9 +9,12 @@
 
 import {
   encodeClientMessage,
+  parsePublicRoomList,
   parseServerMessage,
   PROTOCOL_VERSION,
   type ClientMessage,
+  type PublicRoom,
+  type RoomVisibility,
   type ServerMessage,
 } from '@scorched/protocol';
 
@@ -249,13 +252,32 @@ function storeSession(roomCode: string, sessionId: string): void {
   }
 }
 
-/** Ask the Worker for a fresh room code. */
-export async function createRoom(): Promise<string> {
-  const response = await fetch('/api/rooms', { method: 'POST' });
+/** Ask the Worker for a fresh room code — listed in the browser, or not. */
+export async function createRoom(visibility: RoomVisibility = 'private'): Promise<string> {
+  const response = await fetch('/api/rooms', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ visibility }),
+  });
   if (!response.ok) throw new Error(`Could not create a room (HTTP ${response.status})`);
   const data = (await response.json()) as { roomCode?: unknown };
   if (typeof data.roomCode !== 'string' || !/^[A-Z]{4}$/.test(data.roomCode)) {
     throw new Error('Server returned an invalid room code');
   }
   return data.roomCode;
+}
+
+/**
+ * The public rooms open right now.
+ *
+ * Validated like every socket frame, because it is the same kind of thing: text
+ * from the server that is about to become DOM. Throws with a sentence a player
+ * can read, which the browser shows in place of the list.
+ */
+export async function listPublicRooms(): Promise<PublicRoom[]> {
+  const response = await fetch('/api/rooms/public', { cache: 'no-store' });
+  if (!response.ok) throw new Error(`Could not load public rooms (HTTP ${response.status})`);
+  const parsed = parsePublicRoomList(await response.text());
+  if (!parsed.ok) throw new Error(`The room list did not make sense: ${parsed.error}`);
+  return parsed.value.rooms;
 }

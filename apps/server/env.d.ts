@@ -11,6 +11,7 @@ declare global {
   namespace Cloudflare {
     interface Env {
       GAME_ROOM: DurableObjectNamespace<import('./src/game-room.ts').GameRoom>;
+      ROOM_DIRECTORY: DurableObjectNamespace<import('./src/room-directory.ts').RoomDirectory>;
       ASSETS: Fetcher;
     }
   }
