@@ -36,20 +36,23 @@ function tankBox(tank: { x: number; y: number }) {
 /**
  * Convert a canvas rectangle into a page rectangle.
  *
- * Phaser FIT-scales a fixed 1280x720 world into whatever box it is given, so a
- * snapshot coordinate is not a page coordinate.
+ * Phaser scales the 1280x720 world into whatever box it is given, and a wide
+ * window trims sky off the top (`MAX_SKY_TRIM`), so a snapshot coordinate is
+ * not a page coordinate. The canvas always shows the BOTTOM of the world, so y
+ * is measured up from the canvas's bottom edge.
  */
 async function clipFor(
   page: Page,
   region: { x: number; y: number; width: number; height: number },
   worldWidth: number,
+  worldHeight = 720,
 ) {
   const box = await page.locator('#game-root canvas').boundingBox();
   expect(box).not.toBeNull();
   const scale = box!.width / worldWidth;
   return {
     x: box!.x + region.x * scale,
-    y: box!.y + region.y * scale,
+    y: box!.y + box!.height - (worldHeight - region.y) * scale,
     width: region.width * scale,
     height: region.height * scale,
   };
@@ -74,20 +77,8 @@ test.describe('aiming is visible', () => {
     const shooter = snapshot.tanks[snapshot.activeTank];
     expect(shooter).toBeDefined();
 
-    const canvas = page.locator('#game-root canvas');
-    const box = await canvas.boundingBox();
-    expect(box).not.toBeNull();
-
-    // The canvas is letterboxed by Phaser's FIT scaling, so a snapshot
-    // coordinate is not a page coordinate. Convert through the displayed size.
-    const scale = box!.width / snapshot.terrain.width;
-    const region = tankBox(shooter!);
-    const clip = {
-      x: box!.x + region.x * scale,
-      y: box!.y + region.y * scale,
-      width: region.width * scale,
-      height: region.height * scale,
-    };
+    const { width: worldWidth, height: worldHeight } = snapshot.terrain;
+    const clip = await clipFor(page, tankBox(shooter!), worldWidth, worldHeight);
 
     await setAim(page, 20, 60);
     await page.waitForTimeout(120);
@@ -106,12 +97,12 @@ test.describe('aiming is visible', () => {
     // And it must be the barrel moving, not a stray animation: at 85 degrees
     // the barrel stands almost straight up, so the strip directly above the
     // turret must gain ink that is not there at 20 degrees.
-    const above = {
-      x: box!.x + (shooter!.x - 4) * scale,
-      y: box!.y + (shooter!.y - 34) * scale,
-      width: 8 * scale,
-      height: 14 * scale,
-    };
+    const above = await clipFor(
+      page,
+      { x: shooter!.x - 4, y: shooter!.y - 34, width: 8, height: 14 },
+      worldWidth,
+      worldHeight,
+    );
     await setAim(page, 20, 60);
     await page.waitForTimeout(120);
     const aboveLow = await page.screenshot({ clip: above });

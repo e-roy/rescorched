@@ -624,6 +624,7 @@ export class Ui {
           message.name,
           message.text,
           colorIndex === undefined ? null : colorCss(colorIndex),
+          message.playerId === this.you,
         );
         return;
       }

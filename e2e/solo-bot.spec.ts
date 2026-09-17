@@ -18,11 +18,13 @@
  *  - a FULL room — eight seats, which is what this feature lets one person
  *    produce on their own — still has a clickable Start button and a refusal
  *    that is on the screen rather than merely in the document.
- *  - the chat bar does not sit on the battlefield.
+ *  - chat floats over the battlefield without taking clicks or space from it.
+ *  - the playfield fills the window, and the sky it trims to do that never
+ *    takes the ground with it.
  *  - a computer player firing while your own shot is still animating cannot
  *    rewind the board.
  *
- * The last three are measurements, not eyeballs: rectangles, hit tests and a
+ * The last four are measurements, not eyeballs: rectangles, hit tests and a
  * turn counter. Every one of them regressed once already.
  */
 
@@ -567,49 +569,215 @@ test.describe('one person, one computer player, no second browser', () => {
     await solo.context.close();
   });
 
-  test('the chat bar does not sit on the battlefield', async ({ browser }) => {
+  test('chat floats over the playfield without costing a player the map', async ({ browser }) => {
     test.setTimeout(120_000);
 
+    const solo = await openPlayer(browser, 'Solo');
+    const page = solo.page;
+    await page.setViewportSize({ width: 1902, height: 985 });
+    await createRoom(solo);
+    await addBot(page, 'shooter');
+    await startMatch(solo);
+    const snapshot = await waitForSnapshot(page);
+
+    // The box is always there to type in: clickable without pressing anything.
+    const input = page.getByTestId('chat-input');
+    await expectClickable(page, 'chat-input');
+
+    /*
+     * …and it is always there without ever standing on a tank. It lives in the
+     * bottom corner, below the LOWEST ground on the map: tanks stand on ground,
+     * so nothing a player needs to see is under it. Polled, because the canvas
+     * settles under the HUD a frame after the match appears.
+     */
+    await expect
+      .poll(
+        () =>
+          page.evaluate(
+            ({ worldWidth, worldHeight, lowestGround }) => {
+              const canvas = document.querySelector('#game-root canvas')!.getBoundingClientRect();
+              const box = document.querySelector('#chat-input')!.getBoundingClientRect();
+              const scale = canvas.width / worldWidth;
+              // The camera shows the bottom of the world; measure up from there.
+              const groundY = canvas.bottom - (worldHeight - lowestGround) * scale;
+              return box.top >= groundY && box.bottom <= canvas.bottom;
+            },
+            {
+              worldWidth: snapshot.terrain.width,
+              worldHeight: snapshot.terrain.height,
+              lowestGround: Math.max(...snapshot.terrain.surface),
+            },
+          ),
+        { message: 'the chat input is standing on the ground a tank could be on' },
+      )
+      .toBe(true);
+
+    // T gets you into it and Enter sends; the box stays for the next line.
+    const lines = Array.from({ length: 12 }, (_, index) => `line ${index + 1} of the chat`);
+    for (const line of lines) {
+      await page.keyboard.press('t');
+      await expect(input).toBeFocused();
+      await input.fill(line);
+      await page.keyboard.press('Enter');
+      await expect(input).not.toBeFocused();
+    }
+    await expect(page.getByTestId('chat-log')).toContainText('line 12 of the chat');
+    await expectClickable(page, 'chat-input');
+
+    /*
+     * The feed under the box is on the MAP — not hanging in a gutter beside it —
+     * and never takes a click from the map. Every visible line is hit-tested:
+     * what is under its middle must be the canvas.
+     */
+    const collapsed = await page.evaluate(() => {
+      const canvas = document.querySelector('#game-root canvas')!.getBoundingClientRect();
+      const chat = document.querySelector('#chat')!.getBoundingClientRect();
+      const visible = Array.from(
+        document.querySelectorAll<HTMLElement>('#chat-log .chat__line'),
+      ).filter((line) => line.getClientRects().length > 0);
+      return {
+        insideField:
+          chat.left >= canvas.left &&
+          chat.right <= canvas.right &&
+          chat.top >= canvas.top &&
+          chat.bottom <= canvas.bottom,
+        chatHeight: chat.height,
+        fieldHeight: canvas.height,
+        hits: visible.map((line) => {
+          const r = line.getBoundingClientRect();
+          return document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)?.tagName;
+        }),
+      };
+    });
+    expect(collapsed.insideField, 'the chat is not over the playfield').toBe(true);
+    expect(collapsed.hits.length).toBeGreaterThan(0);
+    expect(collapsed.hits, 'the chat feed takes clicks from the map').toEqual(
+      collapsed.hits.map(() => 'CANVAS'),
+    );
+    // Twelve lines of conversation do not become a quarter of the battlefield.
+    expect(collapsed.chatHeight).toBeLessThan(collapsed.fieldHeight / 4);
+    await expect(page.getByText('line 1 of the chat', { exact: true })).toBeHidden();
+
+    // …and the feed goes away by itself, leaving only the box over the map.
+    await expect(page.getByText('line 12 of the chat', { exact: true })).toBeHidden({
+      timeout: 20_000,
+    });
+
+    // The log button opens the whole conversation to scroll back through.
+    await page.getByTestId('chat-toggle').click();
+    await expect(page.getByTestId('chat-toggle')).toHaveAttribute('aria-expanded', 'true');
+    const first = page.getByText('line 1 of the chat', { exact: true });
+    await first.scrollIntoViewIfNeeded();
+    await expect(first).toBeVisible();
+    await expectClickable(page, 'chat-input');
+
+    // Folding it back gives the map back.
+    await page.getByTestId('chat-toggle').click();
+    await expect(first).toBeHidden();
+
+    /*
+     * A window too wide for the map to fill has black bars again, and the chat
+     * belongs on the map, not out in the right-hand bar. At 1902x985 there is no
+     * bar to stray into, so this is the only place the anchoring is tested.
+     */
+    await page.setViewportSize({ width: 1902, height: 600 });
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const canvas = document.querySelector('#game-root canvas')!.getBoundingClientRect();
+            const chat = document.querySelector('#chat')!.getBoundingClientRect();
+            return canvas.left > 50 && chat.right <= canvas.right && chat.left >= canvas.left;
+          }),
+        { message: 'the chat is out in the gutter beside the map' },
+      )
+      .toBe(true);
+
+    await solo.context.close();
+  });
+
+  test('the playfield fills the window, trimming sky and never ground', async ({ browser }) => {
+    test.setTimeout(120_000);
+
+    /*
+     * The world is a fixed 16:9 and most stages, once the HUD is off the window,
+     * are wider than that. FIT alone left black bars down both sides: at 1902x985
+     * the map was 1422px wide and sat off-centre (355px of black on the left,
+     * 109 on the right); at 1280x720, with a chat strip under it too, 908px.
+     * Now the game takes the stage's shape and trims sky off the top instead.
+     */
     const solo = await openPlayer(browser, 'Solo');
     const page = solo.page;
     await createRoom(solo);
     await addBot(page, 'shooter');
     await startMatch(solo);
-    await waitForSnapshot(page);
+    const snapshot = await waitForSnapshot(page);
 
     /*
-     * The chat used to float over the bottom-left of the playfield: the input
-     * box and its Send button sat on the terrain, across the exact corner a tank
-     * can spawn in. Chrome that can cover a tank is a playability bug, and prose
-     * about where a box "should" be is not evidence — so this measures the two
-     * rectangles and asserts they do not overlap.
+     * Only a SETTLED canvas counts. Until Phaser refits it under the HUD, the
+     * canvas is still the size it had behind the lobby, and a poll that took
+     * the first sample would pass on that frame however much chrome there was.
+     * Settled means it fits inside the stage.
      */
-    /*
-     * Polled rather than measured once, because Phaser rescales the canvas to
-     * fit on an animation frame: for a tick after the HUD appears the canvas is
-     * still its old size, and a single measurement taken in that tick reports an
-     * overlap that is a layout frame rather than a bug. Polling asks for the
-     * settled answer. A chat that genuinely sits on the map never settles into a
-     * clean one, so this still fails on the layout it was written to catch —
-     * checked by putting the old `position: fixed` rule back.
-     */
-    const overlap = async (): Promise<number> => {
-      const canvas = await page.locator('#game-root canvas').boundingBox();
-      const chat = await page.getByTestId('chat').boundingBox();
-      if (canvas === null || chat === null) return Number.POSITIVE_INFINITY;
-      return Math.min(
-        Math.min(canvas.x + canvas.width, chat.x + chat.width) - Math.max(canvas.x, chat.x),
-        Math.min(canvas.y + canvas.height, chat.y + chat.height) - Math.max(canvas.y, chat.y),
-      );
-    };
+    const field = () =>
+      page.evaluate(() => {
+        const canvas = document.querySelector('#game-root canvas')!.getBoundingClientRect();
+        const stage = document.querySelector('#stage')!.getBoundingClientRect();
+        return {
+          settled: canvas.top >= stage.top - 0.5 && canvas.bottom <= stage.bottom + 0.5,
+          left: canvas.left - stage.left,
+          right: stage.right - canvas.right,
+          top: canvas.top,
+          bottom: canvas.bottom,
+          width: canvas.width,
+          stageWidth: stage.width,
+        };
+      });
 
+    for (const [width, height] of [
+      [1902, 985],
+      [1280, 720],
+    ] as const) {
+      await page.setViewportSize({ width, height });
+      await expect
+        .poll(
+          async () => {
+            const f = await field();
+            return f.settled ? f.stageWidth - f.width : Number.POSITIVE_INFINITY;
+          },
+          { message: `black bars beside the map in a ${width}x${height} window` },
+        )
+        .toBeLessThanOrEqual(1);
+    }
+
+    /*
+     * A window too wide for trimming to fill. Two things must hold: the bars
+     * that come back are even, and the trim stopped before it reached ground.
+     * "Ground" is the highest column on this map — every generated map fills its
+     * whole height band, so that is the highest ground there is — plus the room
+     * a tank's name and health bar take above it.
+     */
+    await page.setViewportSize({ width: 1902, height: 600 });
     await expect
-      .poll(overlap, { message: 'the chat bar is sitting on the playfield' })
-      .toBeLessThanOrEqual(0.5);
+      .poll(
+        async () => {
+          const f = await field();
+          return f.settled ? Math.abs(f.left - f.right) : Number.POSITIVE_INFINITY;
+        },
+        { message: 'the playfield is not centred in the window' },
+      )
+      .toBeLessThanOrEqual(2);
 
-    // And the playfield is still worth having: most of the window, not a strip.
-    const canvas = await page.locator('#game-root canvas').boundingBox();
-    expect(canvas?.height ?? 0).toBeGreaterThan(400);
+    const f = await field();
+    const scale = f.width / snapshot.terrain.width;
+    // The camera shows the bottom of the world, so measure up from the canvas bottom.
+    const pageY = (worldY: number): number => f.bottom - (snapshot.terrain.height - worldY) * scale;
+    const highestGround = Math.min(...snapshot.terrain.surface);
+    const tankHeadroom = 45;
+    expect(
+      pageY(highestGround - tankHeadroom),
+      'trimming the sky cut off the top of the highest ground',
+    ).toBeGreaterThanOrEqual(f.top);
 
     await solo.context.close();
   });

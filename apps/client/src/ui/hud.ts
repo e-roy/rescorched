@@ -351,9 +351,11 @@ export class HudView {
     const remaining = WEAPONS.length - carried.length;
     if (remaining > 0) {
       chips.push(
+        // Short, because it shares a line with the roster; the rest is a hover away.
         el('span', {
           className: 'hud__hint',
-          text: `+${remaining} more in the armoury between rounds`,
+          text: `+${remaining} in the armoury`,
+          title: `${remaining} more weapons can be bought in the armoury between rounds`,
         }),
       );
     }

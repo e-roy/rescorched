@@ -451,7 +451,6 @@ body {
   align-items: center;
   gap: 5px;
   flex-wrap: wrap;
-  margin-top: 5px;
   min-height: 22px;
 }
 
@@ -506,7 +505,8 @@ body {
 .hud__footline {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 5px 10px;
   margin-top: 5px;
 }
 
@@ -516,8 +516,14 @@ body {
   flex-wrap: wrap;
 }
 
+/*
+ * Wraps inside its own box before it wraps onto a line of its own: two lines of
+ * message beside the roster cost six pixels of height, a third HUD row costs
+ * twenty-seven — and on a FIT-scaled 16:9 field, fifty of width.
+ */
 .hud__turn {
-  flex: 1 1 auto;
+  flex: 1 1 240px;
+  min-width: 0;
   font-size: 12px;
   color: var(--accent);
   min-height: 1.1em;
@@ -649,52 +655,99 @@ body {
 /* ================================================================= chat == */
 
 /*
- * Chat docks UNDER the stage. It used to float over the bottom-left corner of
- * the playfield, and the captures said what that costs: the input box and its
- * Send button sat on the terrain, across the exact corner a tank can spawn in,
- * and over the crater a player had just made. Chrome that can hide a tank is
- * not a cosmetic complaint.
+ * During a match the chat floats over the RIGHT edge of the playfield.
  *
- * Docking it costs no battlefield. The canvas is FIT-scaled from a fixed
- * 1280x720 world, so a strip of chrome below it makes the drawing smaller and
- * the map no smaller — nothing is cropped and nothing moves off screen.
+ * It spent a while docked in a strip under the stage, on the theory that the
+ * strip cost no battlefield. It did: the canvas is FIT-scaled from a fixed 16:9
+ * world, so ninety pixels of chrome under it also took 160 pixels off its width.
+ * Before that it floated over the bottom-left, where an always-on input box sat
+ * on the terrain across the corner a tank can spawn in.
  *
- * The first attempt at docking then covered the Start button instead, because
- * the overlay was still measured against the whole window and grew underneath
- * this bar. `.stage` is the fix, and `solo-bot.spec.ts` now hit-tests both: the
- * chat rectangle against the canvas, and the Start button in a FULL room
- * against whatever `elementFromPoint` says is actually on top of it.
+ * So this version reads like a stream's chat and is mostly not there. The input
+ * is pinned bottom right and always showing, because talking should never be a
+ * hunt — and it sits in bedrock: generated ground never comes within 12% of the
+ * bottom of the world (`DEFAULT_MIN_GROUND` in the sim), so no tank on a fresh
+ * map stands where the box is. Above it the last few lines stack up, newest
+ * nearest the box, fade out on their own, and are `pointer-events: none` — the
+ * feed can never take a click from the map. The whole log is one click away,
+ * and when it is open, covering the right of the map is what the player asked
+ * for.
+ *
+ * Positioned against the CANVAS (`--field-*`, see `ui/playfield.ts`), not the
+ * stage, so on a wide window it sits on the map rather than in the gutter.
  */
 .chat {
-  position: relative;
-  flex: 0 0 auto;
+  position: absolute;
+  right: calc(var(--field-right, 0px) + 8px);
+  bottom: calc(var(--field-bottom, 0px) + 8px);
+  /* Above the overlay, so the game-over screen can still be talked over. */
+  z-index: 25;
+  width: min(340px, calc(var(--field-width, 100vw) * 0.42));
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 5px 10px 6px;
-  background: linear-gradient(180deg, #080b12 0%, #10141f 100%);
-  border-top: 1px solid var(--panel-edge);
+  justify-content: flex-end;
+  align-items: stretch;
+  gap: 6px;
   font-size: 12px;
+  pointer-events: none;
 }
 
 .chat[hidden] {
   display: none;
 }
 
-.chat__log {
-  /*
-   * Four lines or so. The log is in the layout now, so an unbounded one would
-   * let a talkative room squeeze the battlefield; older lines scroll instead.
-   */
-  max-height: 76px;
-  overflow-y: auto;
+.chat__bar {
+  display: flex;
+  gap: 4px;
+  pointer-events: auto;
+}
+
+.chat__toggle {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  background: rgba(6, 8, 14, 0.86);
+  border: 1px solid var(--panel-edge);
+  border-radius: 2px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.chat__toggle:hover,
+.chat__toggle[aria-expanded='true'] {
+  border-color: var(--accent-cool);
+  color: var(--accent-cool);
+}
+
+.chat__unread {
+  min-width: 16px;
   padding: 0 4px;
+  font-size: 10px;
+  letter-spacing: 0;
+  line-height: 14px;
+  text-align: center;
+  color: #140a00;
+  background: var(--accent);
+  border-radius: 7px;
+}
+
+.chat__unread[hidden] {
+  display: none;
+}
+
+.chat__log {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  text-shadow:
-    0 1px 0 #000,
-    0 0 4px #000;
+  align-items: flex-start;
+  gap: 3px;
+  overflow: hidden;
 }
 
 .chat__log:empty {
@@ -702,8 +755,19 @@ body {
 }
 
 .chat__line {
+  max-width: 100%;
+  padding: 3px 8px;
   color: var(--ink);
   word-break: break-word;
+  /*
+   * Each line carries its own backing rather than the feed carrying one: the
+   * terrain palette is re-rolled every round, and bare text is legible against
+   * one map and lost against the next. A per-line plate also covers only the
+   * pixels that have words on them.
+   */
+  background: rgba(4, 6, 12, 0.72);
+  border-radius: 2px;
+  text-shadow: 0 1px 0 #000;
 }
 
 .chat__who {
@@ -715,30 +779,37 @@ body {
   font-style: italic;
 }
 
-.chat__form {
-  display: flex;
-  gap: 4px;
-  /* Wide enough to type in, short enough that the strip reads as a comms bar
-     rather than as a second panel. */
-  width: min(420px, 100%);
-  opacity: 0.75;
-  transition: opacity 0.15s ease;
+/* Collapsed: the last five lines, each gone ten seconds after it arrived. */
+.chat:not(.chat--docked):not([data-expanded='true']) .chat__line:nth-last-child(n + 6) {
+  display: none;
 }
 
-.chat__form:hover,
-.chat__form:focus-within {
-  opacity: 1;
+.chat:not(.chat--docked):not([data-expanded='true']):not([data-composing='true']) .chat__line {
+  animation: chat-line-fade 0.8s ease-in 10s forwards;
+}
+
+@keyframes chat-line-fade {
+  to {
+    opacity: 0;
+    visibility: hidden;
+  }
+}
+
+.chat__form {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  gap: 4px;
 }
 
 .chat__input {
   flex: 1;
   min-width: 0;
-  padding: 5px 8px;
+  padding: 6px 8px;
   font-family: inherit;
   font-size: 12px;
   color: var(--ink);
-  /* Nearly opaque: the terrain palette is re-rolled every round, so anything
-     translucent here is legible against one map and murky against the next. */
+  /* Nearly opaque, for the same re-rolled-palette reason as the lines. */
   background: rgba(6, 8, 14, 0.94);
   border: 1px solid var(--panel-edge);
   border-radius: 2px;
@@ -749,8 +820,6 @@ body {
   font-family: inherit;
   font-size: 11px;
   color: var(--ink-dim);
-  /* Nearly opaque: the terrain palette is re-rolled every round, so anything
-     translucent here is legible against one map and murky against the next. */
   background: rgba(6, 8, 14, 0.94);
   border: 1px solid var(--panel-edge);
   border-radius: 2px;
@@ -763,11 +832,73 @@ body {
 }
 
 /*
+ * Expanded: a panel down the right of the playfield, the whole log scrollable,
+ * the input always there. Everything in it takes clicks.
+ */
+.chat[data-expanded='true']:not(.chat--docked) {
+  top: calc(var(--field-top, 0px) + 8px);
+  padding: 8px;
+  background: rgba(5, 7, 13, 0.9);
+  border: 1px solid var(--panel-edge);
+  border-radius: 3px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.55);
+  pointer-events: auto;
+}
+
+.chat[data-expanded='true']:not(.chat--docked) .chat__log {
+  flex: 1 1 auto;
+  min-height: 0;
+  align-items: stretch;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--panel-edge-hot) transparent;
+}
+
+.chat[data-expanded='true']:not(.chat--docked) .chat__log:empty {
+  display: flex;
+}
+
+.chat[data-expanded='true']:not(.chat--docked) .chat__log:empty::before {
+  content: 'Nobody has said anything yet.';
+  margin: auto 0;
+  font-style: italic;
+  text-align: center;
+  color: var(--ink-faint);
+}
+
+.chat[data-expanded='true']:not(.chat--docked) .chat__line {
+  background: none;
+  padding: 1px 2px;
+}
+
+/*
+ * A short conversation sits down by the box, the way a stream's chat does.
+ * `margin-top: auto` rather than `justify-content: flex-end`, which would push
+ * the oldest lines of a long log above the scroll origin where no scrollbar can
+ * reach them.
+ */
+.chat[data-expanded='true']:not(.chat--docked) .chat__line:first-child {
+  margin-top: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat:not(.chat--docked):not([data-expanded='true']):not([data-composing='true']) .chat__line {
+    animation-duration: 1ms;
+  }
+}
+
+/*
  * Docked in the lobby panel (`ChatView.dock`): a real conversation area rather
  * than a comms strip. The log takes whatever height the panel has left, and
  * says what it is for while nobody has spoken.
  */
 .chat.chat--docked {
+  position: relative;
+  right: auto;
+  bottom: auto;
+  z-index: auto;
+  width: auto;
+  pointer-events: auto;
   flex: 1 1 auto;
   min-height: 0;
   gap: 8px;
@@ -777,7 +908,12 @@ body {
   font-size: 13px;
 }
 
+.chat--docked .chat__toggle {
+  display: none;
+}
+
 .chat--docked .chat__log {
+  align-items: stretch;
   flex: 1 1 auto;
   min-height: 150px;
   max-height: none;
@@ -807,7 +943,12 @@ body {
 
 .chat--docked .chat__form {
   width: 100%;
-  opacity: 1;
+}
+
+.chat--docked .chat__line {
+  padding: 0;
+  background: none;
+  text-shadow: none;
 }
 
 .chat--docked .chat__input,
@@ -2228,7 +2369,18 @@ body {
   border-radius: 3px;
   z-index: 40;
   pointer-events: none;
-  max-width: min(76vw, 620px);
+  /*
+   * Clear of the chat, which shares this bottom edge on the right: centred, the
+   * toast may be as wide as the field less the chat's width on BOTH sides.
+   */
+  max-width: min(
+    76vw,
+    620px,
+    max(
+      240px,
+      calc(var(--field-width, 100vw) - 2 * (min(340px, var(--field-width, 100vw) * 0.42) + 24px))
+    )
+  );
   text-align: center;
   /* It lands on terrain, a starfield or a panel edge — all three need this. */
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.6);
@@ -2325,15 +2477,6 @@ body:has(#conn-banner:not([hidden])) .chat {
     justify-items: center;
     padding: 120px 16px 60px;
     overflow-y: auto;
-  }
-
-  .chat {
-    display: none;
-  }
-
-  /* Docked in the lobby the chat is the conversation, not chrome over a map. */
-  .chat.chat--docked:not([hidden]) {
-    display: flex;
   }
 
   .panel--lobby {

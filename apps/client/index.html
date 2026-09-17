@@ -151,9 +151,15 @@
         <button class="firebutton" id="hud-fire" data-testid="fire-button" disabled>Fire</button>
       </div>
 
-      <div class="hud__arsenal" id="hud-arsenal" data-testid="hud-arsenal"></div>
-
+      <!--
+        The arsenal shares the second line with the roster rather than taking a
+        line of its own. The playfield is FIT-scaled from a fixed 16:9 world, so
+        every row of chrome above it costs width as well as height: a third HUD
+        row was 30-odd pixels of battlefield off the bottom and fifty off each
+        side.
+      -->
       <div class="hud__footline">
+        <div class="hud__arsenal" id="hud-arsenal" data-testid="hud-arsenal"></div>
         <div class="hud__players" id="hud-players" data-testid="hud-players"></div>
         <div class="hud__turn" id="hud-turn" data-testid="hud-turn"></div>
         <div class="hud__link" id="hud-conn" data-testid="hud-conn" data-state="open">Live</div>
@@ -172,9 +178,11 @@
       seven seats put Start at y=636 and it worked; eight put it at y=686 and
       `elementFromPoint` came back with the chat.
 
-      With the HUD above and the chat below as siblings of the stage, the three
-      occupy disjoint boxes in the flex column and no z-index argument decides
-      anything. `solo-bot.spec.ts` hit-tests the Start button in a full room.
+      The HUD sits above the stage as its sibling, so the two occupy disjoint
+      boxes in the flex column and no z-index argument decides anything. The chat
+      now lives inside the stage, but it is only ever over the battlefield or the
+      game-over screen: in the lobby it is moved into the lobby panel.
+      `solo-bot.spec.ts` hit-tests the Start button in a full room.
     -->
     <div id="stage" class="stage">
       <div id="game-root"></div>
@@ -519,37 +527,60 @@
         for.
       -->
       <div id="toast" class="toast" data-testid="toast" hidden></div>
-    </div>
 
-    <!--
-      Chat docks BELOW the stage, so it takes height from nothing that matters:
-      the canvas is FIT-scaled from a fixed 1280x720 world, so a strip of chrome
-      under it makes the drawing smaller and the map no smaller. It used to
-      float over the bottom-left of the playfield, where it sat on the terrain
-      and across the corner a tank can spawn in.
-    -->
-    <div id="chat" class="chat" hidden data-testid="chat">
-      <div
-        class="chat__log"
-        id="chat-log"
-        data-testid="chat-log"
-        role="log"
-        aria-live="polite"
-      ></div>
-      <form class="chat__form" id="chat-form">
-        <input
-          class="chat__input"
-          id="chat-input"
-          data-testid="chat-input"
-          maxlength="200"
-          placeholder="Press T to talk"
-          autocomplete="off"
-          aria-label="Chat message"
-        />
-        <button class="chat__send" id="chat-send" data-testid="chat-send" type="submit">
-          Send
-        </button>
-      </form>
+      <!--
+        Chat floats over the RIGHT edge of the playfield during a match, and is
+        mostly not there. It used to dock in a strip under the stage, which
+        looked free and was not: the canvas is FIT-scaled from a fixed 16:9
+        world, so a strip of chrome below it narrowed the battlefield too.
+
+        It reads like a stream's chat: the input pinned to the BOTTOM right,
+        always there, and the last few lines stacked above it, newest nearest the
+        box, each fading on its own. The feed is click-through, so it never takes
+        a click from the map. The input sits in bedrock: generated ground never
+        comes within 12% of the bottom of the world, so no tank on a fresh map can
+        stand where the box is. The Log button opens the whole conversation, and
+        covering the right of the map is then something the player chose.
+
+        In the lobby the same element is moved into the lobby panel instead
+        (`ChatView.dock`).
+      -->
+      <div id="chat" class="chat" hidden data-testid="chat" data-expanded="false">
+        <div
+          class="chat__log"
+          id="chat-log"
+          data-testid="chat-log"
+          role="log"
+          aria-live="polite"
+        ></div>
+        <div class="chat__bar">
+          <form class="chat__form" id="chat-form">
+            <input
+              class="chat__input"
+              id="chat-input"
+              data-testid="chat-input"
+              maxlength="200"
+              placeholder="Press T to talk"
+              autocomplete="off"
+              aria-label="Chat message"
+            />
+            <button class="chat__send" id="chat-send" data-testid="chat-send" type="submit">
+              Send
+            </button>
+          </form>
+          <button
+            type="button"
+            class="chat__toggle"
+            id="chat-toggle"
+            data-testid="chat-toggle"
+            aria-expanded="false"
+            aria-controls="chat-log"
+          >
+            <span class="chat__toggle-label">Log</span>
+            <span class="chat__unread" id="chat-unread" data-testid="chat-unread" hidden></span>
+          </button>
+        </div>
+      </div>
     </div>
 
     <div id="conn-banner" class="connbanner" data-testid="conn-banner" hidden></div>

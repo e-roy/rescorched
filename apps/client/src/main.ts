@@ -6,9 +6,17 @@
 
 import Phaser from 'phaser';
 import type { GameSnapshot, ServerMessage } from '@scorched/protocol';
-import { BattleScene, VIEW_HEIGHT, VIEW_WIDTH } from './scenes/battle.ts';
+import {
+  BattleScene,
+  MAX_SKY_ABOVE,
+  MAX_SKY_TRIM,
+  VIEW_HEIGHT,
+  VIEW_WIDTH,
+} from './scenes/battle.ts';
 import { createRoom, NetClient } from './net.ts';
 import { Ui } from './ui.ts';
+import { must } from './ui/dom.ts';
+import { trackPlayfield } from './ui/playfield.ts';
 
 interface AppState {
   net: NetClient | null;
@@ -30,13 +38,58 @@ const game = new Phaser.Game({
   backgroundColor: '#03030c',
   scale: {
     mode: Phaser.Scale.FIT,
-    autoCenter: Phaser.Scale.CENTER_BOTH,
+    /*
+     * NOT Phaser's own centring. `#game-root` is a grid that already centres
+     * the canvas, and CENTER_BOTH adds a margin on top of that — the grid then
+     * centres the canvas-plus-margin, and the playfield sat off to the right by
+     * half a gutter (355px of black on the left of a 1902px window, 109px on
+     * the right).
+     */
+    autoCenter: Phaser.Scale.NO_CENTER,
   },
   render: {
     pixelArt: true,
     antialias: false,
   },
   scene: [BattleScene],
+});
+
+/**
+ * Fit the world's WIDTH to the stage, and let the sky give.
+ *
+ * FIT alone letterboxes the world, which put black bars down both sides of the
+ * map in almost every desktop window. So the game is resized to the stage's
+ * own shape: the whole width of the world (1280, or wider for a bigger room —
+ * it comes from the snapshot), and however many rows of it that shape allows,
+ * always anchored at the BOTTOM of the world. A short stage loses up to
+ * `MAX_SKY_TRIM` rows of sky; a tall one gains up to `MAX_SKY_ABOVE` rows above
+ * the world. Past either cap the bars come back, smaller.
+ *
+ * Called on every stage resize and every snapshot, because a new match can
+ * bring a different width. Cheap when nothing changed.
+ */
+function fitStage(): void {
+  const root = must<HTMLElement>('#game-root');
+  const { width, height } = root.getBoundingClientRect();
+  if (width === 0 || height === 0) return;
+  const worldWidth = app.snapshot?.terrain.width ?? VIEW_WIDTH;
+  const wanted = Math.round((worldWidth * height) / width);
+  const visible = Math.min(
+    VIEW_HEIGHT + MAX_SKY_ABOVE,
+    Math.max(VIEW_HEIGHT - MAX_SKY_TRIM, wanted),
+  );
+  const size = game.scale.gameSize;
+  if (visible !== size.height || worldWidth !== size.width) {
+    game.scale.setGameSize(worldWidth, visible);
+  }
+  battleScene()?.refitView();
+}
+
+game.events.once(Phaser.Core.Events.READY, () => {
+  const stage = must<HTMLElement>('#stage');
+  trackPlayfield(stage, game.canvas);
+  new ResizeObserver(fitStage).observe(must<HTMLElement>('#game-root'));
+  fitStage();
 });
 
 function battleScene(): BattleScene | null {
@@ -181,6 +234,7 @@ function handleMessage(message: ServerMessage): void {
       // Lock input while the shell is in the air.
       ui.renderHud(message.snapshot, app.you ?? '', false);
       app.snapshot = message.snapshot;
+      fitStage();
       void scene.playEvents(message.events, message.snapshot).then(() => {
         /*
          * Only render this turn if it is still the latest one.
@@ -260,6 +314,7 @@ function handleMessage(message: ServerMessage): void {
 
 function applySnapshot(snapshot: GameSnapshot): void {
   app.snapshot = snapshot;
+  fitStage();
   const you = app.you ?? '';
   const scene = battleScene();
   scene?.render(snapshot);
