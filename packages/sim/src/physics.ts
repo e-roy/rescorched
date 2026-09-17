@@ -12,7 +12,7 @@
  */
 
 import { clamp, detCosDeg, detSinDeg, hypot2 } from './math.ts';
-import { isSolid, type Terrain } from './terrain.ts';
+import { isSolid, muzzleSpeedScale, REFERENCE_WORLD_WIDTH, type Terrain } from './terrain.ts';
 
 /** Global integration constants. Tuned to feel like the original at 1280x720. */
 export const PHYSICS = {
@@ -20,7 +20,10 @@ export const PHYSICS = {
   gravity: 260,
   /** Fixed integration step, seconds. */
   dt: 1 / 60,
-  /** Muzzle speed at power 100, pixels per second. */
+  /**
+   * Muzzle speed at power 100, pixels per second — on the reference 1280 map.
+   * A wider map scales it by `muzzleSpeedScale` so reach keeps pace.
+   */
   powerScale: 5.2,
 
   /**
@@ -213,9 +216,16 @@ export interface FlightOptions {
   velocity?: { vx: number; vy: number };
 }
 
-/** Convert the UI's angle+power into a velocity vector. */
-export function launchVelocity(angleDeg: number, power: number): { vx: number; vy: number } {
-  const speed = clamp(power, 0, 100) * PHYSICS.powerScale;
+/**
+ * Convert the UI's angle+power into a velocity vector, for a map `worldWidth`
+ * wide — power 100 crosses the same fraction of any map (`muzzleSpeedScale`).
+ */
+export function launchVelocity(
+  angleDeg: number,
+  power: number,
+  worldWidth: number = REFERENCE_WORLD_WIDTH,
+): { vx: number; vy: number } {
+  const speed = clamp(power, 0, 100) * PHYSICS.powerScale * muzzleSpeedScale(worldWidth);
   return {
     vx: detCosDeg(angleDeg) * speed,
     // Screen Y grows downward, so "up" is negative.
@@ -239,7 +249,7 @@ export function simulateFlight(spawn: ProjectileSpawn, options: FlightOptions): 
   const windAccel = options.windImmune === true ? 0 : wind * PHYSICS.windScale;
   const dt = PHYSICS.dt;
 
-  const initial = options.velocity ?? launchVelocity(spawn.angleDeg, spawn.power);
+  const initial = options.velocity ?? launchVelocity(spawn.angleDeg, spawn.power, terrain.width);
   let x = spawn.x;
   let y = spawn.y;
   let vx = initial.vx;

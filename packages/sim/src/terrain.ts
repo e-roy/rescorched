@@ -456,6 +456,36 @@ export function generateSafeTerrain(options: TerrainOptions, rng: Rng): Terrain 
 // ---------------------------------------------------------------------------
 
 /**
+ * The map width the gun was tuned on.
+ *
+ * Every range in this package that is written down as a number of pixels —
+ * "full power reaches 1040 px", "power 80 reaches 666" — is a range on a map
+ * this wide. A room with more tanks gets a wider map (`worldWidthFor` in
+ * `game.ts`), and on it the gun is scaled rather than the prose.
+ */
+export const REFERENCE_WORLD_WIDTH = 1280;
+
+/**
+ * Muzzle-speed multiplier for a map `worldWidth` wide.
+ *
+ * Reach on flat ground is v^2/g, so scaling speed by sqrt(w / 1280) scales
+ * every shot's reach by exactly w / 1280: the same angle and power cover the
+ * same FRACTION of any map. Wind drift is a*T^2/2 and flight time scales with
+ * speed, so drift scales by the same factor and a given wind still costs a
+ * shot the same fraction of its range. Gravity, wind and the barrel angle are
+ * untouched — a 45-degree shot still leaves at 45 degrees.
+ *
+ * At the reference width this is exactly 1 (`Math.sqrt(1)` is specified to
+ * be 1), so a two-player match is bit-for-bit the game it always was.
+ *
+ * Lives here rather than in `physics.ts` for the same import-cycle reason as
+ * `PROBE` below; `physics.ts`, the probe and the bots all call this one.
+ */
+export function muzzleSpeedScale(worldWidth: number): number {
+  return Math.sqrt(worldWidth / REFERENCE_WORLD_WIDTH);
+}
+
+/**
  * Ballistic constants, duplicated from `physics.ts` on purpose.
  *
  * `physics.ts` imports this module, so importing it back would create a cycle
@@ -890,8 +920,9 @@ function hasLineOfFire(
   const dx = toX - fromX;
   const dy = toY - fromY;
 
+  const muzzle = PROBE.powerScale * muzzleSpeedScale(terrain.width);
   for (let power = 100; power >= PROBE_MIN_POWER; power -= 1) {
-    const speed = power * PROBE.powerScale;
+    const speed = power * muzzle;
     for (const ideal of aimAngles(dx, dy, speed)) {
       const low = Math.floor(ideal);
       const high = Math.ceil(ideal);
@@ -911,7 +942,8 @@ function hasLineOfFire(
  * fault?
  *
  * Deliberately measured at power 80, not 100. The gun's flat-ground reach is
- * v^2/g = 1040 px and the map is 1280 wide, so the outermost spawns sit right on
+ * v^2/g = 1040 px and the map is 1280 wide (both scale together on a wider map;
+ * see `muzzleSpeedScale`), so the outermost spawns sit right on
  * the edge of what full power can do — those pairs miss because the shell runs
  * out of energy, not because a hill is in the way, and failing a map for that
  * would reject almost every seed. Power 80 reaches 666 px on flat ground, so the
@@ -927,14 +959,15 @@ function hasLineOfFire(
  */
 const RANGE_GATE_POWER = 80;
 
-function withinBallisticRange(dx: number, dy: number): boolean {
-  return vacuumAim(dx, dy, RANGE_GATE_POWER * PROBE.powerScale).length > 0;
+function withinBallisticRange(dx: number, dy: number, worldWidth: number): boolean {
+  const speed = RANGE_GATE_POWER * PROBE.powerScale * muzzleSpeedScale(worldWidth);
+  return vacuumAim(dx, dy, speed).length > 0;
 }
 
 /** Can a tank here put a shell anywhere at all, or is it walled in? */
 function canShootOut(terrain: Terrain, x: number, y: number, minDistance: number): boolean {
   for (const power of [100, 75]) {
-    const speed = power * PROBE.powerScale;
+    const speed = power * PROBE.powerScale * muzzleSpeedScale(terrain.width);
     for (const angle of ESCAPE_ANGLES) {
       for (const direction of [1, -1]) {
         const vx = detCosDeg(angle) * speed * direction;
@@ -1015,7 +1048,7 @@ export function checkPlayability(
       const to = spawns[j] as number;
       const fromY = surfaceAt(terrain, from) - muzzleHeight;
       const toY = surfaceAt(terrain, to);
-      if (!withinBallisticRange(to - from, toY - fromY)) continue;
+      if (!withinBallisticRange(to - from, toY - fromY, terrain.width)) continue;
 
       if (!hasLineOfFire(terrain, from, fromY, to, toY, tolerance)) {
         issues.push({ kind: 'blocked', column: from, target: to });

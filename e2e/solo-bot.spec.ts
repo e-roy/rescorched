@@ -21,10 +21,12 @@
  *  - chat floats over the battlefield without taking clicks or space from it.
  *  - the playfield fills the window, and the sky it trims to do that never
  *    takes the ground with it.
+ *  - a bigger room's wider map is drawn in full rather than cropped to the
+ *    width the client starts at.
  *  - a computer player firing while your own shot is still animating cannot
  *    rewind the board.
  *
- * The last four are measurements, not eyeballs: rectangles, hit tests and a
+ * The last five are measurements, not eyeballs: rectangles, hit tests and a
  * turn counter. Every one of them regressed once already.
  */
 
@@ -778,6 +780,44 @@ test.describe('one person, one computer player, no second browser', () => {
       pageY(highestGround - tankHeadroom),
       'trimming the sky cut off the top of the highest ground',
     ).toBeGreaterThanOrEqual(f.top);
+
+    await solo.context.close();
+  });
+
+  test('a bigger room is drawn on its bigger map, edge to edge', async ({ browser }) => {
+    test.setTimeout(120_000);
+
+    /*
+     * Four tanks get a 1600 px world. The client must size itself to the
+     * snapshot's width rather than to the 1280 it starts at: sized to 1280, the
+     * canvas still fills the window, but the camera shows only the left 1280
+     * columns and every tank past them is off the edge of the map. So this
+     * checks the canvas draws the world's full width, and still has no bars.
+     */
+    const solo = await openPlayer(browser, 'Solo');
+    const page = solo.page;
+    await page.setViewportSize({ width: 1902, height: 985 });
+    await createRoom(solo);
+    for (const personality of ['shooter', 'tosser', 'moron']) await addBot(page, personality);
+    await startMatch(solo);
+    const snapshot = await waitForSnapshot(page);
+    expect(snapshot.terrain.width, 'a four-tank room is not on a wider map').toBeGreaterThan(1280);
+
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const canvas = document.querySelector<HTMLCanvasElement>('#game-root canvas')!;
+            const stage = document.querySelector('#stage')!.getBoundingClientRect();
+            const box = canvas.getBoundingClientRect();
+            return {
+              drawnWidth: canvas.width,
+              bars: Math.round(stage.width - box.width),
+            };
+          }),
+        { message: 'the wide map is not drawn edge to edge' },
+      )
+      .toEqual({ drawnWidth: snapshot.terrain.width, bars: 0 });
 
     await solo.context.close();
   });

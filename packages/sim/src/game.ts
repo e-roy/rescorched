@@ -48,6 +48,7 @@ import { makeRng, normalizeSeed, restoreRng, type Rng, type RngState } from './r
 import { BABY_MISSILE, requireWeapon, type WeaponDef, type WeaponId } from './weapons.ts';
 
 export const DEFAULT_WORLD = {
+  /** The map for two players. A bigger room gets a wider one: `worldWidthFor`. */
   width: 1280,
   height: 720,
   maxHealth: 100,
@@ -72,6 +73,27 @@ export const DEFAULT_WORLD = {
  * broadcast.
  */
 export const MAX_PLAYERS = 16;
+
+/** Extra map width per tank beyond the second. See `worldWidthFor`. */
+const WIDTH_PER_EXTRA_TANK = 160;
+
+/**
+ * How wide the map is for a match of `playerCount` tanks.
+ *
+ * At a fixed 1280 a four-tank match left about 275 px between neighbours and
+ * an eight-tank one about 137 — close enough that a Baby Missile aimed at one
+ * tank was a threat to the next. Each tank past the second adds 160 px: 1600 for
+ * four, 2240 for eight (the room's seat limit), 3520 for `MAX_PLAYERS`, inside
+ * the 4096 columns the protocol allows. A duel keeps its 1280, so it is the
+ * same game it was.
+ *
+ * The gun keeps pace (`muzzleSpeedScale`), so full power still crosses the same
+ * fraction of the map whatever its width.
+ */
+export function worldWidthFor(playerCount: number): number {
+  const extraTanks = Math.max(0, Math.floor(playerCount) - 2);
+  return DEFAULT_WORLD.width + extraTanks * WIDTH_PER_EXTRA_TANK;
+}
 
 export type GamePhase = 'lobby' | 'aiming' | 'resolving' | 'shopping' | 'gameover';
 
@@ -209,7 +231,7 @@ export function createGame(config: GameConfig, players: readonly PlayerSeed[]): 
       'A match must be a whole number of rounds, at least 1',
     );
 
-  const width = config.width ?? DEFAULT_WORLD.width;
+  const width = config.width ?? worldWidthFor(players.length);
   const height = config.height ?? DEFAULT_WORLD.height;
   const rng = makeRng(config.seed);
 

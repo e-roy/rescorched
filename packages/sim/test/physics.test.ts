@@ -505,9 +505,16 @@ describe('trajectory data', () => {
     // preserved order and rhythm must advance x by the same amount at every
     // point. Reordering, duplicating or resampling would all show up here — and
     // unlike the vertical shot above, "monotone in x" actually means something.
+    // At the reference muzzle speed: the 3200 px map is only there for room,
+    // and would otherwise speed the shell up by `muzzleSpeedScale(3200)`.
     const arc = simulateFlight(
       { x: 100, y: 690, angleDeg: 70, power: 60 },
-      { terrain: flat(700, 3200, 720), wind: 0, gravityScale: 0.08 },
+      {
+        terrain: flat(700, 3200, 720),
+        wind: 0,
+        gravityScale: 0.08,
+        velocity: launchVelocity(70, 60),
+      },
     );
     expect(arc.impact.kind).toBe('terrain');
     expect(arc.steps).toBeGreaterThan(1000);
@@ -691,10 +698,21 @@ describe('hitting tanks', () => {
   const SHOOTER_MUZZLE = { x: 320, y: 289 };
 
   /** Fire from the shooter's own muzzle with the shooter as the only target. */
+  /*
+   * Fired at the REFERENCE muzzle speed whatever the test map's width. The
+   * numbers below were measured for the real gun, and the small 640 px test
+   * map would otherwise slow every shell by `muzzleSpeedScale(640)` — which is
+   * correct for a map that narrow, and nothing to do with arming.
+   */
   function selfShot(terrain: ReturnType<typeof flat>, angleDeg: number, power: number) {
     return simulateFlight(
       { ...SHOOTER_MUZZLE, angleDeg, power },
-      { terrain, wind: 0, targets: [{ ...SHOOTER }] },
+      {
+        terrain,
+        wind: 0,
+        targets: [{ ...SHOOTER }],
+        velocity: launchVelocity(angleDeg, power),
+      },
     );
   }
 
