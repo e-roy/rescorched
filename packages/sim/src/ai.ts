@@ -65,6 +65,7 @@ import { ammoFor, DEFAULT_WORLD, predictShot, type GameState, type Tank } from '
 import { buy, isOnTheShelf, isShopOpen, roundsFought } from './economy.ts';
 import { PHYSICS, type Trajectory } from './physics.ts';
 import { makeRng, type Rng } from './rng.ts';
+import { muzzleSpeedScale } from './terrain.ts';
 import {
   BABY_MISSILE,
   getWeapon,
@@ -1106,7 +1107,8 @@ function analyticPower(solver: Solver, elevation: number): number {
   if (!(denominator > 0)) return 100;
   const speedSquared = (PHYSICS.gravity * u * u) / denominator;
   if (!(speedSquared > 0) || !Number.isFinite(speedSquared)) return 100;
-  return clamp(Math.sqrt(speedSquared) / PHYSICS.powerScale, MIN_SOLVED_POWER, 100);
+  const muzzle = PHYSICS.powerScale * muzzleSpeedScale(solver.model.terrain.width);
+  return clamp(Math.sqrt(speedSquared) / muzzle, MIN_SOLVED_POWER, 100);
 }
 
 /**

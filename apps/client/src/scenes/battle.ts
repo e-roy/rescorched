@@ -44,8 +44,40 @@ import { addDecal, paintTerrain, type ScorchDecal } from '../render/terrain.ts';
 import { drawTank, muzzlePoint, TANK_NAME_OFFSET_Y, tankColor } from '../render/tank.ts';
 import { TrailLayer } from '../render/trails.ts';
 
+/**
+ * The world's size before any snapshot has said otherwise. The HEIGHT is fixed;
+ * the width is the snapshot's own (`worldWidthFor` in the sim widens the map for
+ * a bigger room), so nothing here may assume 1280 once a match is running.
+ */
 export const VIEW_WIDTH = 1280;
 export const VIEW_HEIGHT = 720;
+
+/**
+ * How much sky a wide window may trim off the TOP of the world, in world pixels.
+ *
+ * The world is 16:9 and most windows, once the HUD is off them, are wider than
+ * that. Fitting the whole world left black gutters down both sides; fitting the
+ * width instead and losing a strip of sky fills the window. Only sky: the
+ * generator's ground band tops out at y≈202 (`DEFAULT_MAX_GROUND` in the sim),
+ * and a tank with its name and health bar stands about 45 above its ground, so
+ * 120 leaves the highest tank on any fresh map ~35px of clear sky. A window
+ * wider still gets narrow gutters back rather than lose a tank.
+ *
+ * Shells already fly above the top of the world; this makes the last 120px of
+ * their climb off-screen as well. Never the sides — those are walls that matter.
+ */
+export const MAX_SKY_TRIM = 120;
+
+/**
+ * How much sky a TALL stage may show above the top of the world.
+ *
+ * The other direction: a wide map in an ordinary window (an eight-tank match is
+ * 2240x720, over 3:1) fits the stage's width with room to spare above it. That
+ * room is real sky — shells fly up there — so it is drawn as sky rather than
+ * left as a black bar. 360 covers an eight-tank map in a typical desktop
+ * window; a stage taller still gets bars above and below.
+ */
+export const MAX_SKY_ABOVE = 360;
 
 /**
  * Re-exported, not moved: `ui.ts` and `ui/format.ts` colour their player chips
@@ -107,6 +139,15 @@ export class BattleScene extends Phaser.Scene {
    */
   private dropped = 0;
 
+  /**
+   * World y of the top of the visible area: positive when sky is trimmed
+   * (`MAX_SKY_TRIM`), negative when extra sky shows above the world
+   * (`MAX_SKY_ABOVE`). The bottom of the view is always the bottom of the world.
+   */
+  private viewTop = 0;
+  /** Width of the world on screen, from the game size `main.ts` fitted. */
+  private viewWidth = VIEW_WIDTH;
+
   private skyImage: Phaser.GameObjects.Image | null = null;
   private skyKey = '';
   private terrainTexture: Phaser.Textures.CanvasTexture | null = null;
@@ -154,7 +195,7 @@ export class BattleScene extends Phaser.Scene {
     this.particles = new ParticleField(this, 0x1f2c3d, DEPTH.particles, VIEW_HEIGHT);
 
     this.flash = this.add
-      .rectangle(0, 0, VIEW_WIDTH, VIEW_HEIGHT, 0xffffff)
+      .rectangle(0, -MAX_SKY_ABOVE, VIEW_WIDTH, VIEW_HEIGHT + MAX_SKY_ABOVE, 0xffffff)
       .setOrigin(0, 0)
       .setDepth(DEPTH.flash)
       .setAlpha(0);
@@ -162,9 +203,26 @@ export class BattleScene extends Phaser.Scene {
     this.frame = this.add.graphics().setDepth(DEPTH.frame);
 
     this.ready = true;
-    this.ensureSky(this.snapshot?.seed ?? 0);
-    this.drawFrame();
+    // The stage may have been fitted before this scene existed to be told.
+    this.refitView();
     if (this.snapshot !== null) this.render(this.snapshot);
+  }
+
+  /**
+   * Point the camera at whatever `main.ts` has sized the game to: the whole
+   * width of the world, and the bottom `gameSize.height` rows of it — fewer
+   * than the world has when sky is trimmed, more when extra sky shows above.
+   * Moves the frame and the wind gauge to the new top edge.
+   */
+  refitView(): void {
+    const { width, height } = this.scale.gameSize;
+    this.viewWidth = width;
+    this.viewTop = VIEW_HEIGHT - height;
+    if (!this.ready) return;
+    this.cameras.main.setScroll(0, this.viewTop);
+    this.flash.setSize(width, VIEW_HEIGHT + MAX_SKY_ABOVE);
+    this.ensureSky(this.snapshot?.seed ?? 0);
+    this.drawFrame(this.snapshot ?? undefined);
   }
 
   override update(_time: number, delta: number): void {
@@ -206,18 +264,21 @@ export class BattleScene extends Phaser.Scene {
     this.ensureSky(snapshot.seed);
   }
 
+  /** One sky for the whole world, plus the extra above it a tall stage can show. */
   private ensureSky(seed: number): void {
-    const expected = starfieldKey(seed, VIEW_WIDTH, VIEW_HEIGHT);
+    const width = this.viewWidth;
+    const height = VIEW_HEIGHT + MAX_SKY_ABOVE;
+    const expected = starfieldKey(seed, width, height);
     if (this.skyKey === expected && this.skyImage !== null) return;
 
     // Drop the old image before the old texture goes, not after.
     this.skyImage?.destroy();
     this.skyImage = null;
-    this.skyKey = ensureStarfield(this, seed, VIEW_WIDTH, VIEW_HEIGHT);
+    this.skyKey = ensureStarfield(this, seed, width, height);
     this.skyImage = this.add
-      .image(0, 0, this.skyKey)
+      .image(0, -MAX_SKY_ABOVE, this.skyKey)
       .setOrigin(0, 0)
-      .setDisplaySize(VIEW_WIDTH, VIEW_HEIGHT)
+      .setDisplaySize(width, height)
       .setDepth(DEPTH.sky);
   }
 
@@ -330,13 +391,14 @@ export class BattleScene extends Phaser.Scene {
     g.clear();
 
     g.lineStyle(2, FRAME_COLOR, 0.85);
-    g.strokeRect(1, 1, VIEW_WIDTH - 2, VIEW_HEIGHT - 2);
+    const top = this.viewTop;
+    g.strokeRect(1, top + 1, this.viewWidth - 2, VIEW_HEIGHT - top - 2);
 
     if (snapshot === undefined) return;
 
-    const centerX = VIEW_WIDTH / 2;
-    const arrowY = 24;
-    const scaleY = 36;
+    const centerX = this.viewWidth / 2;
+    const arrowY = top + 24;
+    const scaleY = top + 36;
 
     // The scale sits BELOW the arrow, not behind it. Drawn on the same line the
     // arrow occupies, half its ticks are covered by the arrow itself and the
